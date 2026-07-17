@@ -49,6 +49,7 @@ stop_recording.py
 recordings/
 *.log
 claude_node_usage.txt
+ipmart_proxy_usage.jsonl
 
 # 本地调试/运行期门控脚本与代理清单（不进库）
 codex_gated_launch.sh
