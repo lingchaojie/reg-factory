@@ -1,5 +1,22 @@
 ﻿# 更新日志
 
+## 2026-07-18 — IPMart 每账号独立代理接入 BitBrowser
+
+**新增**
+- 新增 IPMart HTTP 代理 provider：每轮请求一个美国代理，验证真实出口 IP，失败或出口重复时最多重试 3 次，并用本地 JSONL 台账避免后续账号复用出口。
+- `run_full_flow.py` 在 Outlook 注册前获取代理，把同一租约传给 Outlook 与 Claude 的临时 BitBrowser profile；进入 Claude 前复检同一出口，变化时终止本轮。
+- `.env.example`、`config.py` 与 WebUI 配置页新增 `IPMART_*` 配置；accessKey 在 WebUI 使用密码框，未提供会消耗分配的连接测试按钮。
+
+**行为边界**
+- `IPMART_ENABLED=0` 时保持原 Clash/现有代理逻辑；启用后不回退到 Clash、直连或已有 BitBrowser profile。
+- API 获取请求绕过系统代理，使用 IPMart 的来源 IP 白名单鉴权；默认 `US`、单代理、30 分钟粘性。
+- `--dry-run` 不请求代理；严格唯一性要求只运行一个顺序编排进程。
+
+**测试**
+- 覆盖配置解析、接口参数、代理验活、出口变化、重复出口、密钥脱敏、台账、环境传递及 Outlook/Claude/全流程集成。
+
+---
+
 ## 2026-07-14 — Grok 纯 HTTP 协议注册（不开浏览器） + WebUI 接入 + 移除 ruyi 版
 
 **新增**

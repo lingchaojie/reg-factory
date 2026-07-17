@@ -2,6 +2,7 @@ import unittest
 
 from common import account_proxy
 from common.ipmart_proxy import IPMartProxyError, ProxyLease
+from webui import scripts
 
 
 class AccountProxyTests(unittest.TestCase):
@@ -50,6 +51,20 @@ class AccountProxyTests(unittest.TestCase):
             with self.subTest(env=env):
                 with self.assertRaises(IPMartProxyError):
                     account_proxy.lease_from_env(env)
+
+    def test_ipmart_configuration_keys_are_exposed_in_webui(self):
+        keys = set(scripts.env_keys())
+        self.assertTrue(
+            {
+                "IPMART_ENABLED",
+                "IPMART_ACCESS_KEY",
+                "IPMART_API_BASE",
+                "IPMART_COUNTRY",
+                "IPMART_STICKY_MINUTES",
+                "IPMART_MAX_ATTEMPTS",
+                "IPMART_IP_CHECK_URL",
+            }.issubset(keys)
+        )
 
 
 if __name__ == "__main__":

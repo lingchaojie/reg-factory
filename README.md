@@ -210,6 +210,13 @@ cp .env.example .env
 | `CLASH_API` | Clash 控制面地址（默认 `http://127.0.0.1:9097`） | 否 |
 | `CLASH_PROXY` | Clash 混合端口代理（默认 `http://127.0.0.1:7897`） | 否 |
 | `CLASH_GROUP` | 切换出口的代理组名（默认 `GLOBAL`） | 否 |
+| `IPMART_ENABLED` | 每账号使用一个 IPMart HTTP 代理；`1` 启用，默认 `0` | 否 |
+| `IPMART_ACCESS_KEY` | IPMart API accessKey（仅启用时读取，不写入日志） | 启用 IPMart 时 |
+| `IPMART_API_BASE` | IPMart 获取代理接口（默认 `https://api.ipmart.io/ipmart/common/getIps`） | 否 |
+| `IPMART_COUNTRY` | 代理国家代码（默认 `US`） | 否 |
+| `IPMART_STICKY_MINUTES` | 代理粘性分钟数（默认 `30`，允许 `5-30`） | 否 |
+| `IPMART_MAX_ATTEMPTS` | 获取、验活或出口重复时的最大尝试次数（默认 `3`） | 否 |
+| `IPMART_IP_CHECK_URL` | 真实出口 IP 校验地址（默认 ipify JSON API） | 否 |
 | `FINGERPRINT_BROWSER` | 指纹浏览器 provider：`bitbrowser` / `adspower`（默认 `bitbrowser`） | 否 |
 | `BITBROWSER_API` | 比特浏览器本地 API（默认 `http://127.0.0.1:54345`） | 否 |
 | `ADSPOWER_API` | AdsPower 本地 API（默认 `http://127.0.0.1:50325`） | 使用 AdsPower 时 |
@@ -255,6 +262,29 @@ python run_full_flow.py --dry-run             # 只打印将执行的命令
 > 自动注入 `HTTP(S)_PROXY` 与 `CLASH_API/SECRET/GROUP` 给子进程。
 > `--import-c2a` 逐层透传到 `register_chatgpt.py`，只对 chatgpt 平台生效，需先配 `CHATGPT2API_URL/KEY`。
 > `--email-confirm-before-register` 会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
+
+#### 每个账号使用独立 IPMart 代理
+
+先在 IPMart 后台把运行本项目的电脑公网 IP 加入白名单，再在 `.env` 填写：
+
+```dotenv
+IPMART_ENABLED=1
+IPMART_ACCESS_KEY=你的_access_key
+IPMART_COUNTRY=US
+IPMART_STICKY_MINUTES=30
+IPMART_MAX_ATTEMPTS=3
+```
+
+本地无消耗检查与真实单轮运行：
+
+```bash
+python run_full_flow.py --platforms claude --dry-run
+python run_full_flow.py --platforms claude --rounds 1
+```
+
+启用后，每轮会直接调用 IPMart 获取一个 `num=1`、`format=1` 的美国 HTTP 代理，先通过代理检查真实出口 IP，再把同一代理写入本轮 Outlook 和 Claude 的临时 BitBrowser profile。进入 Claude 阶段前会再次检查出口；代理失效或出口改变时终止本轮，最多获取 3 次，**不会回退到 Clash、直连或已有 BitBrowser profile**。临时 profile 在流程结束后照常删除，不依赖 IPMart 后台继续保留该条代理配置。
+
+默认粘性时间是 30 分钟，单轮应在有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。`--dry-run` 只打印流程，不调用 IPMart，也不占用代理分配。
 
 ### 仅三平台注册（已有邮箱池 emails.txt）
 ```bash
