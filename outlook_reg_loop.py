@@ -29,6 +29,10 @@ import importlib.util
 import urllib.request
 from datetime import datetime
 
+import config  # noqa: F401 - load .env before reading proxy settings
+from common.account_proxy import bitbrowser_proxy_fields, lease_from_env
+from common.ipmart_proxy import IPMartProxyError, acquire_proxy, settings_from_env
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -66,6 +70,10 @@ def _env_truthy_norotate():
     return (os.environ.get("OUTLOOK_NO_ROTATE", "") or "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+def should_skip_clash_rotation(env=None):
+    return lease_from_env(os.environ if env is None else env) is not None
 
 
 def ensure_clash_proxy_env():
@@ -358,11 +366,16 @@ def _bb_call(path, body):
         return json.loads(r.read())
 
 
-def bb_create_for_outlook_reg(name):
+def bb_create_for_outlook_reg(name, lease=None):
     """Mirror bs_register_step1.bb_create_ephemeral so we share the working
     fingerprint config (proxyType=noproxy + IP-derived locale; routes through
     Clash via TUN). Standalone's hardcoded coreVersion=130 returns 502 on
     BitBrowser builds that only have Chromium 146 installed."""
+    proxy_fields = (
+        bitbrowser_proxy_fields(lease)
+        if lease is not None
+        else {"proxyMethod": 2, "proxyType": "noproxy"}
+    )
     if _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
         from bitbrowser import BitBrowser
         return BitBrowser().create_browser(
@@ -370,8 +383,7 @@ def bb_create_for_outlook_reg(name):
             remark="outlook reg loop auto-deleted after use",
             platform="https://outlook.live.com",
             platformIcon="outlook.live.com",
-            proxyMethod=2,
-            proxyType="noproxy",
+            **proxy_fields,
             browserFingerPrint={
                 "ostype": "PC",
                 "os": "Win32",
@@ -388,8 +400,7 @@ def bb_create_for_outlook_reg(name):
         "remark": "outlook reg loop — auto-deleted after use",
         "platform": "https://outlook.live.com",
         "platformIcon": "outlook.live.com",
-        "proxyMethod": 2,
-        "proxyType": "noproxy",
+        **proxy_fields,
         "browserFingerPrint": {
             "ostype": "PC",
             "os": "Win32",
@@ -619,7 +630,7 @@ async def _run_outlook_on_ctx(mod, ctx, idx):
     return email, password, cookies
 
 
-async def one_attempt(mod, proxy_str, idx):
+async def one_attempt(mod, proxy_str, idx, lease=None):
     """Mirrors bs_register_step1.fetch_email_from_self_register's inline
     flow, but doesn't carry the breaker state — we're a dedicated loop and
     want to keep trying."""
@@ -632,7 +643,9 @@ async def one_attempt(mod, proxy_str, idx):
                 # Use our own create that picks coreVersion=146 (matches the
                 # BitBrowser install on this machine). Standalone's hardcoded
                 # 130 makes BB return 502.
-                profile_id = bb_create_for_outlook_reg(f"outlook_loop_{ts}_{idx}")
+                profile_id = bb_create_for_outlook_reg(
+                    f"outlook_loop_{ts}_{idx}", lease
+                )
                 break
             except Exception as e:
                 m = str(e)
@@ -691,7 +704,14 @@ def main():
     args = ap.parse_args()
 
     # 不轮换开关：命令行 --no-rotate 或 env OUTLOOK_NO_ROTATE 任一为真即生效。
-    no_rotate = args.no_rotate or _env_truthy_norotate()
+    inherited_lease = lease_from_env()
+    ipmart_settings = settings_from_env()
+    no_rotate = (
+        args.no_rotate
+        or _env_truthy_norotate()
+        or inherited_lease is not None
+        or ipmart_settings.enabled
+    )
 
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
     if args.confirm_before_register:
@@ -707,7 +727,15 @@ def main():
     if injected_proxy:
         log(f"proxy env ready: {injected_proxy}")
     proxy = clash_proxy_from_env()
-    if not proxy:
+    if inherited_lease is not None:
+        log(
+            "using inherited IPMart proxy: "
+            f"{inherited_lease.host}:{inherited_lease.port} "
+            f"exit={inherited_lease.exit_ip}"
+        )
+    elif ipmart_settings.enabled:
+        log("IPMart enabled: acquiring one proxy per Outlook attempt")
+    elif not proxy:
         log("HTTP_PROXY not set — running without proxy (signup will likely fail)", "WARN")
     else:
         log(f"using clash proxy: {proxy}")
@@ -752,9 +780,26 @@ def main():
         t0 = time.time()
         email = password = None
         cookies = []
+        attempt_lease = inherited_lease
+        if attempt_lease is None and ipmart_settings.enabled:
+            try:
+                attempt_lease = acquire_proxy()
+                log(
+                    "IPMart proxy acquired: "
+                    f"{attempt_lease.host}:{attempt_lease.port} "
+                    f"exit={attempt_lease.exit_ip}"
+                )
+            except IPMartProxyError as exc:
+                failed += 1
+                log(f"IPMart proxy unavailable: {exc}", "ERR")
+                time.sleep(args.sleep)
+                continue
         try:
             email, password, cookies = asyncio.run(
-                asyncio.wait_for(one_attempt(mod, proxy, n), timeout=args.timeout)
+                asyncio.wait_for(
+                    one_attempt(mod, proxy, n, attempt_lease),
+                    timeout=args.timeout,
+                )
             )
         except Exception as e:
             log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
