@@ -46,6 +46,14 @@ try:
 except Exception:
     pass
 
+from common.account_proxy import lease_to_env
+from common.ipmart_proxy import (
+    IPMartProxyError,
+    acquire_proxy,
+    settings_from_env,
+    verify_proxy,
+)
+
 # 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
@@ -195,9 +203,25 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
 
 
 # ---------------------------------------------------------------- 单轮
-def run_once(args, env):
+def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
     """跑一轮 A+B。返回 Stage B 的 exit code（0=成功）；没拿到邮箱返回 1。"""
     t0 = time.time()
+    round_env = dict(env)
+    account_lease = None
+    ipmart_settings = settings_from_env(round_env)
+    if ipmart_settings.enabled and not args.dry_run:
+        try:
+            account_lease = acquire(env=round_env)
+        except IPMartProxyError as exc:
+            log(f"IPMart proxy acquisition failed: {exc}", "ERR")
+            return 1, ""
+        round_env.update(lease_to_env(account_lease))
+        log(
+            "IPMart proxy reserved for this account: "
+            f"{account_lease.host}:{account_lease.port} "
+            f"exit={account_lease.exit_ip}"
+        )
+
     # Stage A
     token = client_id = ""
     if args.skip_email:
@@ -206,7 +230,7 @@ def run_once(args, env):
         email, password = args.email.strip(), args.password.strip()
         log(f"跳过邮箱注册，直接用 {email}", "A")
     else:
-        got = stage_email(args, env)
+        got = stage_email(args, round_env)
         if not got:
             log("Stage A 没拿到可用邮箱，本轮终止", "ERR")
             return 1, ""
@@ -214,9 +238,22 @@ def run_once(args, env):
         # emails.txt 里可能没记密码，用快照里的
         password = password or args.password
 
+    if account_lease is not None:
+        try:
+            verify(
+                account_lease,
+                expected_exit_ip=account_lease.exit_ip,
+                env=round_env,
+            )
+        except IPMartProxyError as exc:
+            log(f"IPMart proxy changed before Claude: {exc}", "ERR")
+            return 1, email
+
     # Stage B
     print("=" * 64)
-    rc = stage_platforms(args, env, email, password, token, client_id)
+    rc = stage_platforms(
+        args, round_env, email, password, token, client_id
+    )
     print("=" * 64)
     dt = time.time() - t0
     log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
