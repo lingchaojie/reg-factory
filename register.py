@@ -30,6 +30,12 @@ try:
 except Exception:
     proxy_switch = None
 from common import human_mouse as _hm
+from common.account_proxy import bitbrowser_proxy_fields, lease_from_env
+from common.ipmart_proxy import (
+    IPMartProxyError,
+    acquire_proxy,
+    settings_from_env,
+)
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -101,6 +107,58 @@ def _pick_claude_node():
         node = proxy_switch.find_working_node(
             test_url="https://claude.ai/login", challenge_markers=markers, candidates=alln)
     return node
+
+
+def configure_claude_proxy(
+    node_arg, account_lease=None, *, ipmart_enabled=False
+):
+    global CLAUDE_PROXY_NODE
+    CLAUDE_PROXY_NODE = None
+    if account_lease is not None:
+        print(
+            "  [proxy] IPMart account proxy "
+            f"{account_lease.host}:{account_lease.port} "
+            f"exit={account_lease.exit_ip}"
+        )
+        return
+    if ipmart_enabled:
+        print("  [proxy] IPMart enabled; skipping Clash node selection")
+        return
+    if not node_arg or node_arg.lower() == "none":
+        return
+    if proxy_switch is None:
+        print(
+            "  [proxy] proxy_switch unavailable; "
+            "Claude may be region-blocked"
+        )
+        return
+    try:
+        if node_arg.lower() == "auto":
+            print("  [proxy] probing Clash nodes for Claude...")
+            node = _pick_claude_node()
+            if not node:
+                print(
+                    "  [proxy] no working Claude node found; "
+                    "continuing without a browser proxy"
+                )
+                return
+            CLAUDE_PROXY_NODE = node
+            _record_claude_node(node)
+            print(f"  [proxy] selected node: {node}")
+            return
+        proxy_switch.set_node(node_arg)
+        time.sleep(2)
+        CLAUDE_PROXY_NODE = node_arg
+        print(f"  [proxy] selected node: {proxy_switch.current_node()}")
+    except Exception as exc:
+        print(f"  [proxy] Clash node selection failed: {exc}")
+
+
+def create_claude_profile(bb, name, account_lease=None):
+    proxy_fields = (
+        bitbrowser_proxy_fields(account_lease) if account_lease else {}
+    )
+    return bb.create_browser(name=name, **proxy_fields)
 
 # web2api 验证服务地址
 WEB2API_BASE = "http://127.0.0.1:9000"
@@ -3842,28 +3900,13 @@ async def main():
     REGISTER_TIMEOUT = args.timeout
     CLAUDE_PROXY_PORT = args.proxy_port
 
-    # 选 Clash 节点过 claude 区域封锁（app-unavailable-in-region）
-    if args.node and args.node.lower() != "none":
-        if proxy_switch is None:
-            print("  [proxy] proxy_switch 不可用，跳过节点选择（claude 可能被区域封锁）")
-        else:
-            try:
-                if args.node.lower() == "auto":
-                    print("  [proxy] 自动探测能进 claude 的节点(轮换避开最近用过的)...")
-                    node = _pick_claude_node()
-                    if not node:
-                        print("  [proxy] 没找到能进 claude 的节点，仍按无代理继续(大概率失败)")
-                    else:
-                        CLAUDE_PROXY_NODE = node
-                        _record_claude_node(node)
-                        print(f"  [proxy] 选用节点: {node}")
-                else:
-                    proxy_switch.set_node(args.node)
-                    time.sleep(2)
-                    CLAUDE_PROXY_NODE = args.node
-                    print(f"  [proxy] 使用指定节点 -> {proxy_switch.current_node()}")
-            except Exception as e:
-                print(f"  [proxy] 切节点失败(确认 Clash 在跑): {e}")
+    inherited_lease = lease_from_env()
+    ipmart_settings = settings_from_env()
+    configure_claude_proxy(
+        args.node,
+        inherited_lease,
+        ipmart_enabled=ipmart_settings.enabled,
+    )
 
     print("=" * 50)
     print("  Claude.ai Auto Register")
@@ -3914,13 +3957,35 @@ async def main():
                 email, email_password, email_token = email_list[i - 1]
                 print(f"\n  email from file: {email}")
 
+            account_lease = inherited_lease
+            if account_lease is None and ipmart_settings.enabled:
+                try:
+                    account_lease = await asyncio.to_thread(acquire_proxy)
+                    print(
+                        "  [proxy] IPMart proxy acquired: "
+                        f"{account_lease.host}:{account_lease.port} "
+                        f"exit={account_lease.exit_ip}"
+                    )
+                except IPMartProxyError as exc:
+                    print(f"  FATAL: IPMart proxy unavailable: {exc}")
+                    async with results_lock:
+                        results.append({
+                            "index": i,
+                            "profile": "-",
+                            "status": "ERROR",
+                            "sk": None,
+                        })
+                    return
+
             ts = datetime.now().strftime("%m%d_%H%M%S") + f"_{i}"
             name = f"claude_{ts}"
             print(f"\n  create browser: {name}")
             profile_id = None
             for _retry in range(3):
                 try:
-                    profile_id = bb.create_browser(name=name)
+                    profile_id = create_claude_profile(
+                        bb, name, account_lease
+                    )
                     break
                 except Exception as e:
                     err_msg = str(e)
@@ -3940,7 +4005,7 @@ async def main():
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
                 return
             # 走 Clash 节点：更新窗口为 http 代理（绕 claude 区域封锁）
-            if CLAUDE_PROXY_NODE:
+            if account_lease is None and CLAUDE_PROXY_NODE:
                 try:
                     bb._post("/browser/update", {
                         "id": profile_id, "name": name, "proxyMethod": 2, "proxyType": "http",
