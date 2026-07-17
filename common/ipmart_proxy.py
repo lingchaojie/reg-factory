@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import ipaddress
 import json
 import os
+import re
+import secrets
 import threading
 import time
+from urllib.parse import quote
 
 import requests
 
 
-DEFAULT_API_BASE = "https://api.ipmart.io/ipmart/common/getIps"
 DEFAULT_IP_CHECK_URL = "https://api.ipify.org?format=json"
 DEFAULT_USAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -27,10 +29,10 @@ class IPMartProxyError(RuntimeError):
 @dataclass(frozen=True)
 class IPMartSettings:
     enabled: bool
-    access_key: str
-    api_base: str
-    country: str
-    sticky_minutes: int
+    proxy_host: str
+    proxy_port: int
+    username_template: str = field(repr=False)
+    password: str = field(repr=False)
     max_attempts: int
     ip_check_url: str
 
@@ -40,6 +42,9 @@ class ProxyLease:
     proxy_type: str
     host: str
     port: int
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+    sid: str
     exit_ip: str
 
 
@@ -57,54 +62,53 @@ def _env_int(env, key: str, default: str) -> int:
 def settings_from_env(env=None) -> IPMartSettings:
     env = os.environ if env is None else env
     enabled = _truthy(env.get("IPMART_ENABLED", "0"))
-    access_key = (env.get("IPMART_ACCESS_KEY") or "").strip()
-    sticky_minutes = _env_int(env, "IPMART_STICKY_MINUTES", "30")
-    max_attempts = _env_int(env, "IPMART_MAX_ATTEMPTS", "3")
-
-    if enabled and not access_key:
-        raise IPMartProxyError(
-            "IPMART_ACCESS_KEY is required when IPMart is enabled"
-        )
-    if not 5 <= sticky_minutes <= 30:
-        raise IPMartProxyError(
-            "IPMART_STICKY_MINUTES must be between 5 and 30"
-        )
-    if max_attempts < 1:
+    host = (env.get("IPMART_PROXY_HOST") or "").strip()
+    raw_port = (env.get("IPMART_PROXY_PORT") or "").strip()
+    template = (env.get("IPMART_PROXY_USERNAME_TEMPLATE") or "").strip()
+    password = env.get("IPMART_PROXY_PASSWORD") or ""
+    attempts = _env_int(env, "IPMART_MAX_ATTEMPTS", "3")
+    check_url = (env.get("IPMART_IP_CHECK_URL") or DEFAULT_IP_CHECK_URL).strip()
+    if enabled:
+        if not host:
+            raise IPMartProxyError("IPMART_PROXY_HOST is required")
+        if not raw_port.isdigit() or not 1 <= int(raw_port) <= 65535:
+            raise IPMartProxyError("IPMART_PROXY_PORT must be between 1 and 65535")
+        if template.count("{sid}") != 1:
+            raise IPMartProxyError(
+                "IPMART_PROXY_USERNAME_TEMPLATE must contain exactly one {sid}"
+            )
+        if not password:
+            raise IPMartProxyError("IPMART_PROXY_PASSWORD is required")
+    if attempts < 1:
         raise IPMartProxyError("IPMART_MAX_ATTEMPTS must be positive")
-
+    if not check_url:
+        raise IPMartProxyError("IPMART_IP_CHECK_URL is required")
     return IPMartSettings(
         enabled=enabled,
-        access_key=access_key,
-        api_base=(env.get("IPMART_API_BASE") or DEFAULT_API_BASE).strip(),
-        country=(env.get("IPMART_COUNTRY") or "US").strip().upper(),
-        sticky_minutes=sticky_minutes,
-        max_attempts=max_attempts,
-        ip_check_url=(
-            env.get("IPMART_IP_CHECK_URL") or DEFAULT_IP_CHECK_URL
-        ).strip(),
+        proxy_host=host,
+        proxy_port=int(raw_port) if raw_port.isdigit() else 0,
+        username_template=template,
+        password=password,
+        max_attempts=attempts,
+        ip_check_url=check_url,
     )
 
 
-def parse_proxy_text(text: str) -> tuple[str, int]:
-    body = (text or "").strip()
-    if not body or "<html" in body.lower():
-        raise IPMartProxyError("IPMart returned no usable proxy endpoint")
-
-    line = next((item.strip() for item in body.splitlines() if item.strip()), "")
-    host, separator, raw_port = line.rpartition(":")
-    if not separator or not host or not raw_port.isdigit():
-        raise IPMartProxyError("IPMart returned a malformed proxy endpoint")
-
-    port = int(raw_port)
-    if not 1 <= port <= 65535:
-        raise IPMartProxyError("IPMart returned an invalid proxy port")
-    return host.strip("[]"), port
+def generate_sid(randbelow=secrets.randbelow) -> str:
+    return f"{randbelow(100_000_000):08d}"
 
 
-def _new_direct_session(factory):
-    session = factory()
+def requests_proxy_url(lease: ProxyLease) -> str:
+    username = quote(lease.username, safe="")
+    password = quote(lease.password, safe="")
+    return f"http://{username}:{password}@{lease.host}:{lease.port}"
+
+
+def _credentialed_session(lease, session_factory):
+    session = session_factory()
     session.trust_env = False
-    session.proxies = {}
+    proxy_url = requests_proxy_url(lease)
+    session.proxies = {"http": proxy_url, "https": proxy_url}
     return session
 
 
@@ -133,16 +137,14 @@ def verify_proxy(
     session_factory=requests.Session,
 ) -> str:
     settings = settings_from_env(env)
-    session = _new_direct_session(session_factory)
-    proxy_url = f"http://{lease.host}:{lease.port}"
-    session.proxies = {"http": proxy_url, "https": proxy_url}
+    session = _credentialed_session(lease, session_factory)
     try:
         response = session.get(settings.ip_check_url, timeout=20)
         exit_ip = _read_exit_ip(response)
     except IPMartProxyError:
         raise
-    except Exception as exc:
-        raise IPMartProxyError("proxy IP check request failed") from exc
+    except Exception:
+        raise IPMartProxyError("proxy IP check request failed") from None
 
     if expected_exit_ip and exit_ip != expected_exit_ip:
         raise IPMartProxyError(
@@ -171,6 +173,7 @@ def _write_lease(lease: ProxyLease, path: str) -> None:
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "endpoint": f"{lease.host}:{lease.port}",
+        "sid": lease.sid,
         "exit_ip": lease.exit_ip,
     }
     with open(path, "a", encoding="utf-8") as stream:
@@ -192,13 +195,22 @@ def _reserve_if_unique(lease: ProxyLease, path: str | None = None) -> bool:
         return True
 
 
+def _next_unique_sid(sid_factory, seen):
+    for _ in range(10):
+        sid = sid_factory()
+        if re.fullmatch(r"\d{8}", sid or "") and sid not in seen:
+            seen.add(sid)
+            return sid
+    raise IPMartProxyError("could not generate a unique eight-digit SID")
+
+
 def acquire_proxy(
     used_exit_ips: set[str] | None = None,
     usage_path: str | None = None,
     *,
     env=None,
-    api_session_factory=requests.Session,
-    probe_session_factory=requests.Session,
+    session_factory=requests.Session,
+    sid_factory=generate_sid,
     reserve: bool = True,
     sleep=time.sleep,
 ) -> ProxyLease:
@@ -209,54 +221,35 @@ def acquire_proxy(
         )
 
     used = set(used_exit_ips or ()) | load_used_exit_ips(usage_path)
-    last_error = "unknown error"
+    attempted_sids = set()
+    last_error = "proxy validation failed"
     for attempt in range(1, settings.max_attempts + 1):
         try:
-            session = _new_direct_session(api_session_factory)
-            response = session.get(
-                settings.api_base,
-                params={
-                    "accessKey": settings.access_key,
-                    "num": 1,
-                    "cntryCode": settings.country,
-                    "time": settings.sticky_minutes,
-                    "format": 1,
-                },
-                timeout=20,
+            sid = _next_unique_sid(sid_factory, attempted_sids)
+            candidate = ProxyLease(
+                proxy_type="http",
+                host=settings.proxy_host,
+                port=settings.proxy_port,
+                username=settings.username_template.replace("{sid}", sid),
+                password=settings.password,
+                sid=sid,
+                exit_ip="",
             )
-            if response.status_code != 200:
-                raise IPMartProxyError(
-                    f"IPMart API returned HTTP {response.status_code}"
-                )
-
-            host, port = parse_proxy_text(response.text)
-            candidate = ProxyLease("http", host, port, "")
             exit_ip = verify_proxy(
-                candidate,
-                env=env,
-                session_factory=probe_session_factory,
+                candidate, env=env, session_factory=session_factory
             )
             if exit_ip in used:
-                raise IPMartProxyError(
-                    f"IPMart returned duplicate exit IP {exit_ip}"
-                )
-
-            lease = ProxyLease("http", host, port, exit_ip)
+                raise IPMartProxyError(f"duplicate proxy exit IP {exit_ip}")
+            lease = replace(candidate, exit_ip=exit_ip)
             if reserve and not _reserve_if_unique(lease, usage_path):
                 used.add(exit_ip)
-                raise IPMartProxyError(
-                    f"IPMart returned duplicate exit IP {exit_ip}"
-                )
+                raise IPMartProxyError(f"duplicate proxy exit IP {exit_ip}")
             return lease
         except IPMartProxyError as exc:
             last_error = str(exc)
-        except Exception:
-            last_error = "IPMart API request failed"
-
         if attempt < settings.max_attempts:
             sleep(attempt)
-
     raise IPMartProxyError(
-        "IPMart proxy acquisition failed after "
-        f"{settings.max_attempts} attempts: {last_error}"
+        f"IPMart proxy acquisition failed after {settings.max_attempts} "
+        f"attempts: {last_error}"
     )

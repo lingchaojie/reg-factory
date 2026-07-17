@@ -8,7 +8,9 @@ from common.ipmart_proxy import ProxyLease
 class ClaudeIPMartProxyTests(unittest.TestCase):
     def setUp(self):
         self.lease = ProxyLease(
-            "http", "edge.example", 8080, "203.0.113.8"
+            "http", "gateway.example", 8080,
+            "account-res-US-sid-00000042", "proxy-secret",
+            "00000042", "203.0.113.8",
         )
 
     def test_create_profile_uses_inherited_lease(self):
@@ -26,8 +28,10 @@ class ClaudeIPMartProxyTests(unittest.TestCase):
                 "name": "claude-1",
                 "proxyMethod": 2,
                 "proxyType": "http",
-                "host": "edge.example",
+                "host": "gateway.example",
                 "port": "8080",
+                "proxyUserName": "account-res-US-sid-00000042",
+                "proxyPassword": "proxy-secret",
             },
         )
 

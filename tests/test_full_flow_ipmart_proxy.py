@@ -34,11 +34,16 @@ def args_for_test(dry_run=False):
 class FullFlowIPMartProxyTests(unittest.TestCase):
     def setUp(self):
         self.lease = ProxyLease(
-            "http", "edge.example", 8080, "203.0.113.8"
+            "http", "gateway.example", 8080,
+            "account-res-US-sid-00000042", "proxy-secret",
+            "00000042", "203.0.113.8",
         )
         self.base_env = {
             "IPMART_ENABLED": "1",
-            "IPMART_ACCESS_KEY": "top-secret-key",
+            "IPMART_PROXY_HOST": "gateway.example",
+            "IPMART_PROXY_PORT": "8080",
+            "IPMART_PROXY_USERNAME_TEMPLATE": "account-res-US-sid-{sid}",
+            "IPMART_PROXY_PASSWORD": "proxy-secret",
         }
 
     def test_one_lease_reaches_both_stages_and_is_rechecked(self):
@@ -74,8 +79,14 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
         self.assertEqual(len(captured), 2)
         self.assertEqual(captured[0], captured[1])
         self.assertEqual(captured[0]["ACCOUNT_PROXY_SOURCE"], "ipmart")
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_HOST"], "edge.example")
+        self.assertEqual(captured[0]["ACCOUNT_PROXY_HOST"], "gateway.example")
         self.assertEqual(captured[0]["ACCOUNT_PROXY_PORT"], "8080")
+        self.assertEqual(
+            captured[0]["ACCOUNT_PROXY_USERNAME"],
+            "account-res-US-sid-00000042",
+        )
+        self.assertEqual(captured[0]["ACCOUNT_PROXY_PASSWORD"], "proxy-secret")
+        self.assertEqual(captured[0]["ACCOUNT_PROXY_SID"], "00000042")
         self.assertEqual(captured[0]["ACCOUNT_PROXY_EXIT_IP"], "203.0.113.8")
         self.assertEqual(
             verify_calls,

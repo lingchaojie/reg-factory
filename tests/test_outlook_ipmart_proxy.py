@@ -9,7 +9,9 @@ from common.ipmart_proxy import ProxyLease
 class OutlookIPMartProxyTests(unittest.TestCase):
     def setUp(self):
         self.lease = ProxyLease(
-            "http", "edge.example", 8080, "203.0.113.8"
+            "http", "gateway.example", 8080,
+            "account-res-US-sid-00000042", "proxy-secret",
+            "00000042", "203.0.113.8",
         )
 
     def test_profile_creation_applies_ipmart_http_proxy(self):
@@ -27,10 +29,10 @@ class OutlookIPMartProxyTests(unittest.TestCase):
         body = call.call_args.args[1]
         self.assertEqual(body["proxyMethod"], 2)
         self.assertEqual(body["proxyType"], "http")
-        self.assertEqual(body["host"], "edge.example")
+        self.assertEqual(body["host"], "gateway.example")
         self.assertEqual(body["port"], "8080")
-        self.assertNotIn("proxyUserName", body)
-        self.assertNotIn("proxyPassword", body)
+        self.assertEqual(body["proxyUserName"], "account-res-US-sid-00000042")
+        self.assertEqual(body["proxyPassword"], "proxy-secret")
 
     def test_profile_creation_keeps_noproxy_when_no_lease_exists(self):
         response = {"success": True, "data": {"id": "profile-1"}}
@@ -49,8 +51,11 @@ class OutlookIPMartProxyTests(unittest.TestCase):
         env = {
             "ACCOUNT_PROXY_SOURCE": "ipmart",
             "ACCOUNT_PROXY_TYPE": "http",
-            "ACCOUNT_PROXY_HOST": "edge.example",
+            "ACCOUNT_PROXY_HOST": "gateway.example",
             "ACCOUNT_PROXY_PORT": "8080",
+            "ACCOUNT_PROXY_USERNAME": "account-res-US-sid-00000042",
+            "ACCOUNT_PROXY_PASSWORD": "proxy-secret",
+            "ACCOUNT_PROXY_SID": "00000042",
             "ACCOUNT_PROXY_EXIT_IP": "203.0.113.8",
         }
 
