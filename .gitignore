@@ -16,6 +16,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.worktrees/
 
 # 运行期数据 / PII（账号、cookie、日志、截图）
 cookies/**
