@@ -55,6 +55,10 @@ The NINEMALL source file is read-only. In particular, the implementation must
 ignore an AppleEmail `new_refresh_token` response field and must never update,
 rewrite, reorder, delete, or consume rows from `mail.txt`.
 
+The repository ignore rules must cover `mail.txt`, `mail_used_claude.txt`, and
+`mail_error_claude.txt` so account credentials and local processing state cannot
+be committed accidentally.
+
 Claude reservation state is stored separately:
 
 - `mail_used_claude.txt` records reserved and successfully used addresses.
