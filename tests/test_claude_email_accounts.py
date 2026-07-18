@@ -106,6 +106,53 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         self.assertNotIn(account.client_id, state)
         self.assertNotIn(account.refresh_token, state)
 
+    def test_terminal_success_remains_blocked_after_later_release(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        self.write(
+            "mail_used_claude.txt",
+            "person@example.com----reserved\n"
+            "person@example.com----ok\n"
+            "person@example.com----released\n",
+        )
+
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root
+        ).reserve_one()
+
+        self.assertIsNone(selected)
+
+    def test_terminal_error_remains_blocked_after_later_release(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        self.write(
+            "mail_used_claude.txt",
+            "person@example.com----reserved\n"
+            "person@example.com----released\n",
+        )
+        self.write(
+            "mail_error_claude.txt",
+            "person@example.com----registration_error\n",
+        )
+
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root
+        ).reserve_one()
+
+        self.assertIsNone(selected)
+
+    def test_nonterminal_release_remains_selectable(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        self.write(
+            "mail_used_claude.txt",
+            "person@example.com----reserved\n"
+            "person@example.com----released\n",
+        )
+
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root
+        ).reserve_one()
+
+        self.assertEqual(selected.email, "person@example.com")
+
     def test_terminal_reservation_cannot_be_released(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")
         store = ClaudeEmailAccountStore("NINEMALL", source, self.root)

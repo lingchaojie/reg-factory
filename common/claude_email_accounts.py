@@ -86,16 +86,15 @@ class ClaudeEmailAccountStore:
         )
 
     def _blocked(self):
-        blocked = set()
-        error_blocked = set()
+        terminal = set()
         if self.error_file.exists():
             for raw in self.error_file.read_text(encoding="utf-8").splitlines():
                 value = raw.strip()
                 if value and not value.startswith("#"):
-                    error_blocked.add(
+                    terminal.add(
                         value.split("----", 1)[0].strip().lower()
                     )
-        blocked.update(error_blocked)
+        used_events = []
         if self.used_file.exists():
             for raw in self.used_file.read_text(encoding="utf-8").splitlines():
                 value = raw.strip()
@@ -112,10 +111,27 @@ class ClaudeEmailAccountStore:
                     and len(parts) >= 3
                     and parts[-1].lower() == "released"
                 )
-                if released and email not in error_blocked:
-                    blocked.discard(email)
-                else:
-                    blocked.add(email)
+                terminal_success = (
+                    self.provider == "NINEMALL"
+                    and len(parts) == 2
+                    and parts[1].lower() == "ok"
+                ) or (
+                    self.provider == "OUTLOOK"
+                    and len(parts) >= 3
+                    and parts[-1].lower() == "ok"
+                )
+                used_events.append((email, released))
+                if terminal_success:
+                    terminal.add(email)
+
+        blocked = set(terminal)
+        for email, released in used_events:
+            if email in terminal:
+                blocked.add(email)
+            elif released:
+                blocked.discard(email)
+            else:
+                blocked.add(email)
         return blocked
 
     def _append_state(self, path, account, status):
