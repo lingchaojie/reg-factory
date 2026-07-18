@@ -207,14 +207,30 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
             result.magic_link,
             "https://platform.claude.com/magic-link?code=graph-secret",
         )
+        deadline = token.call_args.kwargs["deadline"]
         token.assert_called_once_with(
-            "refresh-secret", "client-guid", account_lease=lease
+            "refresh-secret",
+            "client-guid",
+            account_lease=lease,
+            deadline=deadline,
         )
         self.assertEqual(
             fetch.call_args_list,
             [
-                call("access-token", "inbox", top=10, account_lease=lease),
-                call("access-token", "junkemail", top=10, account_lease=lease),
+                call(
+                    "access-token",
+                    "inbox",
+                    top=10,
+                    account_lease=lease,
+                    deadline=deadline,
+                ),
+                call(
+                    "access-token",
+                    "junkemail",
+                    top=10,
+                    account_lease=lease,
+                    deadline=deadline,
+                ),
             ],
         )
         rendered = " ".join(str(item) for item in output.call_args_list)
@@ -234,42 +250,54 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
             "body": "Use this login code to sign in.",
             "received": "2020-01-01T00:00:00Z",
         }
-        clock = iter((0.0, 0.0, 2.0, 2.0))
-
         with patch("common.mailbox._get_access_token", return_value="token"), patch(
-            "common.mailbox.fetch_messages", side_effect=([stale], [])
-        ), patch.object(claude_platform_mailbox.time, "time", side_effect=clock), patch.object(
-            claude_platform_mailbox.time, "sleep"
+            "common.mailbox.fetch_messages", return_value=[stale]
         ), patch("builtins.print"):
             result = claude_platform_mailbox.get_claude_platform_verification_by_token(
                 "person@example.com",
                 "refresh-secret",
                 "client-guid",
-                max_wait=1,
+                max_wait=0.001,
+                poll=0.001,
                 received_after=2_000_000_000.0,
             )
 
         self.assertIsNone(result)
 
-    def test_browser_folder_scan_uses_shared_extractor_for_both_artifacts(self):
+    def browser_page(self, candidates, payload):
         page = Mock()
         page.evaluate = AsyncMock(
             side_effect=(
+                candidates,
                 True,
-                {
-                    "subject": "Your Claude Platform verification code is 482731",
-                    "body": (
-                        "Use this login code. "
-                        "https://platform.claude.com/magic-link?code=browser-secret"
-                    ),
-                },
+                payload,
             )
+        )
+        return page
+
+    def test_browser_folder_scan_uses_email_timestamp_for_both_artifacts(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:25Z",
+                    "stable_id": "message-a",
+                }
+            ],
+            {
+                "subject": "Your Claude Platform verification code is 482731",
+                "body": (
+                    "Use this login code. "
+                    "https://platform.claude.com/magic-link?code=browser-secret"
+                ),
+            },
         )
 
         with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
             result = asyncio.run(
                 claude_platform_mailbox._scan_claude_platform_folder(
-                    page, received_after=0.0
+                    page, received_after=2_000_000_000.0
                 )
             )
 
@@ -278,6 +306,170 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
             result.magic_link,
             "https://platform.claude.com/magic-link?code=browser-secret",
         )
+        self.assertEqual(result.received_at, 2_000_000_005.0)
+        self.assertEqual(page.evaluate.await_args_list[1].args[1], 0)
+
+    def test_browser_scan_ignores_hidden_first_match(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": False,
+                    "received": "2033-05-18T03:33:30Z",
+                    "stable_id": "hidden",
+                },
+                {
+                    "index": 1,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:25Z",
+                    "stable_id": "visible",
+                },
+            ],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(claude_platform_mailbox._scan_claude_platform_folder(page))
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(page.evaluate.await_args_list[1].args[1], 1)
+
+    def test_browser_scan_selects_newest_timestamp_not_dom_order(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:25Z",
+                    "stable_id": "older",
+                },
+                {
+                    "index": 1,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:35Z",
+                    "stable_id": "newer",
+                },
+            ],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(claude_platform_mailbox._scan_claude_platform_folder(page))
+
+        self.assertEqual(result.received_at, 2_000_000_015.0)
+        self.assertEqual(page.evaluate.await_args_list[1].args[1], 1)
+
+    def test_browser_scan_accepts_stable_epoch_millisecond_metadata(self):
+        page = self.browser_page(
+            [{
+                "index": 0,
+                "visible": True,
+                "received": "2000000015000",
+                "stable_id": "epoch-millis",
+            }],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(
+                claude_platform_mailbox._scan_claude_platform_folder(
+                    page, received_after=2_000_000_000.0
+                )
+            )
+
+        self.assertEqual(result.received_at, 2_000_000_015.0)
+
+    def test_browser_scan_rejects_stale_or_unknown_time_after_resend(self):
+        for received in ("2020-01-01T00:00:00Z", ""):
+            with self.subTest(received=received):
+                page = self.browser_page(
+                    [{"index": 0, "visible": True, "received": received, "stable_id": "same"}],
+                    {"subject": "Claude login code 482731", "body": "Sign in"},
+                )
+                with patch.object(
+                    claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()
+                ):
+                    result = asyncio.run(
+                        claude_platform_mailbox._scan_claude_platform_folder(
+                            page, received_after=2_000_000_000.0
+                        )
+                    )
+                self.assertIsNone(result)
+
+    def test_browser_scan_unknown_time_uses_stable_sentinel_without_filter(self):
+        results = []
+        for _ in range(2):
+            page = self.browser_page(
+                [{"index": 0, "visible": True, "received": "", "stable_id": "same"}],
+                {"subject": "Claude login code 482731", "body": "Sign in"},
+            )
+            with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+                results.append(
+                    asyncio.run(claude_platform_mailbox._scan_claude_platform_folder(page))
+                )
+
+        self.assertEqual(results[0].received_at, results[1].received_at)
+        self.assertEqual(results[0].received_at, 0.0)
+
+    def test_graph_deadline_starts_before_token_acquisition(self):
+        clock = Mock(side_effect=(100.0, 101.0))
+        with patch.object(claude_platform_mailbox.time, "monotonic", clock), patch(
+            "common.mailbox._get_access_token", return_value="token"
+        ) as token, patch("common.mailbox.fetch_messages") as fetch:
+            result = claude_platform_mailbox.get_claude_platform_verification_by_token(
+                "person@example.com", "refresh-secret", "client-guid", max_wait=1
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(token.call_args.kwargs["deadline"], 101.0)
+        fetch.assert_not_called()
+
+    def test_graph_deadline_stops_before_second_folder(self):
+        now = [100.0]
+
+        def fetch_folder(_token, folder, **_kwargs):
+            if folder == "inbox":
+                now[0] = 101.0
+            return []
+
+        with patch.object(
+            claude_platform_mailbox.time, "monotonic", side_effect=lambda: now[0]
+        ), patch("common.mailbox._get_access_token", return_value="token"), patch(
+            "common.mailbox.fetch_messages", side_effect=fetch_folder
+        ) as fetch, patch.object(claude_platform_mailbox.time, "sleep") as sleep:
+            result = claude_platform_mailbox.get_claude_platform_verification_by_token(
+                "person@example.com", "refresh-secret", "client-guid", max_wait=1
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual([item.args[1] for item in fetch.call_args_list], ["inbox"])
+        sleep.assert_not_called()
+
+    def test_outlook_deadline_starts_before_login_and_skips_navigation_when_spent(self):
+        page = Mock()
+        page.goto = AsyncMock()
+        now = [100.0]
+
+        async def spend_budget(*_args, **_kwargs):
+            now[0] = 101.0
+            return True
+
+        with patch.object(
+            claude_platform_mailbox.time, "monotonic", side_effect=lambda: now[0]
+        ), patch("common.mailbox._outlook_login", new=AsyncMock(side_effect=spend_budget)) as login, patch(
+            "common.mailbox._click_folder", new=AsyncMock()
+        ) as click_folder, patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()) as sleep:
+            result = asyncio.run(
+                claude_platform_mailbox.get_claude_platform_verification_outlook_pw(
+                    page, "person@example.com", "mail-pass", max_wait=1
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(login.await_args.kwargs["deadline"], 101.0)
+        page.goto.assert_not_awaited()
+        click_folder.assert_not_awaited()
+        sleep.assert_not_awaited()
 
     def test_outlook_password_poll_scans_shared_inbox_and_junk_names(self):
         page = Mock()
@@ -304,7 +496,15 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
         from common import mailbox
 
         self.assertEqual(result, verification)
-        login.assert_awaited_once_with(page, "person@example.com", "mail-pass")
+        self.assertGreater(page.goto.await_args.kwargs["timeout"], 0)
+        self.assertLessEqual(page.goto.await_args.kwargs["timeout"], 1000)
+        deadline = login.await_args.kwargs["deadline"]
+        login.assert_awaited_once_with(
+            page,
+            "person@example.com",
+            "mail-pass",
+            deadline=deadline,
+        )
         self.assertEqual(
             click_folder.await_args_list,
             [call(page, mailbox.INBOX_NAMES), call(page, mailbox.JUNK_NAMES)],
@@ -312,8 +512,16 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
         self.assertEqual(
             scan.await_args_list,
             [
-                call(page, received_after=2_000_000_000.0),
-                call(page, received_after=2_000_000_000.0),
+                call(
+                    page,
+                    received_after=2_000_000_000.0,
+                    deadline=deadline,
+                ),
+                call(
+                    page,
+                    received_after=2_000_000_000.0,
+                    deadline=deadline,
+                ),
             ],
         )
 

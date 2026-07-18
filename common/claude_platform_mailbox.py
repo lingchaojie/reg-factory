@@ -5,6 +5,7 @@ from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, unquote, urlparse
 import asyncio
+import math
 import os
 import re
 import time
@@ -56,6 +57,14 @@ def _received_epoch(value):
     text = str(value or "").strip()
     if not text:
         return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None and math.isfinite(numeric) and numeric >= 0:
+        if numeric >= 100_000_000_000:
+            numeric /= 1000.0
+        return numeric
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
@@ -153,23 +162,28 @@ def get_claude_platform_verification_by_token(
 ):
     from common import mailbox
 
+    start = time.monotonic()
+    deadline = start + max(0.0, float(max_wait))
     token = mailbox._get_access_token(
         refresh_token,
         client_id,
         account_lease=account_lease,
+        deadline=deadline,
     )
-    if not token:
+    if not token or time.monotonic() >= deadline:
         return None
-    start = time.time()
     refreshed = False
-    while time.time() - start < max_wait:
+    while time.monotonic() < deadline:
         messages = []
         for folder in mailbox.GRAPH_FOLDERS:
+            if time.monotonic() >= deadline:
+                return None
             for item in mailbox.fetch_messages(
                 token,
                 folder,
                 top=10,
                 account_lease=account_lease,
+                deadline=deadline,
             ):
                 messages.append(ClaudePlatformMessage(
                     sender=item.get("from", ""),
@@ -177,13 +191,15 @@ def get_claude_platform_verification_by_token(
                     received=item.get("received", ""),
                     body=item.get("body", ""),
                 ))
+            if time.monotonic() >= deadline:
+                return None
         result = extract_claude_platform_verification(
             messages,
             received_after=received_after,
         )
         if result:
             return result
-        elapsed = time.time() - start
+        elapsed = time.monotonic() - start
         print(
             "  [mail] waiting for Claude Platform verification "
             f"(inbox+junk)... ({int(elapsed)}s/{max_wait}s)"
@@ -194,30 +210,106 @@ def get_claude_platform_verification_by_token(
                 refresh_token,
                 client_id,
                 account_lease=account_lease,
+                deadline=deadline,
             )
             if new_token:
                 token = new_token
-        time.sleep(poll)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(float(poll), remaining))
     return None
 
 
-async def _scan_claude_platform_folder(page, received_after=None):
-    opened = await page.evaluate("""
+async def _scan_claude_platform_folder(
+    page,
+    received_after=None,
+    deadline=None,
+):
+    candidates = await page.evaluate("""
         () => {
-            const items = document.querySelectorAll('[role="option"], [role="listitem"]');
-            for (const item of items) {
+            const items = Array.from(
+                document.querySelectorAll('[role="option"], [role="listitem"]')
+            );
+            return items.map((item, index) => {
                 const text = (item.textContent || '').toLowerCase();
-                if (text.includes('anthropic') || text.includes('claude')) {
-                    item.click();
-                    return true;
-                }
-            }
-            return false;
+                if (!text.includes('anthropic') && !text.includes('claude')) return null;
+                const style = window.getComputedStyle(item);
+                const rect = item.getBoundingClientRect();
+                const visible = style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    rect.width > 0 && rect.height > 0;
+                const time = item.querySelector('time[datetime]');
+                const received = (time && time.getAttribute('datetime')) ||
+                    item.getAttribute('data-received') ||
+                    item.getAttribute('data-timestamp') ||
+                    item.getAttribute('data-time') || '';
+                const stableId = item.getAttribute('data-convid') ||
+                    item.getAttribute('data-item-id') ||
+                    item.getAttribute('data-id') || item.id || String(index);
+                return {index, visible, received, stable_id: stableId};
+            }).filter(Boolean);
         }
     """)
+    if not isinstance(candidates, list):
+        return None
+    visible = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and item.get("visible")
+    ]
+    if not visible:
+        return None
+
+    timestamped = []
+    for item in visible:
+        received_epoch = _received_epoch(item.get("received"))
+        if received_epoch is not None:
+            timestamped.append(
+                (received_epoch, str(item.get("stable_id") or ""), item)
+            )
+    if timestamped:
+        _received, _stable_id, selected = max(
+            timestamped,
+            key=lambda item: (item[0], item[1]),
+        )
+        received = str(selected.get("received") or "")
+    else:
+        if received_after is not None:
+            return None
+        selected = min(
+            visible,
+            key=lambda item: (
+                int(item.get("index") or 0),
+                str(item.get("stable_id") or ""),
+            ),
+        )
+        received = "1970-01-01T00:00:00+00:00"
+
+    opened = await page.evaluate(
+        """(index) => {
+            const items = Array.from(
+                document.querySelectorAll('[role="option"], [role="listitem"]')
+            );
+            const item = items[index];
+            if (!item) return false;
+            const text = (item.textContent || '').toLowerCase();
+            const style = window.getComputedStyle(item);
+            const rect = item.getBoundingClientRect();
+            if ((!text.includes('anthropic') && !text.includes('claude')) ||
+                style.display === 'none' || style.visibility === 'hidden' ||
+                rect.width <= 0 || rect.height <= 0) return false;
+            item.click();
+            return true;
+        }""",
+        int(selected.get("index") or 0),
+    )
     if not opened:
         return None
-    await asyncio.sleep(2)
+    from common.mailbox import _async_sleep_bounded
+
+    if not await _async_sleep_bounded(2, deadline):
+        return None
     payload = await page.evaluate("""
         () => {
             const pane = document.querySelector('[role="main"]') || document.body;
@@ -234,7 +326,7 @@ async def _scan_claude_platform_folder(page, received_after=None):
     message = ClaudePlatformMessage(
         sender="claude",
         subject=str(payload.get("subject") or ""),
-        received=datetime.now(timezone.utc).isoformat(),
+        received=received,
         body=str(payload.get("body") or ""),
     )
     return extract_claude_platform_verification(
@@ -255,23 +347,68 @@ async def get_claude_platform_verification_outlook_pw(
         _outlook_login,
         INBOX_NAMES,
         JUNK_NAMES,
+        _async_sleep_bounded,
     )
 
-    if not await _outlook_login(page, email, password):
+    deadline = time.monotonic() + max(0.0, float(max_wait))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         return None
-    await page.goto("https://outlook.live.com/mail/0/", timeout=60000)
-    start = time.time()
-    while time.time() - start < max_wait:
+    try:
+        logged_in = await asyncio.wait_for(
+            _outlook_login(page, email, password, deadline=deadline),
+            timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return None
+    if not logged_in:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    navigation_timeout = max(1, min(60000, int(remaining * 1000)))
+    try:
+        await asyncio.wait_for(
+            page.goto(
+                "https://outlook.live.com/mail/0/",
+                timeout=navigation_timeout,
+            ),
+            timeout=remaining,
+        )
+    except asyncio.TimeoutError:
+        return None
+    while time.monotonic() < deadline:
         for names in (INBOX_NAMES, JUNK_NAMES):
-            await _click_folder(page, names)
-            await asyncio.sleep(2)
-            result = await _scan_claude_platform_folder(
-                page,
-                received_after=received_after,
-            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                await asyncio.wait_for(
+                    _click_folder(page, names),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                return None
+            if not await _async_sleep_bounded(2, deadline):
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                result = await asyncio.wait_for(
+                    _scan_claude_platform_folder(
+                        page,
+                        received_after=received_after,
+                        deadline=deadline,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                return None
             if result:
                 return result
-        await asyncio.sleep(5)
+        if not await _async_sleep_bounded(5, deadline):
+            break
     return None
 
 
@@ -298,7 +435,11 @@ async def fetch_claude_platform_from_broker(
             base.rstrip("/") + "/fetch",
             json=payload,
         ) as response:
+            if not 200 <= int(response.status) < 300:
+                return None
             data = await response.json()
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None
     value = data.get("value")
     if not isinstance(value, dict):
         return None
@@ -306,8 +447,12 @@ async def fetch_claude_platform_from_broker(
     code = str(value.get("code") or "")
     if not magic_link and not code:
         return None
+    try:
+        received_at = float(value.get("received_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
     return ClaudePlatformVerification(
         magic_link=magic_link,
         code=code,
-        received_at=float(value.get("received_at") or 0.0),
+        received_at=received_at,
     )
