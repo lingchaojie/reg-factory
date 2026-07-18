@@ -178,6 +178,18 @@ class OctoBrowserTests(unittest.TestCase):
         self.assertIs(session.calls[0][2]["json"]["headless"], True)
         self.assertIs(session.calls[1][2]["json"]["headless"], False)
 
+    def test_start_defaults_headless_to_false_when_environment_is_missing(self):
+        browser, session = self.make_browser([
+            FakeResponse({
+                "uuid": "profile-1",
+                "ws_endpoint": "ws://127.0.0.1:55000/devtools/browser/id",
+                "debug_port": "55000",
+            })
+        ])
+        with patch.dict(os.environ, {}, clear=True):
+            browser.open_browser("profile-1")
+        self.assertIs(session.calls[0][2]["json"]["headless"], False)
+
     def test_list_and_delete_use_public_api(self):
         browser, session = self.make_browser([
             FakeResponse({
