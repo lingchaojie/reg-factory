@@ -12,6 +12,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SAFE_REASONS = {
     "http_400",
     "http_401",
+    "http_403",
     "invalid_json",
     "invalid_response",
     "magic_link_timeout",
@@ -186,6 +187,8 @@ class ClaudeEmailAccountStore:
             return self._load_accounts(limit=limit)
 
     def reserve_many(self, limit=None):
+        if limit is not None and limit <= 0:
+            return []
         with _POOL_LOCK:
             blocked = self._blocked()
             selected = []

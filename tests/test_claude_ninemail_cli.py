@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import tempfile
 import unittest
 import sys
@@ -229,6 +230,113 @@ class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "refresh-a",
         ):
             self.assertNotIn(secret, rendered)
+
+    async def test_ninemail_cookie_outputs_omit_all_mailbox_credentials(self):
+        cookie_dir = self.root / "cookies"
+        token_dir = self.root / "tokens"
+        account = ClaudeEmailAccount(
+            "NINEMALL",
+            "secure@example.com",
+            "synthetic-mailbox-password-9A!",
+            "synthetic-client-id-9B",
+            "synthetic-refresh-token-9C",
+        )
+        context = Mock()
+        context.cookies = AsyncMock(return_value=[{
+            "name": "sessionKey",
+            "value": "synthetic-session-key",
+            "domain": ".claude.ai",
+            "path": "/",
+        }])
+
+        with patch.object(register, "COOKIE_OUTPUT_DIR", str(cookie_dir)), patch.object(
+            register, "NINEMALL_API_PASSWORD", "synthetic-api-password"
+        ), patch(
+            "common.session_export.TOKEN_OUTPUT_DIR", str(token_dir)
+        ):
+            session_key = await register.save_cookies(
+                context,
+                "profile-a",
+                email=account.email,
+                email_password=account.password,
+                account=account,
+            )
+
+        self.assertEqual(session_key, "synthetic-session-key")
+        account_line = (cookie_dir / "accounts.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            account_line,
+            "secure@example.com||synthetic-session-key\n",
+        )
+        output_state = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.root.rglob("*")
+            if path.is_file()
+        )
+        for secret in (
+            account.password,
+            account.client_id,
+            account.refresh_token,
+            "synthetic-api-password",
+        ):
+            self.assertNotIn(secret, output_state)
+
+    async def test_outlook_cookie_account_output_remains_byte_for_byte_legacy(self):
+        cookie_dir = self.root / "cookies"
+        token_dir = self.root / "tokens"
+        account = ClaudeEmailAccount(
+            "OUTLOOK",
+            "legacy@example.com",
+            "legacy-mail-password",
+            "legacy-client",
+            "legacy-refresh",
+        )
+        context = Mock()
+        context.cookies = AsyncMock(return_value=[{
+            "name": "sessionKey",
+            "value": "synthetic-session-key",
+            "domain": ".claude.ai",
+            "path": "/",
+        }])
+
+        with patch.object(register, "COOKIE_OUTPUT_DIR", str(cookie_dir)), patch(
+            "common.session_export.TOKEN_OUTPUT_DIR", str(token_dir)
+        ):
+            await register.save_cookies(
+                context,
+                "profile-outlook",
+                email=account.email,
+                email_password=account.password,
+                account=account,
+            )
+
+        self.assertEqual(
+            (cookie_dir / "accounts.txt").read_bytes(),
+            (
+                "legacy@example.com|legacy-mail-password|"
+                f"synthetic-session-key{os.linesep}"
+            ).encode("utf-8"),
+        )
+
+    async def test_nonpositive_count_is_rejected_before_account_preparation(self):
+        with patch.object(
+            sys, "argv", ["register.py", "--count", "0", "--node", "none"]
+        ), patch.object(
+            register,
+            "prepare_email_accounts",
+            side_effect=AssertionError("account preparation must not run"),
+        ) as prepare, patch.object(
+            register, "lease_from_env", return_value=None
+        ), patch.object(
+            register, "settings_from_env", return_value=SimpleNamespace(enabled=False)
+        ), patch.object(
+            register, "prepare_claude_network"
+        ), patch.object(
+            register, "configure_claude_proxy"
+        ), self.assertRaises(SystemExit):
+            await register.main()
+
+        prepare.assert_not_called()
 
     async def test_unexpected_proxy_failure_releases_account_for_reselection(self):
         (self.root / "mail.txt").write_text(

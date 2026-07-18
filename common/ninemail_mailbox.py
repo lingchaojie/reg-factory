@@ -101,6 +101,7 @@ class NineMallMailboxClient:
         api_password="",
         http_timeout=30,
         poll_interval=5,
+        max_attempts=3,
         session=None,
         sleep=time.sleep,
         clock=time.time,
@@ -123,8 +124,22 @@ class NineMallMailboxClient:
             raise ValueError("NINEMALL_API_BASE must be the exact HTTPS AppleEmail origin")
         self.url = _NINEMALL_MAIL_ALL_URL
         self.api_password = str(api_password or "")
-        self.http_timeout = int(http_timeout)
-        self.poll_interval = int(poll_interval)
+        try:
+            self.http_timeout = float(http_timeout)
+            self.poll_interval = float(poll_interval)
+            self.max_attempts = int(max_attempts)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "NINEMALL timeout, poll interval, and retry count must be positive"
+            ) from None
+        if (
+            self.http_timeout <= 0
+            or self.poll_interval <= 0
+            or self.max_attempts <= 0
+        ):
+            raise ValueError(
+                "NINEMALL timeout, poll interval, and retry count must be positive"
+            )
         self.session = session or requests.Session()
         self.sleep = sleep
         self.clock = clock
@@ -162,55 +177,131 @@ class NineMallMailboxClient:
             ))
         return messages
 
-    def fetch_folder(self, account, folder):
-        transient_statuses = {429, 500, 502, 503, 504}
-        for attempt in range(3):
+    def _stopped(self, deadline=None, cancel_event=None):
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        return deadline is not None and self.clock() >= deadline
+
+    def _sleep_bounded(self, seconds, deadline=None, cancel_event=None):
+        duration = float(seconds)
+        if deadline is not None:
+            duration = min(duration, max(0.0, deadline - self.clock()))
+        if duration <= 0 or self._stopped(deadline, cancel_event):
+            return False
+        if cancel_event is not None and hasattr(cancel_event, "wait"):
+            if cancel_event.wait(duration):
+                return False
+        else:
+            self.sleep(duration)
+        return not self._stopped(deadline, cancel_event)
+
+    def fetch_folder(
+        self,
+        account,
+        folder,
+        *,
+        deadline=None,
+        cancel_event=None,
+    ):
+        for attempt in range(self.max_attempts):
+            if self._stopped(deadline, cancel_event):
+                return []
+            timeout = self.http_timeout
+            if deadline is not None:
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    return []
+                timeout = min(timeout, remaining)
             try:
                 response = self.session.post(
                     self.url,
                     json=self._payload(account, folder),
-                    timeout=self.http_timeout,
+                    timeout=timeout,
+                    allow_redirects=False,
                 )
             except (requests.ConnectionError, requests.Timeout):
-                if attempt < 2:
-                    self.sleep(attempt + 1)
+                if self._stopped(deadline, cancel_event):
+                    return []
+                if attempt + 1 < self.max_attempts and self._sleep_bounded(
+                    attempt + 1, deadline, cancel_event
+                ):
                     continue
+                if self._stopped(deadline, cancel_event):
+                    return []
                 raise NineMallMailboxError("network_error", retryable=True) from None
-            try:
-                payload = response.json()
-            except (TypeError, ValueError):
-                raise NineMallMailboxError("invalid_json") from None
-            if response.status_code == 200:
-                return self._normalize(payload)
-            if response.status_code == 500 and self._nothing_to_fetch(payload):
-                return []
-            if response.status_code in transient_statuses:
-                if attempt < 2:
-                    self.sleep(attempt + 1)
-                    continue
-                raise NineMallMailboxError("transient_http", retryable=True)
-            if response.status_code == 400:
+
+            status = int(response.status_code)
+            if 300 <= status < 400:
+                raise NineMallMailboxError("unexpected_http")
+            if status == 400:
                 raise NineMallMailboxError("http_400")
-            if response.status_code == 401:
+            if status == 401:
                 raise NineMallMailboxError("http_401")
+            if status == 403:
+                raise NineMallMailboxError("http_403")
+            if status == 429 or 500 <= status < 600:
+                if status == 500:
+                    try:
+                        payload = response.json()
+                    except (TypeError, ValueError):
+                        payload = None
+                    if self._nothing_to_fetch(payload):
+                        return []
+                if self._stopped(deadline, cancel_event):
+                    return []
+                if attempt + 1 < self.max_attempts and self._sleep_bounded(
+                    attempt + 1, deadline, cancel_event
+                ):
+                    continue
+                if self._stopped(deadline, cancel_event):
+                    return []
+                raise NineMallMailboxError("transient_http", retryable=True)
+            if 200 <= status < 300:
+                try:
+                    payload = response.json()
+                except (TypeError, ValueError):
+                    raise NineMallMailboxError("invalid_json") from None
+                return self._normalize(payload)
             raise NineMallMailboxError("unexpected_http")
         raise NineMallMailboxError("transient_http", retryable=True)
 
-    def poll_magic_link(self, account, max_wait, received_after=None):
-        deadline = self.clock() + max(0, max_wait)
-        while self.clock() < deadline:
+    def poll_magic_link(
+        self,
+        account,
+        max_wait,
+        received_after=None,
+        *,
+        cancel_event=None,
+    ):
+        try:
+            wait_budget = float(max_wait)
+        except (TypeError, ValueError):
+            raise ValueError("max_wait must be positive") from None
+        if wait_budget <= 0:
+            raise ValueError("max_wait must be positive")
+        deadline = self.clock() + wait_budget
+        while not self._stopped(deadline, cancel_event):
             messages = []
             for folder in ("INBOX", "Junk"):
+                if self._stopped(deadline, cancel_event):
+                    return None
                 try:
-                    messages.extend(self.fetch_folder(account, folder))
+                    messages.extend(self.fetch_folder(
+                        account,
+                        folder,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    ))
                 except NineMallMailboxError as exc:
                     if not exc.retryable:
                         raise
+                if self._stopped(deadline, cancel_event):
+                    return None
             link = extract_claude_magic_link(messages, received_after=received_after)
             if link:
                 return link
-            remaining = deadline - self.clock()
-            if remaining <= 0:
+            if not self._sleep_bounded(
+                self.poll_interval, deadline, cancel_event
+            ):
                 break
-            self.sleep(min(self.poll_interval, remaining))
         return None

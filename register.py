@@ -15,6 +15,7 @@ import random
 import re
 import string
 import sys
+import threading
 import time
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -1760,12 +1761,25 @@ async def fetch_claude_magic_link(
 ):
     if account.provider == "NINEMALL":
         client = ninemail_client or build_ninemail_client()
-        return await asyncio.to_thread(
-            client.poll_magic_link,
-            account,
-            max_wait,
-            received_after,
+        cancel_event = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                client.poll_magic_link,
+                account,
+                max_wait,
+                received_after,
+                cancel_event=cancel_event,
+            )
         )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            try:
+                await asyncio.shield(worker)
+            except BaseException:
+                pass
+            raise
     link = None
     if account.refresh_token:
         fetch_token_link = functools.partial(
@@ -3329,7 +3343,13 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
     return False
 
 
-async def save_cookies(context, profile_id, email=None, email_password=None):
+async def save_cookies(
+    context,
+    profile_id,
+    email=None,
+    email_password=None,
+    account=None,
+):
     cookies = await context.cookies()
     os.makedirs(COOKIE_OUTPUT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3355,7 +3375,11 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
         print(f"  full cookies saved: {full_filename}")
         # 追加到统一账号文件
         if email:
-            pwd = email_password or ""
+            pwd = (
+                ""
+                if account is not None and account.provider == "NINEMALL"
+                else email_password or ""
+            )
             accounts_file = os.path.join(COOKIE_OUTPUT_DIR, "accounts.txt")
             with open(accounts_file, "a", encoding="utf-8") as f:
                 f.write(f"{email}|{pwd}|{session_key}\n")
@@ -4099,7 +4123,13 @@ async def register(
                     if sk_cookie:
                         print("  found sessionKey in cookies")
                         session_key = sk_cookie
-                        await save_cookies(context, profile_id, email=email, email_password=email_password)
+                        await save_cookies(
+                            context,
+                            profile_id,
+                            email=email,
+                            email_password=email_password,
+                            account=account,
+                        )
                         mark_claude_account_used(account, account_store)
                         return session_key
                 except Exception as e:
@@ -4115,7 +4145,13 @@ async def register(
 
             # 直接保存 cookie
             await asyncio.sleep(2)
-            session_key = await save_cookies(context, profile_id, email=email, email_password=email_password)
+            session_key = await save_cookies(
+                context,
+                profile_id,
+                email=email,
+                email_password=email_password,
+                account=account,
+            )
             if session_key:
                 mark_claude_account_used(account, account_store)
             else:
@@ -4174,6 +4210,8 @@ async def main():
                         help="Clash 出口节点绕 claude 区域封锁：none=不走代理 / auto=自动探测 / 具体节点名")
     parser.add_argument("--proxy-port", type=str, default="7897", help="Clash mixed-port 代理端口")
     args = parser.parse_args()
+    if args.count <= 0:
+        parser.error("--count must be greater than zero")
 
     global REGISTER_TIMEOUT, CLAUDE_PROXY_NODE, CLAUDE_PROXY_PORT
     REGISTER_TIMEOUT = args.timeout

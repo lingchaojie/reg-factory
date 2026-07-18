@@ -80,6 +80,16 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
             accounts = list(pool.map(lambda _i: store.reserve_one(), range(8)))
         self.assertEqual(len({account.email for account in accounts}), 8)
 
+    def test_nonpositive_limit_returns_empty_without_state_writes(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+
+        self.assertEqual(store.reserve_many(limit=0), [])
+        self.assertEqual(store.reserve_many(limit=-1), [])
+
+        self.assertFalse((self.root / "mail_used_claude.txt").exists())
+        self.assertFalse((self.root / "mail_error_claude.txt").exists())
+
     def test_mark_error_sanitizes_reason(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")
         store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
@@ -88,6 +98,18 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         state = (self.root / "mail_error_claude.txt").read_text(encoding="utf-8")
         self.assertIn("http_401", state)
         self.assertNotIn("refresh-secret", state)
+
+    def test_mark_error_preserves_stable_http_403_code(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        account = store.reserve_one()
+
+        store.mark_error(account, "http_403")
+
+        state = (self.root / "mail_error_claude.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("person@example.com----http_403", state)
 
     def test_released_reservation_is_selectable_after_store_restart(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")

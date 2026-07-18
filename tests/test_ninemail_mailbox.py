@@ -13,20 +13,26 @@ class FakeResponse:
     def __init__(self, status_code, payload):
         self.status_code = status_code
         self.payload = payload
+        self.json_calls = 0
 
     def json(self):
+        self.json_calls += 1
         if isinstance(self.payload, Exception):
             raise self.payload
         return self.payload
 
 
 class FakeSession:
-    def __init__(self, responses):
+    def __init__(self, responses, clock=None, elapsed=None):
         self.responses = list(responses)
         self.calls = []
+        self.clock = clock
+        self.elapsed = list(elapsed or [])
 
-    def post(self, url, json, timeout):
-        self.calls.append((url, json, timeout))
+    def post(self, url, json, timeout, allow_redirects=True):
+        self.calls.append((url, json, timeout, allow_redirects))
+        if self.clock is not None and self.elapsed:
+            self.clock.sleep(self.elapsed.pop(0))
         return self.responses.pop(0)
 
 
@@ -39,6 +45,20 @@ class FakeClock:
 
     def sleep(self, seconds):
         self.value += seconds
+
+
+class CancellingEvent:
+    def __init__(self, clock):
+        self.clock = clock
+        self.cancelled = False
+
+    def is_set(self):
+        return self.cancelled
+
+    def wait(self, seconds):
+        self.clock.sleep(min(seconds, 0.25))
+        self.cancelled = True
+        return True
 
 
 def account():
@@ -78,9 +98,10 @@ class NineMallMailboxTests(unittest.TestCase):
     def test_post_contract_keeps_credentials_out_of_url(self):
         client = self.client([FakeResponse(200, {"data": []})])
         client.fetch_folder(account(), "INBOX")
-        url, payload, timeout = self.session.calls[0]
+        url, payload, timeout, allow_redirects = self.session.calls[0]
         self.assertEqual(url, "https://www.appleemail.top/api/mail-all")
         self.assertEqual(timeout, 17)
+        self.assertFalse(allow_redirects)
         self.assertEqual(payload, {
             "refresh_token": "refresh-secret",
             "client_id": "client-guid",
@@ -147,13 +168,151 @@ class NineMallMailboxTests(unittest.TestCase):
         self.assertEqual(len(self.session.calls), 3)
 
     def test_401_is_non_retryable_and_secret_safe(self):
-        client = self.client([FakeResponse(401, {"error": "refresh-secret rejected"})])
+        response = FakeResponse(401, ValueError("not json"))
+        client = self.client([response])
         with self.assertRaises(NineMallMailboxError) as caught:
             client.fetch_folder(account(), "INBOX")
         self.assertEqual(caught.exception.code, "http_401")
         self.assertFalse(caught.exception.retryable)
         self.assertNotIn("refresh-secret", str(caught.exception))
         self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(response.json_calls, 0)
+
+    def test_403_is_non_retryable_before_json_decode(self):
+        response = FakeResponse(403, ValueError("not json"))
+        client = self.client([response])
+
+        with self.assertRaises(NineMallMailboxError) as caught:
+            client.fetch_folder(account(), "INBOX")
+
+        self.assertEqual(caught.exception.code, "http_403")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(response.json_calls, 0)
+
+    def test_307_and_308_redirects_are_never_followed_or_retried(self):
+        for status in (307, 308):
+            with self.subTest(status=status):
+                response = FakeResponse(status, ValueError("not json"))
+                client = self.client([response])
+                with self.assertRaises(NineMallMailboxError) as caught:
+                    client.fetch_folder(account(), "INBOX")
+                self.assertEqual(caught.exception.code, "unexpected_http")
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(len(self.session.calls), 1)
+                self.assertFalse(self.session.calls[0][3])
+                self.assertEqual(response.json_calls, 0)
+
+    def test_non_json_503_remains_retryable(self):
+        responses = [
+            FakeResponse(503, ValueError("not json")),
+            FakeResponse(503, ValueError("not json")),
+            FakeResponse(503, ValueError("not json")),
+        ]
+        client = self.client(responses)
+
+        with self.assertRaises(NineMallMailboxError) as caught:
+            client.fetch_folder(account(), "INBOX")
+
+        self.assertEqual(caught.exception.code, "transient_http")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(len(self.session.calls), 3)
+        self.assertEqual([response.json_calls for response in responses], [0, 0, 0])
+
+    def test_every_unlisted_5xx_status_retries(self):
+        responses = [
+            FakeResponse(599, ValueError("not json")),
+            FakeResponse(599, ValueError("not json")),
+            FakeResponse(200, {"data": []}),
+        ]
+        client = self.client(responses)
+
+        self.assertEqual(client.fetch_folder(account(), "INBOX"), [])
+        self.assertEqual(len(self.session.calls), 3)
+        self.assertEqual(responses[0].json_calls, 0)
+        self.assertEqual(responses[1].json_calls, 0)
+
+    def test_successful_2xx_invalid_json_is_invalid_json(self):
+        client = self.client([FakeResponse(204, ValueError("not json"))])
+
+        with self.assertRaises(NineMallMailboxError) as caught:
+            client.fetch_folder(account(), "INBOX")
+
+        self.assertEqual(caught.exception.code, "invalid_json")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_polling_deadline_clamps_request_and_backoff_budget(self):
+        self.clock = FakeClock()
+        self.session = FakeSession(
+            [FakeResponse(503, ValueError("not json"))],
+            clock=self.clock,
+            elapsed=[4],
+        )
+        client = NineMallMailboxClient(
+            base_url="https://www.appleemail.top",
+            http_timeout=17,
+            poll_interval=5,
+            session=self.session,
+            sleep=self.clock.sleep,
+            clock=self.clock,
+        )
+
+        self.assertIsNone(client.poll_magic_link(account(), max_wait=5))
+        self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(self.session.calls[0][2], 5)
+        self.assertEqual(self.session.calls[0][1]["mailbox"], "INBOX")
+        self.assertEqual(self.clock.value, 2_000_000_005.0)
+
+    def test_polling_stops_before_folder_switch_when_deadline_expires(self):
+        self.clock = FakeClock()
+        self.session = FakeSession(
+            [FakeResponse(200, {"data": []})],
+            clock=self.clock,
+            elapsed=[3],
+        )
+        client = NineMallMailboxClient(
+            base_url="https://www.appleemail.top",
+            http_timeout=17,
+            poll_interval=5,
+            session=self.session,
+            sleep=self.clock.sleep,
+            clock=self.clock,
+        )
+
+        self.assertIsNone(client.poll_magic_link(account(), max_wait=3))
+        self.assertEqual(
+            [call[1]["mailbox"] for call in self.session.calls],
+            ["INBOX"],
+        )
+
+    def test_cancellation_interrupts_backoff_before_retry_or_folder_switch(self):
+        client = self.client([FakeResponse(503, ValueError("not json"))])
+        cancelled = CancellingEvent(self.clock)
+
+        self.assertIsNone(
+            client.poll_magic_link(
+                account(), max_wait=20, cancel_event=cancelled
+            )
+        )
+
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(self.session.calls[0][1]["mailbox"], "INBOX")
+
+    def test_positive_timeout_poll_interval_and_retry_count_are_required(self):
+        for kwargs in (
+            {"http_timeout": 0},
+            {"poll_interval": 0},
+            {"max_attempts": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                NineMallMailboxClient(
+                    base_url="https://www.appleemail.top", **kwargs
+                )
+
+        client = self.client([])
+        with self.assertRaises(ValueError):
+            client.poll_magic_link(account(), max_wait=0)
 
     def test_new_refresh_token_is_ignored(self):
         client = self.client([

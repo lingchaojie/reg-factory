@@ -30,6 +30,10 @@ from common.claude_email_accounts import (
     ClaudeEmailAccountStore,
     normalize_email_provider,
 )
+from common.process_lifecycle import (
+    process_group_kwargs,
+    shutdown_async_process,
+)
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -52,12 +56,23 @@ class _ReservedPoolAccount(tuple):
         instance.account = account
         instance.store = store
         instance.active = True
+        instance.owned_processes = set()
         return instance
+
+    def track_process(self, process):
+        self.owned_processes.add(id(process))
+
+    def confirm_process_stopped(self, process, confirmed):
+        if confirmed:
+            self.owned_processes.discard(id(process))
 
     def release(self):
         if self.active:
-            self.store.release(self.account)
             self.active = False
+            if self.owned_processes:
+                return False
+            return self.store.release(self.account)
+        return False
 
 
 def _release_pool_account(account):
@@ -129,38 +144,61 @@ def build_command(platform, args, account):
     raise ValueError(f"unknown platform: {platform}")
 
 
-async def run_platform(platform, cmd, run_id, child_env=None):
+async def run_platform(
+    platform,
+    cmd,
+    run_id,
+    child_env=None,
+    process_owner=None,
+):
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"{run_id}_{platform}.log")
     print(f"\n[{platform}] start")
     print(f"[{platform}] log: {log_path}")
 
+    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=ROOT,
-            env=child_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except Exception as exc:
-        raise PlatformLaunchError(f"failed to launch {platform}") from exc
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=ROOT,
+                env=child_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                **process_group_kwargs(),
+            )
+        except Exception as exc:
+            raise PlatformLaunchError(f"failed to launch {platform}") from exc
+        if process_owner is not None:
+            process_owner.track_process(proc)
 
-    saw_success = False
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        assert proc.stdout is not None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace")
-            if "success: 1/1" in text.lower():
-                saw_success = True
-            log.write(text)
-            log.flush()
-            print(f"[{platform}] {text}", end="")
+        saw_success = False
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace")
+                if "success: 1/1" in text.lower():
+                    saw_success = True
+                log.write(text)
+                log.flush()
+                print(f"[{platform}] {text}", end="")
 
-    rc = await proc.wait()
+        rc = await proc.wait()
+        if process_owner is not None:
+            process_owner.confirm_process_stopped(proc, True)
+    except BaseException:
+        if proc is not None:
+            cleanup = asyncio.create_task(shutdown_async_process(proc))
+            try:
+                confirmed = await asyncio.shield(cleanup)
+            except BaseException:
+                confirmed = False
+            if process_owner is not None:
+                process_owner.confirm_process_stopped(proc, confirmed)
+        raise
     ok = rc == 0 and saw_success
     status = "OK" if ok else f"FAIL(exit={rc}, success_marker={saw_success})"
     print(f"[{platform}] done: {status}")
@@ -254,27 +292,33 @@ async def process_account(account, args, child_env):
     platforms = list(args.platforms)
     if child_env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
         platforms.sort(key=lambda platform: platform != "claude")
+    process_owner = (
+        account if isinstance(account, _ReservedPoolAccount) else None
+    )
+
+    def launch(platform, cmd):
+        kwargs = {}
+        if process_owner is not None:
+            kwargs["process_owner"] = process_owner
+        return run_platform(
+            platform,
+            cmd,
+            run_id,
+            platform_child_env(platform, child_env, args.platforms),
+            **kwargs,
+        )
+
     try:
         jobs = [(p, build_command(p, args, account)) for p in platforms]
         if args.parallel:
             results = await asyncio.gather(*(
-                run_platform(
-                    p,
-                    cmd,
-                    run_id,
-                    platform_child_env(p, child_env, args.platforms),
-                )
+                launch(p, cmd)
                 for p, cmd in jobs
             ))
         else:
             results = []
             for platform, cmd in jobs:
-                results.append(await run_platform(
-                    platform,
-                    cmd,
-                    run_id,
-                    platform_child_env(platform, child_env, args.platforms),
-                ))
+                results.append(await launch(platform, cmd))
     except BaseException:
         _release_pool_account(account)
         raise

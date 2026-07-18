@@ -1,4 +1,6 @@
 import inspect
+import asyncio
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -172,9 +174,54 @@ class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
             received_after=1_234.5,
             ninemail_client=client,
         )
-        client.poll_magic_link.assert_called_once_with(
-            mailbox_account("NINEMALL"), 25, 1_234.5
+        call = client.poll_magic_link.call_args
+        self.assertEqual(
+            call.args,
+            (mailbox_account("NINEMALL"), 25, 1_234.5),
         )
+        self.assertIn("cancel_event", call.kwargs)
+        self.assertFalse(call.kwargs["cancel_event"].is_set())
+
+    async def test_ninemail_async_cancellation_signals_and_joins_worker(self):
+        class CancellableClient:
+            def __init__(self):
+                self.started = threading.Event()
+                self.stopped = threading.Event()
+                self.missing_cancel_event = threading.Event()
+
+            def poll_magic_link(
+                self,
+                _account,
+                _max_wait,
+                _received_after,
+                *,
+                cancel_event=None,
+            ):
+                self.started.set()
+                if cancel_event is None:
+                    self.missing_cancel_event.set()
+                    return None
+                cancel_event.wait(1)
+                self.stopped.set()
+                return None
+
+        client = CancellableClient()
+        task = asyncio.create_task(
+            register.fetch_claude_magic_link(
+                Mock(),
+                mailbox_account("NINEMALL"),
+                60,
+                ninemail_client=client,
+            )
+        )
+        await asyncio.to_thread(client.started.wait)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertFalse(client.missing_cancel_event.is_set())
+        self.assertTrue(client.stopped.is_set())
 
 
 if __name__ == "__main__":

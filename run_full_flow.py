@@ -61,6 +61,10 @@ from common.ipmart_proxy import (
     settings_from_env,
     verify_proxy,
 )
+from common.process_lifecycle import (
+    process_group_kwargs,
+    shutdown_sync_process,
+)
 
 # 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
@@ -84,12 +88,23 @@ class _ReservedStageAccount(tuple):
         instance.account = account
         instance.store = store
         instance.active = True
+        instance.owned_processes = set()
         return instance
+
+    def track_process(self, process):
+        self.owned_processes.add(id(process))
+
+    def confirm_process_stopped(self, process, confirmed):
+        if confirmed:
+            self.owned_processes.discard(id(process))
 
     def release(self):
         if self.active:
-            self.store.release(self.account)
             self.active = False
+            if self.owned_processes:
+                return False
+            return self.store.release(self.account)
+        return False
 
 
 def _release_stage_account(account):
@@ -225,7 +240,15 @@ def acquire_stage_account(
 
 
 # ---------------------------------------------------------------- Stage B
-def stage_platforms(args, env, email, password, token="", client_id=""):
+def stage_platforms(
+    args,
+    env,
+    email,
+    password,
+    token="",
+    client_id="",
+    process_owner=None,
+):
     log(f"Stage B 平台注册：{email}  platforms={','.join(args.platforms)}", "B")
     # token 由 Stage A 注册时抽 Graph 写入 emails.txt；有真 token 走 Graph API 直收码(免浏览器)，
     # 没有(抽取失败回退 fresh/空)则下游退化到浏览器/broker 取码。
@@ -263,12 +286,28 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
     if args.dry_run:
         return 0
     try:
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+        proc = subprocess.Popen(
+            cmd, cwd=ROOT, env=env, **process_group_kwargs()
+        )
     except Exception as exc:
         raise PlatformLaunchError(
             "failed to launch platform orchestrator"
         ) from exc
-    return proc.wait()
+    if process_owner is not None:
+        process_owner.track_process(proc)
+    try:
+        rc = proc.wait()
+        if process_owner is not None:
+            process_owner.confirm_process_stopped(proc, True)
+        return rc
+    except BaseException:
+        try:
+            confirmed = shutdown_sync_process(proc)
+        except BaseException:
+            confirmed = False
+        if process_owner is not None:
+            process_owner.confirm_process_stopped(proc, confirmed)
+        raise
 
 
 # ---------------------------------------------------------------- 单轮
@@ -342,8 +381,17 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             platform_env = dict(round_env)
             platform_env.update(original_http_proxy_env)
         print("=" * 64)
+        stage_kwargs = {}
+        if isinstance(reserved_account, _ReservedStageAccount):
+            stage_kwargs["process_owner"] = reserved_account
         rc = stage_platforms(
-            args, platform_env, email, password, token, client_id
+            args,
+            platform_env,
+            email,
+            password,
+            token,
+            client_id,
+            **stage_kwargs,
         )
         if args.dry_run or rc != 0:
             _release_stage_account(reserved_account)
