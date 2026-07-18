@@ -16,6 +16,8 @@ from .settings import Settings
 
 
 BASE_URL = "https://www.nexacardvcc.com"
+LOGIN_URL = f"{BASE_URL}/#/login"
+PROTECTED_PROBE_URL = f"{BASE_URL}/#/nova-v-card-b/verify-code"
 PAGE_TIMEOUT_MS = 30_000
 USERNAME_INPUT = 'input[placeholder="请输入用户名"]'
 PASSWORD_INPUT = 'input[placeholder="请输入密码"]'
@@ -34,13 +36,19 @@ class NexaCardLogin:
         self._gmail_reader = gmail_reader
 
     @staticmethod
-    def _is_login_url(url: str) -> bool:
-        path = urlsplit(url).path.rstrip("/")
-        return path == "/login"
+    def _route(url: str) -> str:
+        parsed = urlsplit(url)
+        route = parsed.fragment or parsed.path
+        return route.split("?", 1)[0].rstrip("/")
 
-    @staticmethod
-    def _is_authenticated_url(url: str) -> bool:
-        return urlsplit(url).path.startswith("/nova-v-card-b/")
+    @classmethod
+    def _is_login_url(cls, url: str) -> bool:
+        return cls._route(url) == "/login"
+
+    @classmethod
+    def _is_authenticated_url(cls, url: str) -> bool:
+        route = cls._route(url)
+        return route.startswith("/nova-v-card-b") or route.startswith("/3d-1-card")
 
     async def _is_logged_out(self, page: Page) -> bool:
         if self._is_login_url(page.url):
@@ -60,7 +68,7 @@ class NexaCardLogin:
     async def _navigate_for_recheck(self, page: Page) -> None:
         try:
             await page.goto(
-                f"{BASE_URL}/index", wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
+                PROTECTED_PROBE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
             )
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard page operation failed") from exc
@@ -81,7 +89,7 @@ class NexaCardLogin:
         self._require_login_settings(settings)
         try:
             await page.goto(
-                f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
+                LOGIN_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS
             )
             await page.locator(USERNAME_INPUT).fill(settings.account, timeout=PAGE_TIMEOUT_MS)
             await page.locator(PASSWORD_INPUT).fill(settings.password, timeout=PAGE_TIMEOUT_MS)
@@ -100,7 +108,7 @@ class NexaCardLogin:
             await page.locator(VERIFICATION_CODE_INPUT).fill(code, timeout=PAGE_TIMEOUT_MS)
             await page.locator(SUBMIT_BUTTON).click(timeout=PAGE_TIMEOUT_MS)
             await page.wait_for_url(
-                lambda url: not self._is_login_url(str(url)), timeout=PAGE_TIMEOUT_MS
+                lambda url: self._is_authenticated_url(str(url)), timeout=PAGE_TIMEOUT_MS
             )
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard login did not reach an authenticated page") from exc

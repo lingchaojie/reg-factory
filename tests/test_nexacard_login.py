@@ -11,11 +11,13 @@ from nexacard_otp.errors import (
     GmailTemporarilyUnavailable,
     NexaCardLoginFailed,
 )
-from nexacard_otp.login import NexaCardLogin
+from nexacard_otp.login import BASE_URL, NexaCardLogin
 
 
 LOGIN_URL = "https://www.nexacardvcc.com/login"
 AUTHENTICATED_URL = "https://www.nexacardvcc.com/nova-v-card-b/verify-code"
+HASH_LOGIN_URL = f"{BASE_URL}/#/login"
+PROTECTED_PROBE_URL = f"{BASE_URL}/#/nova-v-card-b/verify-code"
 USERNAME = 'input[placeholder="请输入用户名"]'
 PASSWORD = 'input[placeholder="请输入密码"]'
 EMAIL = 'input[placeholder="请输入邮箱"]'
@@ -44,6 +46,16 @@ def logged_out_page():
 
 
 class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hash_login_url_is_logged_out_without_querying_login_fields(self):
+        page = Mock()
+        page.url = HASH_LOGIN_URL
+        page.locator = Mock()
+
+        logged_out = await NexaCardLogin(asyncio.Lock(), AsyncMock())._is_logged_out(page)
+
+        self.assertTrue(logged_out)
+        page.locator.assert_not_called()
+
     async def test_authenticated_page_does_not_touch_login_or_gmail(self):
         page = Mock()
         page.url = AUTHENTICATED_URL
@@ -73,10 +85,10 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered)
         self.assertEqual(page.goto.await_count, 2)
         page.goto.assert_any_await(
-            "https://www.nexacardvcc.com/index", wait_until="domcontentloaded", timeout=30_000
+            PROTECTED_PROBE_URL, wait_until="domcontentloaded", timeout=30_000
         )
         page.goto.assert_any_await(
-            "https://www.nexacardvcc.com/login", wait_until="domcontentloaded", timeout=30_000
+            HASH_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000
         )
         locators[USERNAME].fill.assert_awaited_once_with("account-123", timeout=30_000)
         locators[PASSWORD].fill.assert_awaited_once_with("password-456", timeout=30_000)
@@ -90,6 +102,28 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             selectors,
             [USERNAME, PASSWORD, ".el-radio", EMAIL, "button.get-code-btn", EMAIL_CODE, "button.submit-btn"],
+        )
+
+    async def test_hash_login_requires_protected_route_after_submit(self):
+        page, locators = logged_out_page()
+        page.url = HASH_LOGIN_URL
+        reader = AsyncMock()
+        reader.wait_for_login_code.return_value = "123456789"
+
+        async def wait_for_url(predicate, **_kwargs):
+            self.assertFalse(predicate(HASH_LOGIN_URL))
+            page.url = PROTECTED_PROBE_URL
+            self.assertTrue(predicate(page.url))
+
+        page.wait_for_url.side_effect = wait_for_url
+
+        recovered = await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(
+            page, make_settings()
+        )
+
+        self.assertTrue(recovered)
+        page.goto.assert_any_await(
+            PROTECTED_PROBE_URL, wait_until="domcontentloaded", timeout=30_000
         )
 
     async def test_missing_login_configuration_fails_without_visiting_page_or_gmail(self):
@@ -192,6 +226,57 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results.count(False), 1)
         self.assertEqual(login._perform_login.await_count, 1)
         self.assertEqual(login._navigate_for_recheck.await_count, 2)
+
+    async def test_shared_cookie_recheck_uses_protected_route_and_skips_second_login(self):
+        state = {"authenticated": False}
+        first_probe_entered = asyncio.Event()
+        release_first_probe = asyncio.Event()
+        navigations = []
+
+        def make_page(name):
+            page, locators = logged_out_page()
+            page.url = HASH_LOGIN_URL
+
+            async def goto(url, **_kwargs):
+                navigations.append((name, url))
+                if url == PROTECTED_PROBE_URL:
+                    if name == "first" and not state["authenticated"]:
+                        first_probe_entered.set()
+                        await release_first_probe.wait()
+                    page.url = PROTECTED_PROBE_URL if state["authenticated"] else HASH_LOGIN_URL
+                elif url == HASH_LOGIN_URL:
+                    page.url = HASH_LOGIN_URL
+
+            async def wait_for_url(predicate, **_kwargs):
+                page.url = PROTECTED_PROBE_URL
+                self.assertTrue(predicate(page.url))
+
+            async def submit(**_kwargs):
+                state["authenticated"] = True
+
+            page.goto.side_effect = goto
+            page.wait_for_url.side_effect = wait_for_url
+            locators["button.submit-btn"].click.side_effect = submit
+            return page
+
+        login = NexaCardLogin(asyncio.Lock(), AsyncMock(wait_for_login_code=AsyncMock(return_value="123456789")))
+        first = asyncio.create_task(login.ensure_authenticated(make_page("first"), make_settings()))
+        try:
+            await asyncio.wait_for(first_probe_entered.wait(), timeout=0.1)
+            second = asyncio.create_task(login.ensure_authenticated(make_page("second"), make_settings()))
+            await asyncio.sleep(0)
+            release_first_probe.set()
+
+            self.assertEqual(await first, True)
+            self.assertEqual(await second, False)
+            self.assertEqual(
+                [url for _name, url in navigations if url == PROTECTED_PROBE_URL],
+                [PROTECTED_PROBE_URL, PROTECTED_PROBE_URL],
+            )
+        finally:
+            if not first.done():
+                first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
 
     async def test_login_timestamp_is_aware_utc_and_captured_before_request_click(self):
         page, locators = logged_out_page()

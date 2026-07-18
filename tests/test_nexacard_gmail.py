@@ -37,10 +37,19 @@ class NexaCardGmailTests(unittest.TestCase):
 
         self.assertEqual(parse_login_code(_encoded(raw), RECEIVED_MS, SENT_AFTER), "123456789")
 
-    def test_message_at_or_before_send_time_is_ignored(self):
+    def test_message_before_send_time_is_ignored(self):
         raw = Path("tests/fixtures/nexacard_verification_code.eml").read_bytes()
 
-        self.assertIsNone(parse_login_code(_encoded(raw), int(SENT_AFTER.timestamp() * 1000), SENT_AFTER))
+        self.assertIsNone(parse_login_code(_encoded(raw), int(SENT_AFTER.timestamp() * 1000) - 1, SENT_AFTER))
+
+    def test_message_in_same_millisecond_as_send_time_is_accepted(self):
+        raw = Path("tests/fixtures/nexacard_verification_code.eml").read_bytes()
+        sent_after = datetime(2026, 7, 19, 4, 54, 0, 123456, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            parse_login_code(_encoded(raw), int(sent_after.timestamp() * 1000), sent_after),
+            "123456789",
+        )
 
     def test_sender_and_subject_must_match_exactly(self):
         messages = (
@@ -241,6 +250,33 @@ class NexaCardGmailTests(unittest.TestCase):
 
         self.assertEqual(code, "123456789")
         self.assertEqual(reader._fetch_once.call_count, 2)
+
+    def test_authorization_failure_is_not_reclassified_as_mail_timeout(self):
+        reader = GmailCodeReader()
+        reader._fetch_once = Mock(side_effect=GmailAuthorizationRequired("authorization required"))
+
+        with self.assertRaises(GmailAuthorizationRequired):
+            asyncio.run(reader.wait_for_login_code(SENT_AFTER, interval_seconds=0.01, max_attempts=2))
+
+    def test_exhausted_temporary_gmail_failures_keep_the_last_failure_as_cause(self):
+        reader = GmailCodeReader()
+        temporary = GmailTemporarilyUnavailable("temporary")
+        last_temporary = GmailTemporarilyUnavailable("temporary")
+        reader._fetch_once = Mock(side_effect=[temporary, last_temporary])
+        with patch("nexacard_otp.gmail_reader.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(GmailTemporarilyUnavailable) as captured:
+                asyncio.run(reader.wait_for_login_code(SENT_AFTER, interval_seconds=0.01, max_attempts=2))
+
+        self.assertIs(captured.exception, last_temporary)
+
+    def test_successful_no_mail_poll_ends_with_timeout_without_temporary_cause(self):
+        reader = GmailCodeReader()
+        reader._fetch_once = Mock(side_effect=[GmailTemporarilyUnavailable("temporary"), None, None])
+        with patch("nexacard_otp.gmail_reader.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(TimeoutError) as captured:
+                asyncio.run(reader.wait_for_login_code(SENT_AFTER, interval_seconds=0.01, max_attempts=3))
+
+        self.assertIsNone(captured.exception.__cause__)
 
     def test_mail_poll_is_bounded_when_no_code_arrives(self):
         reader = GmailCodeReader()

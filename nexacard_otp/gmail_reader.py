@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import re
+from calendar import timegm
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -28,8 +29,9 @@ def parse_login_code(raw_message: str, internal_date_ms: int, sent_after: dateti
     """Return a fresh NexaCard code only from the expected MIME message body."""
     if sent_after.tzinfo is None or sent_after.utcoffset() is None:
         raise ValueError("sent_after must be timezone-aware")
-    received = datetime.fromtimestamp(internal_date_ms / 1000, tz=timezone.utc)
-    if received <= sent_after.astimezone(timezone.utc):
+    sent_after_utc = sent_after.astimezone(timezone.utc)
+    sent_after_ms = timegm(sent_after_utc.utctimetuple()) * 1000 + sent_after_utc.microsecond // 1000
+    if internal_date_ms < sent_after_ms:
         return None
     try:
         message = BytesParser(policy=policy.default).parsebytes(_decode(raw_message))
@@ -101,13 +103,18 @@ class GmailCodeReader:
         interval_seconds: float = 3.0,
         max_attempts: int = 60,
     ) -> str:
+        last_temporary_error: GmailTemporarilyUnavailable | None = None
         for attempt in range(max_attempts):
             try:
                 code = await asyncio.to_thread(self._fetch_once, sent_after)
-            except GmailTemporarilyUnavailable:
+                last_temporary_error = None
+            except GmailTemporarilyUnavailable as exc:
+                last_temporary_error = exc
                 code = None
             if code:
                 return code
             if attempt + 1 < max_attempts:
                 await asyncio.sleep(interval_seconds)
+        if last_temporary_error is not None:
+            raise last_temporary_error
         raise TimeoutError("NexaCard login verification email did not arrive")
