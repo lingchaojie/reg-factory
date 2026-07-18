@@ -175,6 +175,49 @@ class NineMallMailboxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "HTTPS"):
             NineMallMailboxClient(base_url="http://www.appleemail.top")
 
+    def test_only_exact_hosted_origin_is_accepted_before_posting_credentials(self):
+        session = FakeSession([])
+        invalid_bases = (
+            "https://attacker.invalid",
+            "https://www.appleemail.top.attacker.invalid",
+            "https://www.appleemail.top:443",
+            "https://user@www.appleemail.top",
+            "https://www.appleemail.top/other-path",
+            "https://www.appleemail.top?redirect=attacker.invalid",
+            "https://www.appleemail.top#fragment",
+            "https://[",
+        )
+        for base_url in invalid_bases:
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(ValueError):
+                    NineMallMailboxClient(base_url=base_url, session=session)
+        self.assertEqual(session.calls, [])
+
+    def test_malformed_direct_link_is_skipped(self):
+        messages = [NineMallMessage(
+            "no-reply@claude.ai",
+            "Claude login",
+            "2033-05-18T03:33:25Z",
+            "https://[",
+        )]
+        self.assertIsNone(extract_claude_magic_link(messages))
+
+    def test_malformed_safelinks_target_is_skipped_while_scanning(self):
+        malformed_target = (
+            "https://nam01.safelinks.protection.outlook.com/"
+            "?url=https%3A%2F%2F%5B"
+        )
+        messages = [NineMallMessage(
+            "no-reply@claude.ai",
+            "Claude login",
+            "2033-05-18T03:33:25Z",
+            malformed_target + " https://claude.ai/magic-link#valid-token",
+        )]
+        self.assertEqual(
+            extract_claude_magic_link(messages),
+            "https://claude.ai/magic-link#valid-token",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

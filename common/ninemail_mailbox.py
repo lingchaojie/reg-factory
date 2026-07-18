@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import re
 import time
 
@@ -41,21 +41,30 @@ def _received_epoch(value):
 
 
 _URL_RE = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
+_NINEMALL_HOST = "www.appleemail.top"
+_NINEMALL_MAIL_ALL_URL = f"https://{_NINEMALL_HOST}/api/mail-all"
 
 
 def _validated_claude_link(candidate):
     value = unescape(str(candidate or "")).rstrip(".,);]")
-    parsed = urlparse(value)
-    host = (parsed.hostname or "").lower()
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
     if host == "claude.ai" and parsed.path.rstrip("/") == "/magic-link" and parsed.fragment:
         return value
     if host.endswith("safelinks.protection.outlook.com"):
         wrapped = parse_qs(parsed.query).get("url", [""])[0]
         if wrapped:
             target = unquote(wrapped)
-            target_parsed = urlparse(target)
+            try:
+                target_parsed = urlparse(target)
+                target_host = (target_parsed.hostname or "").lower()
+            except ValueError:
+                return None
             if (
-                (target_parsed.hostname or "").lower() == "claude.ai"
+                target_host == "claude.ai"
                 and target_parsed.path.rstrip("/") == "/magic-link"
                 and target_parsed.fragment
             ):
@@ -96,10 +105,23 @@ class NineMallMailboxClient:
         sleep=time.sleep,
         clock=time.time,
     ):
-        parsed = urlparse(str(base_url or "").strip())
-        if parsed.scheme.lower() != "https" or not parsed.netloc:
-            raise ValueError("NINEMALL_API_BASE must be HTTPS")
-        self.url = urljoin(str(base_url).rstrip("/") + "/", "api/mail-all")
+        try:
+            parsed = urlparse(str(base_url or "").strip())
+            valid_base = (
+                parsed.scheme.lower() == "https"
+                and (parsed.hostname or "").lower() == _NINEMALL_HOST
+                and parsed.port is None
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in ("", "/")
+                and not parsed.query
+                and not parsed.fragment
+            )
+        except ValueError:
+            valid_base = False
+        if not valid_base:
+            raise ValueError("NINEMALL_API_BASE must be the exact HTTPS AppleEmail origin")
+        self.url = _NINEMALL_MAIL_ALL_URL
         self.api_password = str(api_password or "")
         self.http_timeout = int(http_timeout)
         self.poll_interval = int(poll_interval)
