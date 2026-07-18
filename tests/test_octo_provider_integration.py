@@ -167,6 +167,9 @@ class OctoProviderIntegrationTests(unittest.TestCase):
         items = {item["key"]: item for item in group["items"]}
         self.assertIn("octo", items["FINGERPRINT_BROWSER"]["choices"])
         self.assertIn("OCTO_API_TOKEN", items)
+        self.assertIn("OCTO_HEADLESS", items)
+        self.assertEqual(items["OCTO_HEADLESS"]["type"], "bool")
+        self.assertIs(items["OCTO_HEADLESS"]["default"], False)
         self.assertIn("OCTO_PUBLIC_API_BASE", items)
         self.assertIn("OCTO_LOCAL_API_BASE", items)
         self.assertTrue(items["OCTO_API_TOKEN"]["secret"])
@@ -263,6 +266,21 @@ class OctoProviderIntegrationTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("octo: 'Octo Browser'", source)
+
+    def test_frontend_loads_and_uses_boolean_env_controls(self):
+        source = Path(server.WEBUI, "static", "app.js").read_text(
+            encoding="utf-8"
+        )
+        index = Path(server.WEBUI, "static", "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            index.index("/static/env-controls.js"),
+            index.index("/static/app.js"),
+        )
+        self.assertIn("EnvControls.renderBooleanControl(it.key, value)", source)
+        self.assertIn("EnvControls.collectForConnectionTest(", source)
+        self.assertIn("EnvControls.collectForSave(", source)
 
     def test_webui_masks_saved_octo_token(self):
         with tempfile.TemporaryDirectory() as tmp:
