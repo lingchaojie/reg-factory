@@ -17,24 +17,34 @@ def make_settings(fingerprint=("chrome.exe", True, "account", "mail@example.com"
 
 
 class NexaCardBrowserTests(unittest.IsolatedAsyncioTestCase):
-    def test_direct_env_removes_proxy_keys_case_insensitively(self):
+    def test_direct_env_removes_only_standard_proxy_keys_case_insensitively(self):
         source = {
             "HTTP_PROXY": "http://proxy",
             "HtTp_PrOxY": "http://proxy",
             "https_proxy": "http://proxy",
             "ALL_PROXY": "socks://proxy",
             "No_PrOxY": "localhost",
+            "fTp_PrOxY": "ftp://proxy",
+            "PROXY_VENDOR_API_KEY": "keep-this-business-value",
+            "NEXACARD_PROXY_METRICS": "keep-this-business-value",
             "KEEP_ME": "yes",
         }
 
         result = direct_browser_env(source)
 
-        self.assertEqual(result, {"KEEP_ME": "yes"})
+        self.assertEqual(
+            result,
+            {
+                "PROXY_VENDOR_API_KEY": "keep-this-business-value",
+                "NEXACARD_PROXY_METRICS": "keep-this-business-value",
+                "KEEP_ME": "yes",
+            },
+        )
 
     def test_direct_env_defaults_to_process_environment_without_mutating_it(self):
-        with patch.dict(os.environ, {"MiXeD_PrOxY": "http://proxy", "KEEP_ME": "yes"}, clear=True):
+        with patch.dict(os.environ, {"hTtP_pRoXy": "http://proxy", "KEEP_ME": "yes"}, clear=True):
             result = direct_browser_env()
-            self.assertEqual(os.environ["MiXeD_PrOxY"], "http://proxy")
+            self.assertEqual(os.environ["hTtP_pRoXy"], "http://proxy")
         self.assertEqual(result, {"KEEP_ME": "yes"})
 
     def test_chrome_args_force_direct_network(self):

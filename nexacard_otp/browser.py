@@ -7,14 +7,18 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 
 from .settings import CHROME_PROFILE_DIR, Settings
 
+PROXY_ENV_KEYS = frozenset(
+    {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "ftp_proxy"}
+)
+
 
 def direct_browser_env(source: dict[str, str] | None = None) -> dict[str, str]:
-    """Return a child environment with every proxy-related variable removed."""
+    """Return a child environment without standard proxy-routing variables."""
     environment = source if source is not None else dict(os.environ)
     return {
         key: value
         for key, value in environment.items()
-        if "proxy" not in key.casefold()
+        if key.casefold() not in PROXY_ENV_KEYS
     }
 
 
