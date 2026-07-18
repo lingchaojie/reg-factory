@@ -16,6 +16,7 @@ from common.claude_email_accounts import (
     ClaudeEmailAccountStore,
     reserve_shared_claude_account,
 )
+from webui import scripts, server
 
 
 def platform_args(platforms):
@@ -389,6 +390,69 @@ class BrokerPlatformTests(unittest.TestCase):
 
 
 class ClaudeAPIEntrypointTests(unittest.TestCase):
+    def test_webui_exposes_standalone_claude_api_registration(self):
+        item = scripts.script_by_id("register_claude_api")
+        self.assertIsNotNone(item)
+        self.assertEqual(item["file"], "register_claude_api.py")
+        secret_flags = {
+            spec["flag"] for spec in item["args"] if spec.get("secret")
+        }
+        self.assertTrue(
+            {"--password", "--token", "--client-id"} <= secret_flags
+        )
+
+    def test_orchestrator_platform_choices_include_claude_api(self):
+        for script_id in ("run_full_flow", "register_three_platforms"):
+            item = scripts.script_by_id(script_id)
+            platforms = next(
+                spec for spec in item["args"] if spec["flag"] == "--platforms"
+            )
+            self.assertIn("claude_api", platforms["choices"])
+
+    def test_webui_claude_api_preview_redacts_mailbox_secrets(self):
+        item = scripts.script_by_id("register_claude_api")
+        values = {
+            "--email": "person@example.com",
+            "--password": "mail-pass",
+            "--token": "refresh-secret",
+            "--client-id": "client-guid",
+        }
+        command = server._build_cmd(item, values)
+        preview = " ".join(server._redact_cmd(item, command))
+        for secret in ("mail-pass", "refresh-secret", "client-guid"):
+            self.assertNotIn(secret, preview)
+        self.assertEqual(preview.count("***"), 3)
+
+    def test_claude_api_documentation_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+
+        for command in (
+            "python register_claude_api.py --count 1",
+            "python run_full_flow.py --platforms claude_api",
+            "python register_three_platforms.py --from-pool --platforms claude claude_api",
+        ):
+            self.assertIn(command, readme)
+        for state_file in (
+            "mail_used_claude_api.txt",
+            "mail_error_claude_api.txt",
+            "emails_used_claude_api.txt",
+            "emails_error_claude_api.txt",
+        ):
+            self.assertIn(state_file, readme)
+            self.assertIn(state_file, gitignore)
+        for term in (
+            "cookies/claude_api/",
+            "个人账户",
+            "组织",
+            "API Key",
+            "充值",
+        ):
+            self.assertIn(term, readme)
+            self.assertIn(term, changelog)
+
     def test_claude_api_command_forwards_mailbox_credentials(self):
         command = register_three_platforms.build_command(
             "claude_api",

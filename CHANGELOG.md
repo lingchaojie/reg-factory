@@ -1,5 +1,14 @@
 ﻿# 更新日志
 
+## 2026-07-19 — Claude Platform 个人账户注册
+
+- 新增 `register_claude_api.py` 独立入口，以及 `run_full_flow.py` / `register_three_platforms.py` 的 `claude_api` 选择；WebUI 增加“Claude API 注册”卡片并对密码、refresh token、client ID 的字段和命令预览统一脱敏。
+- 默认 NINEMALL 严格匹配 Anthropic/Claude 新邮件，并解析 magic link 与数字验证码两类验证产物；NINEMALL 超时不会回退 Outlook，只有显式 `EMAIL_PROVIDER=OUTLOOK` 或非 Claude 混合编排才走兼容路由。
+- Claude Platform 与 Claude 网页号使用独立台账：`mail_used_claude_api.txt`、`mail_error_claude_api.txt`、`emails_used_claude_api.txt`、`emails_error_claude_api.txt`；登录会话保存到 `cookies/claude_api/`。
+- 当前范围仅选择 Claude Platform 个人账户：不创建组织，不创建 API Key，也不执行充值、付费或支付操作。
+
+---
+
 ## 2026-07-19 — Claude 专用 NINEMALL 邮箱渠道
 
 - Claude 默认使用 NINEMALL 四列账号顺序（`email----password----client_id----refresh_token`）；`EMAIL_PROVIDER=OUTLOOK` 保留旧 Outlook 顺序和兼容流程。
