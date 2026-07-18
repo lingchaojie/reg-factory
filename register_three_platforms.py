@@ -218,10 +218,18 @@ def child_env_for(args):
     return env
 
 
-def platform_child_env(platform, base_env):
+def platform_child_env(platform, base_env, platforms=None):
     env = dict(base_env)
-    if platform == "claude" and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
-        strip_http_proxy_env(env)
+    if platform == "claude":
+        if env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
+            strip_http_proxy_env(env)
+        if (
+            platforms is not None
+            and set(platforms) != {"claude"}
+            and normalize_email_provider(env.get("EMAIL_PROVIDER"))
+            == "NINEMALL"
+        ):
+            env["EMAIL_PROVIDER"] = "OUTLOOK"
         return env
     if (
         platform in {"chatgpt", "grok"}
@@ -250,7 +258,12 @@ async def process_account(account, args, child_env):
         jobs = [(p, build_command(p, args, account)) for p in platforms]
         if args.parallel:
             results = await asyncio.gather(*(
-                run_platform(p, cmd, run_id, platform_child_env(p, child_env))
+                run_platform(
+                    p,
+                    cmd,
+                    run_id,
+                    platform_child_env(p, child_env, args.platforms),
+                )
                 for p, cmd in jobs
             ))
         else:
@@ -260,14 +273,13 @@ async def process_account(account, args, child_env):
                     platform,
                     cmd,
                     run_id,
-                    platform_child_env(platform, child_env),
+                    platform_child_env(platform, child_env, args.platforms),
                 ))
     except PlatformLaunchError:
         _release_pool_account(account)
         raise
     except Exception:
-        if "jobs" not in locals():
-            _release_pool_account(account)
+        _release_pool_account(account)
         raise
 
     if any(not ok for _platform, ok, _rc, _log_path in results):

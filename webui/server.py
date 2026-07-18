@@ -780,6 +780,23 @@ def _build_cmd(script, args):
     return cmd
 
 
+def _redact_cmd(script, cmd):
+    secret_flags = {
+        spec["flag"] for spec in script["args"] if spec.get("secret")
+    }
+    redacted = []
+    redact_next = False
+    for value in cmd:
+        if redact_next:
+            redacted.append("***")
+            redact_next = False
+            continue
+        redacted.append(value)
+        if value in secret_flags:
+            redact_next = True
+    return redacted
+
+
 def _child_env():
     """构造新任务环境；保存后的 .env 无需重启 WebUI 即可生效。"""
     env = dict(os.environ)
@@ -811,8 +828,9 @@ async def api_run(request: Request):
     )
     _run_seq[0] += 1
     run_id = f"r{_run_seq[0]}"
+    display_cmd = _redact_cmd(script, cmd)
     rec = {"proc": proc, "lines": [], "done": False, "script": sid,
-           "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S")}
+           "cmd": " ".join(display_cmd), "started": time.strftime("%H:%M:%S")}
     RUNS[run_id] = rec
 
     async def _pump():

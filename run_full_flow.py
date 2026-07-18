@@ -255,14 +255,11 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
         cmd.append("--grok-sub2api")
         if args.grok_sub2api_group:
             cmd += ["--grok-sub2api-group", args.grok_sub2api_group]
-    if is_ninemail_claude_only(args, env):
-        log(
-            "Stage B cmd: register_three_platforms.py "
-            "[mailbox credentials redacted]",
-            "B",
-        )
-    else:
-        log(f"Stage B cmd: {' '.join(cmd)}", "B")
+    log(
+        "Stage B cmd: register_three_platforms.py "
+        "[mailbox credentials redacted]",
+        "B",
+    )
     if args.dry_run:
         return 0
     try:

@@ -10,7 +10,7 @@ import register_three_platforms
 import run_full_flow
 from common.claude_email_accounts import ClaudeEmailAccount
 from common.ipmart_proxy import ProxyLease
-from webui import scripts
+from webui import scripts, server
 
 
 def platform_args(platforms):
@@ -86,6 +86,29 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
         self.assertEqual(selected[0], "legacy@example.com")
         store.assert_not_called()
         legacy.assert_called_once_with("tri")
+
+    def test_mixed_platform_claude_child_forces_outlook_provider(self):
+        args = platform_args(["claude", "chatgpt"])
+        args.parallel = False
+        args.broker = ""
+        args.grok_timeout = 40
+        captured = {}
+
+        async def fake_run(platform, _cmd, _run_id, child_env):
+            captured[platform] = dict(child_env)
+            return platform, True, 0, "test.log"
+
+        account = ("legacy@example.com", "pw", "rt", "cid")
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ), patch.object(register_three_platforms, "broker_release"):
+            asyncio.run(
+                register_three_platforms.process_account(
+                    account, args, {"EMAIL_PROVIDER": "NINEMALL"}
+                )
+            )
+        self.assertEqual(captured["claude"]["EMAIL_PROVIDER"], "OUTLOOK")
+        self.assertEqual(captured["chatgpt"]["EMAIL_PROVIDER"], "NINEMALL")
 
     def test_outlook_pure_claude_from_pool_uses_legacy_email_pool(self):
         args = platform_args(["claude"])
@@ -217,6 +240,28 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
                 )
         self.assertEqual(store.released, [self.account])
 
+    def test_pool_reservation_released_on_unwrapped_pre_spawn_error(self):
+        store = FakeStore(self.account)
+        args = platform_args(["claude"])
+        args.parallel = False
+        args.broker = ""
+        args.grok_timeout = 40
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms,
+            "ClaudeEmailAccountStore",
+            return_value=store,
+        ), patch.object(
+            register_three_platforms,
+            "run_platform",
+            side_effect=OSError("log directory unavailable"),
+        ):
+            selected = register_three_platforms.next_pool_account(args)
+            with self.assertRaises(OSError):
+                asyncio.run(
+                    register_three_platforms.process_account(selected, args, {})
+                )
+        self.assertEqual(store.released, [self.account])
+
     def test_pure_claude_ninemail_does_not_release_outlook_broker(self):
         args = platform_args(["claude"])
         args.parallel = False
@@ -308,6 +353,49 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
         logged = output.getvalue()
         for secret in ("mail-pass", "refresh-secret", "client-guid"):
             self.assertNotIn(secret, logged)
+
+    def test_mixed_stage_platform_log_does_not_expose_mailbox_secrets(self):
+        args = argparse.Namespace(
+            platforms=["claude", "chatgpt"],
+            node="auto",
+            platform_timeout=600,
+            broker="",
+            keep_on_fail=False,
+            import_c2a=False,
+            codex=False,
+            grok_sub2api=False,
+            dry_run=True,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = run_full_flow.stage_platforms(
+                args,
+                {"EMAIL_PROVIDER": "NINEMALL"},
+                "legacy@example.com",
+                "mail-pass",
+                "refresh-secret",
+                "client-guid",
+            )
+        self.assertEqual(rc, 0)
+        logged = output.getvalue()
+        for secret in ("mail-pass", "refresh-secret", "client-guid"):
+            self.assertNotIn(secret, logged)
+
+    def test_webui_command_preview_redacts_mailbox_secrets(self):
+        script = scripts.script_by_id("run_full_flow")
+        values = {
+            "--platforms": ["claude"],
+            "--skip-email": True,
+            "--email": "person@example.com",
+            "--password": "mail-pass",
+            "--token": "refresh-secret",
+            "--client-id": "client-guid",
+        }
+        command = server._build_cmd(script, values)
+        preview = " ".join(server._redact_cmd(script, command))
+        for secret in ("mail-pass", "refresh-secret", "client-guid"):
+            self.assertNotIn(secret, preview)
+        self.assertIn("***", preview)
 
     def test_webui_exposes_client_id_and_ninemail_env(self):
         claude_flags = {
