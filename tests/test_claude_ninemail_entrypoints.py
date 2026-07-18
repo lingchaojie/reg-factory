@@ -397,6 +397,20 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
             self.assertNotIn(secret, preview)
         self.assertIn("***", preview)
 
+    def test_all_webui_mailbox_credential_fields_are_secret(self):
+        credential_flags = {
+            "--password",
+            "--token",
+            "--refresh-token",
+            "--client-id",
+        }
+        exposed = []
+        for script in scripts.SCRIPTS:
+            for item in script["args"]:
+                if item["flag"] in credential_flags and not item.get("secret"):
+                    exposed.append((script["id"], item["flag"]))
+        self.assertEqual(exposed, [])
+
     def test_webui_exposes_client_id_and_ninemail_env(self):
         claude_flags = {
             item["flag"]
