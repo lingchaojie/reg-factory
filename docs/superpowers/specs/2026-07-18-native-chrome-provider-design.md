@@ -26,6 +26,8 @@ isolation.
 - Use a separate temporary `user-data-dir` for every session and every account.
 - Support the existing credentialed IPMart HTTP proxy lease without a proxy
   extension or a global system-proxy change.
+- Derive Chrome's timezone and safe regional settings from the same SID proxy's
+  IPinfo response before Chrome starts.
 - Keep WebRTC enabled while preventing non-proxied UDP and local/direct IP
   disclosure.
 - Keep IP, locale, timezone, permissions, and request headers internally
@@ -175,6 +177,55 @@ The Chrome provider must fail closed when IPMart is enabled but no valid lease
 is available. It must not fall back to direct access, Clash, an old profile, or
 another account's lease.
 
+### IPMart exit metadata
+
+The existing SID acquisition already makes a request through the newly rendered
+credentialed proxy. Upgrade that inspection from an IP-only response to a rich
+exit response. The configured check URL defaults to:
+
+```env
+IPMART_IP_CHECK_URL=https://ipinfo.io/json
+IPMART_EXPECTED_COUNTRY=US
+```
+
+The response is expected to contain the current proxy exit and regional data in
+the legacy IPinfo shape:
+
+```json
+{
+  "ip": "203.0.113.8",
+  "city": "Example City",
+  "region": "Example Region",
+  "country": "US",
+  "loc": "40.0000,-90.0000",
+  "timezone": "America/Chicago"
+}
+```
+
+Do not query the IP as an unproxied lookup parameter. The request must be sent
+through the candidate SID proxy so the service describes the actual calling
+exit. The session continues to use `trust_env=False`.
+
+Add a safe `ProxyExitInfo` value containing:
+
+- normalized exit IP;
+- two-letter country code;
+- region and city labels;
+- validated latitude and longitude parsed from `loc`;
+- validated IANA timezone identifier.
+
+`ProxyLease` carries this value with the existing SID and credentials. Runtime
+lease transport adds non-secret country, region, city, coordinates, and timezone
+fields so Outlook and Claude receive the exact same regional decision rather
+than looking it up independently. The usage ledger may record these safe exit
+fields for audit but continues to exclude username, password, and credentialed
+proxy URLs.
+
+For backward compatibility, an explicitly configured IP-only check response may
+still validate a lease for BitBrowser or AdsPower. The Chrome provider requires
+the full country, coordinates, and timezone fields and fails closed if they are
+missing or malformed.
+
 ### Existing Clash behavior
 
 When IPMart is not active, existing workflows may continue using the configured
@@ -199,19 +250,34 @@ location:
 - optional geolocation, only when explicitly required and granted;
 - WebRTC routing policy.
 
-The current IPMart account design obtains US exits. Initial defaults are:
+The current IPMart username design requests US residential exits.
+`IPMART_EXPECTED_COUNTRY` makes that routing intent explicit and must be a
+two-letter country code. The provider requires the inspected `country` to match
+it and derives the timezone directly from the inspected exit. For example, an
+Iowa exit reporting `America/Chicago` launches Chrome with
+`timezone_id="America/Chicago"`; it is not forced to New York time.
+
+Language remains a user preference rather than an exact city property. Initial
+defaults are:
 
 ```env
 CHROME_LOCALE=en-US
-CHROME_TIMEZONE=America/New_York
 CHROME_ACCEPT_LANGUAGE=en-US,en;q=0.9
 ```
 
-All three settings are explicit and configurable. The first implementation does
-not add a new third-party IP-geolocation service. Deployments using IPMart exits
-outside the configured region must set matching values; startup validation must
-reject missing or invalid timezone/locale values rather than silently using the
-host machine's values.
+Locale and `Accept-Language` are explicit and configurable. Timezone is not a
+static Chrome default: it comes from `ProxyExitInfo.timezone_id`. Startup
+validation rejects a missing or invalid country, coordinate pair, timezone, or
+locale rather than silently using the host machine's values.
+
+The metadata lookup used to construct the regional profile is part of IPMart
+acquisition and occurs before Chrome starts. It uses the user-configurable
+`IPMART_IP_CHECK_URL`. The later browser-level request remains a separate
+end-to-end verification of the already selected exit and regional profile. The
+default uses IPinfo because its response contains the required timezone and
+coordinates. If that public compatibility endpoint stops returning rich fields,
+Chrome fails closed and the operator can configure a compatible authenticated
+endpoint.
 
 Geolocation permission is denied by default. If a future workflow requires it,
 coordinates and permission must be configured as one regional-profile unit; the
@@ -260,8 +326,8 @@ native policy applies only to `FINGERPRINT_BROWSER=chrome`.
 
 ## Native Chrome Lifecycle
 
-1. Validate provider, Chrome channel availability, regional configuration, and
-   the required proxy lease.
+1. Validate provider, Chrome channel availability, locale configuration, and a
+   proxy lease containing inspected exit metadata.
 2. Create a uniquely named directory beneath a provider-owned temporary root.
 3. Launch headed installed Chrome with the persistent context, proxy, regional
    settings, and WebRTC policy already applied.
@@ -286,7 +352,8 @@ site:
 - load `IPMART_IP_CHECK_URL` through the browser context;
 - parse the resulting public IP;
 - require it to equal `lease.exit_ip`;
-- inspect locale and timezone values from the page;
+- inspect locale and timezone values from the page and require them to equal the
+  configured language and inspected exit timezone;
 - create a bounded WebRTC ICE probe;
 - reject private IPv4/IPv6 candidates;
 - reject host or server-reflexive public IP candidates that do not equal the
@@ -324,8 +391,9 @@ Add or document:
 
 ```env
 FINGERPRINT_BROWSER=chrome
+IPMART_IP_CHECK_URL=https://ipinfo.io/json
+IPMART_EXPECTED_COUNTRY=US
 CHROME_LOCALE=en-US
-CHROME_TIMEZONE=America/New_York
 CHROME_ACCEPT_LANGUAGE=en-US,en;q=0.9
 CHROME_WEBRTC_MODE=proxy_only
 ```
@@ -362,7 +430,10 @@ isolation.
 - WebUI config choices and provider status behavior.
 - Mapping an IPMart lease to Playwright proxy options without leaking credentials
   in representations or errors.
-- Regional setting validation.
+- Parsing and validating IPinfo exit IP, country, coordinates, and IANA timezone.
+- Rejecting a Chrome lease whose requested and inspected countries differ.
+- Transporting one immutable regional profile with the lease across child
+  processes.
 - Chrome launch options include headed mode, a unique user-data directory, real
   Chrome channel, and `disable_non_proxied_udp`.
 - No UA override is passed for the native provider.
@@ -395,7 +466,8 @@ suite.
 - Each session uses a new temporary user-data directory.
 - A credentialed IPMart lease is applied directly through Playwright.
 - Browser-observed exit IP equals the reserved lease before account navigation.
-- Locale, timezone, and `Accept-Language` equal the configured regional profile.
+- Locale and `Accept-Language` equal the configured language profile, and Chrome
+  timezone equals the timezone inspected through the same IPMart SID lease.
 - WebRTC remains available but does not expose private or direct host IPs.
 - Native Chrome retains its real UA, Client Hints, and hardware/browser signals.
 - All browser processes and provider-owned temporary directories are removed at
