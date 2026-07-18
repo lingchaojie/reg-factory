@@ -90,8 +90,87 @@ class NexaCardGmailTests(unittest.TestCase):
         messages.list.assert_called_once_with(
             userId="me",
             q='from:(jushihui@mail.jushipay.com) subject:"NexaCard Verification Code" newer_than:1d',
-            maxResults=10,
+            maxResults=500,
         )
+
+    def test_snapshot_paginates_all_ids_and_fetch_later_excludes_a_second_page_id(self):
+        raw = _encoded(Path("tests/fixtures/nexacard_verification_code.eml").read_bytes())
+        messages = Mock()
+
+        def list_messages(**kwargs):
+            response = Mock()
+            if kwargs["maxResults"] == 500:
+                response.execute.return_value = (
+                    {"messages": [{"id": "first"}], "nextPageToken": "second-page"}
+                    if "pageToken" not in kwargs
+                    else {"messages": [{"id": "old"}]}
+                )
+            else:
+                response.execute.return_value = {"messages": [{"id": "old"}, {"id": "new"}]}
+            return response
+
+        messages.list.side_effect = list_messages
+        messages.get.return_value.execute.return_value = {"raw": raw, "internalDate": str(RECEIVED_MS)}
+        service = Mock()
+        service.users.return_value.messages.return_value = messages
+        reader = GmailCodeReader()
+
+        with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+            "nexacard_otp.gmail_reader.load_valid_credentials"
+        ):
+            snapshot = asyncio.run(reader.snapshot_login_message_ids())
+            code = reader._fetch_once(SENT_AFTER, excluded_message_ids=snapshot)
+
+        self.assertEqual(snapshot, frozenset({"first", "old"}))
+        self.assertEqual(code, "123456789")
+        self.assertEqual(messages.list.call_args_list[1].kwargs["pageToken"], "second-page")
+        messages.get.assert_called_once_with(userId="me", id="new", format="raw")
+
+    def test_gmail_http_authorization_errors_preserve_cause_for_snapshot_and_fetch(self):
+        for method_name in ("snapshot", "fetch"):
+            for status in (401, 403):
+                with self.subTest(method_name=method_name, status=status):
+                    response = Mock(status=status)
+                    error = HttpError(response, b"secret response")
+                    messages = Mock()
+                    messages.list.return_value.execute.side_effect = error
+                    service = Mock()
+                    service.users.return_value.messages.return_value = messages
+                    reader = GmailCodeReader()
+
+                    with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+                        "nexacard_otp.gmail_reader.load_valid_credentials"
+                    ):
+                        with self.assertRaises(GmailAuthorizationRequired) as captured:
+                            if method_name == "snapshot":
+                                asyncio.run(reader.snapshot_login_message_ids())
+                            else:
+                                reader._fetch_once(SENT_AFTER)
+
+                    self.assertIs(captured.exception.__cause__, error)
+                    self.assertNotIn("secret response", str(captured.exception))
+
+    def test_gmail_http_non_authorization_errors_are_temporary_for_snapshot_and_fetch(self):
+        for method_name in ("snapshot", "fetch"):
+            response = Mock(status=500)
+            error = HttpError(response, b"secret response")
+            messages = Mock()
+            messages.list.return_value.execute.side_effect = error
+            service = Mock()
+            service.users.return_value.messages.return_value = messages
+            reader = GmailCodeReader()
+
+            with self.subTest(method_name=method_name), patch(
+                "nexacard_otp.gmail_reader.build", return_value=service
+            ), patch("nexacard_otp.gmail_reader.load_valid_credentials"):
+                with self.assertRaises(GmailTemporarilyUnavailable) as captured:
+                    if method_name == "snapshot":
+                        asyncio.run(reader.snapshot_login_message_ids())
+                    else:
+                        reader._fetch_once(SENT_AFTER)
+
+            self.assertIs(captured.exception.__cause__, error)
+            self.assertNotIn("secret response", str(captured.exception))
 
     def test_sender_and_subject_must_match_exactly(self):
         messages = (
