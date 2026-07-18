@@ -321,40 +321,41 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         # emails.txt 里可能没记密码，用快照里的
         password = password or args.password
 
-    if account_lease is not None and "claude" in args.platforms:
-        try:
-            verify(
-                account_lease,
-                expected_exit_ip=account_lease.exit_ip,
-                env=round_env,
-            )
-        except IPMartProxyError as exc:
-            log(f"IPMart proxy changed before Claude: {exc}", "ERR")
-            _release_stage_account(reserved_account)
-            return 1, email
-
-    # Stage B
-    platform_env = round_env
-    if account_lease is not None and any(
-        platform != "claude" for platform in args.platforms
-    ):
-        platform_env = dict(round_env)
-        platform_env.update(original_http_proxy_env)
-    print("=" * 64)
+    completed = False
     try:
+        if account_lease is not None and "claude" in args.platforms:
+            try:
+                verify(
+                    account_lease,
+                    expected_exit_ip=account_lease.exit_ip,
+                    env=round_env,
+                )
+            except IPMartProxyError as exc:
+                log(f"IPMart proxy changed before Claude: {exc}", "ERR")
+                return 1, email
+
+        # Stage B
+        platform_env = round_env
+        if account_lease is not None and any(
+            platform != "claude" for platform in args.platforms
+        ):
+            platform_env = dict(round_env)
+            platform_env.update(original_http_proxy_env)
+        print("=" * 64)
         rc = stage_platforms(
             args, platform_env, email, password, token, client_id
         )
-    except PlatformLaunchError:
-        _release_stage_account(reserved_account)
-        raise
-    if args.dry_run or rc != 0:
-        _release_stage_account(reserved_account)
-    print("=" * 64)
-    dt = time.time() - t0
-    log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
-        "OK" if rc == 0 else "WARN")
-    return rc, email
+        if args.dry_run or rc != 0:
+            _release_stage_account(reserved_account)
+        print("=" * 64)
+        dt = time.time() - t0
+        log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
+            "OK" if rc == 0 else "WARN")
+        completed = True
+        return rc, email
+    finally:
+        if not completed:
+            _release_stage_account(reserved_account)
 
 
 # ---------------------------------------------------------------- main

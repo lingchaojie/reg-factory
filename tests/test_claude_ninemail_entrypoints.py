@@ -218,6 +218,50 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
         self.assertEqual(store.released, [self.account])
         platforms.assert_not_called()
 
+    def test_full_flow_runtime_error_releases_once_and_propagates(self):
+        store = FakeStore(self.account)
+        args = argparse.Namespace(
+            skip_email=False,
+            email="",
+            password="",
+            token="",
+            client_id="",
+            platforms=["claude"],
+            dry_run=False,
+        )
+        with patch.object(
+            run_full_flow, "ClaudeEmailAccountStore", return_value=store
+        ), patch.object(
+            run_full_flow,
+            "stage_platforms",
+            side_effect=RuntimeError("unexpected stage unwind"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected stage unwind"):
+                run_full_flow.run_once(args, {"EMAIL_PROVIDER": "NINEMALL"})
+        self.assertEqual(store.released, [self.account])
+
+    def test_full_flow_keyboard_interrupt_releases_once_and_propagates(self):
+        store = FakeStore(self.account)
+        args = argparse.Namespace(
+            skip_email=False,
+            email="",
+            password="",
+            token="",
+            client_id="",
+            platforms=["claude"],
+            dry_run=False,
+        )
+        with patch.object(
+            run_full_flow, "ClaudeEmailAccountStore", return_value=store
+        ), patch.object(
+            run_full_flow,
+            "stage_platforms",
+            side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_full_flow.run_once(args, {"EMAIL_PROVIDER": "NINEMALL"})
+        self.assertEqual(store.released, [self.account])
+
     def test_pool_reservation_released_when_claude_subprocess_cannot_launch(self):
         store = FakeStore(self.account)
         args = platform_args(["claude"])
@@ -257,6 +301,28 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
         ):
             selected = register_three_platforms.next_pool_account(args)
             with self.assertRaises(OSError):
+                asyncio.run(
+                    register_three_platforms.process_account(selected, args, {})
+                )
+        self.assertEqual(store.released, [self.account])
+
+    def test_pool_reservation_released_once_when_processing_is_cancelled(self):
+        store = FakeStore(self.account)
+        args = platform_args(["claude"])
+        args.parallel = False
+        args.broker = ""
+        args.grok_timeout = 40
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms,
+            "ClaudeEmailAccountStore",
+            return_value=store,
+        ), patch.object(
+            register_three_platforms,
+            "run_platform",
+            side_effect=asyncio.CancelledError,
+        ):
+            selected = register_three_platforms.next_pool_account(args)
+            with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(
                     register_three_platforms.process_account(selected, args, {})
                 )

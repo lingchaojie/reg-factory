@@ -120,6 +120,36 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         state = (self.root / "mail_used_claude.txt").read_text(encoding="utf-8")
         self.assertNotIn("released", state)
 
+    def test_terminal_success_from_sibling_store_cannot_be_released(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        owner = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        account = owner.reserve_one()
+        sibling = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        sibling.mark_used(account)
+
+        self.assertFalse(owner.release(account))
+
+        state = (self.root / "mail_used_claude.txt").read_text(encoding="utf-8")
+        self.assertNotIn("released", state)
+        self.assertIsNone(
+            ClaudeEmailAccountStore("NINEMALL", source, self.root).reserve_one()
+        )
+
+    def test_terminal_error_from_sibling_store_cannot_be_released(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        owner = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        account = owner.reserve_one()
+        sibling = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        sibling.mark_error(account, "registration_error")
+
+        self.assertFalse(owner.release(account))
+
+        state = (self.root / "mail_used_claude.txt").read_text(encoding="utf-8")
+        self.assertNotIn("released", state)
+        self.assertIsNone(
+            ClaudeEmailAccountStore("NINEMALL", source, self.root).reserve_one()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

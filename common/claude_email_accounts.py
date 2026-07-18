@@ -126,6 +126,23 @@ class ClaudeEmailAccountStore:
             else:
                 handle.write(f"{account.email}----{status}\n")
 
+    def _has_terminal_state(self, email):
+        if self.error_file.exists():
+            for raw in self.error_file.read_text(encoding="utf-8").splitlines():
+                value = raw.strip()
+                if value and not value.startswith("#"):
+                    if value.split("----", 1)[0].strip().lower() == email:
+                        return True
+        if self.used_file.exists():
+            for raw in self.used_file.read_text(encoding="utf-8").splitlines():
+                value = raw.strip()
+                if not value or value.startswith("#"):
+                    continue
+                parts = [part.strip() for part in value.split("----")]
+                if parts[0].lower() == email and parts[-1].lower() == "ok":
+                    return True
+        return False
+
     def _load_accounts(self, limit=None):
         if not self.source_file.exists():
             return []
@@ -195,6 +212,9 @@ class ClaudeEmailAccountStore:
         email = account.email.lower()
         with _POOL_LOCK:
             if email not in self._active_reservations:
+                return False
+            if self._has_terminal_state(email):
+                self._active_reservations.discard(email)
                 return False
             self._append_state(self.used_file, account, "released")
             self._active_reservations.discard(email)

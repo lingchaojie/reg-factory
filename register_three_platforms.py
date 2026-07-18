@@ -275,10 +275,7 @@ async def process_account(account, args, child_env):
                     run_id,
                     platform_child_env(platform, child_env, args.platforms),
                 ))
-    except PlatformLaunchError:
-        _release_pool_account(account)
-        raise
-    except Exception:
+    except BaseException:
         _release_pool_account(account)
         raise
 
