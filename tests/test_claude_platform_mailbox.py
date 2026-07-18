@@ -146,6 +146,31 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
 
                 self.assertIsNone(result)
 
+    def test_platform_link_requires_exact_magic_link_path(self):
+        invalid_paths = ("/magic-link/", "/magic-link////", "/other-path")
+        for path in invalid_paths:
+            with self.subTest(kind="direct", path=path):
+                result = extract_claude_platform_verification([
+                    self.message(
+                        "Sign in to Claude Platform",
+                        f"https://platform.claude.com{path}?code=invalid",
+                    )
+                ])
+
+                self.assertIsNone(result)
+
+            with self.subTest(kind="safelinks", path=path):
+                wrapped_path = path.replace("/", "%2F").replace("?", "%3F")
+                result = extract_claude_platform_verification([
+                    self.message(
+                        "Sign in to Claude Platform",
+                        "https://nam01.safelinks.protection.outlook.com/"
+                        f"?url=https%3A%2F%2Fplatform.claude.com{wrapped_path}%3Fcode%3Dinvalid",
+                    )
+                ])
+
+                self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()

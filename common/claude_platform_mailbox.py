@@ -90,7 +90,7 @@ def _validated_platform_link(candidate, allow_safelink=True):
         and parsed.username is None
         and parsed.password is None
     ):
-        if parsed.path.rstrip("/") == "/magic-link":
+        if parsed.path == "/magic-link":
             return value
     if allow_safelink and (parsed.hostname or "").endswith(
         "safelinks.protection.outlook.com"

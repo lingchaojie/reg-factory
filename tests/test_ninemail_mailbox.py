@@ -166,6 +166,48 @@ class NineMallMailboxTests(unittest.TestCase):
             ["INBOX", "Junk"],
         )
 
+    def test_platform_polling_cancellation_stops_before_any_fallback_channel(self):
+        client = self.client([FakeResponse(503, ValueError("not json"))])
+        cancelled = CancellingEvent(self.clock)
+
+        self.assertIsNone(
+            client.poll_claude_platform_verification(
+                account(), max_wait=20, cancel_event=cancelled
+            )
+        )
+
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(
+            [call[1]["mailbox"] for call in self.session.calls],
+            ["INBOX"],
+        )
+
+    def test_platform_polling_deadline_exhausts_during_retryable_inbox_fetch(self):
+        self.clock = FakeClock()
+        self.session = FakeSession(
+            [FakeResponse(503, ValueError("not json"))],
+            clock=self.clock,
+            elapsed=[4],
+        )
+        client = NineMallMailboxClient(
+            base_url="https://www.appleemail.top",
+            http_timeout=17,
+            poll_interval=5,
+            session=self.session,
+            sleep=self.clock.sleep,
+            clock=self.clock,
+        )
+
+        self.assertIsNone(
+            client.poll_claude_platform_verification(account(), max_wait=5)
+        )
+        self.assertEqual(
+            [call[1]["mailbox"] for call in self.session.calls],
+            ["INBOX"],
+        )
+        self.assertEqual(self.session.calls[0][2], 5)
+        self.assertEqual(self.clock.value, 2_000_000_005.0)
+
     def test_safelinks_target_is_decoded_and_validated(self):
         good = (
             "https://nam01.safelinks.protection.outlook.com/"
