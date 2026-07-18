@@ -359,6 +359,86 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
         self.assertEqual(result.received_at, 2_000_000_015.0)
         self.assertEqual(page.evaluate.await_args_list[1].args[1], 1)
 
+    def test_browser_scan_mixed_timestamps_uses_first_visible_row_for_rapid_resend(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": True,
+                    "received": "",
+                    "stable_id": "rapid-resend",
+                },
+                {
+                    "index": 1,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:35Z",
+                    "stable_id": "older-rendered-row",
+                },
+            ],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(claude_platform_mailbox._scan_claude_platform_folder(page))
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(result.received_at, 0.0)
+        self.assertEqual(page.evaluate.await_args_list[1].args[1], 0)
+
+    def test_browser_scan_mixed_unknown_first_row_is_rejected_with_freshness_filter(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": True,
+                    "received": "",
+                    "stable_id": "rapid-resend",
+                },
+                {
+                    "index": 1,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:35Z",
+                    "stable_id": "known",
+                },
+            ],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(
+                claude_platform_mailbox._scan_claude_platform_folder(
+                    page, received_after=2_000_000_000.0
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(page.evaluate.await_count, 1)
+
+    def test_browser_scan_equal_timestamps_breaks_tie_by_earliest_dom_index(self):
+        page = self.browser_page(
+            [
+                {
+                    "index": 0,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:35Z",
+                    "stable_id": "a-first",
+                },
+                {
+                    "index": 1,
+                    "visible": True,
+                    "received": "2033-05-18T03:33:35Z",
+                    "stable_id": "z-second",
+                },
+            ],
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(claude_platform_mailbox._scan_claude_platform_folder(page))
+
+        self.assertEqual(result.received_at, 2_000_000_015.0)
+        self.assertEqual(page.evaluate.await_args_list[1].args[1], 0)
+
     def test_browser_scan_accepts_stable_epoch_millisecond_metadata(self):
         page = self.browser_page(
             [{

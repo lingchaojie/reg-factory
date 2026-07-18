@@ -265,26 +265,27 @@ async def _scan_claude_platform_folder(
     for item in visible:
         received_epoch = _received_epoch(item.get("received"))
         if received_epoch is not None:
-            timestamped.append(
-                (received_epoch, str(item.get("stable_id") or ""), item)
-            )
-    if timestamped:
-        _received, _stable_id, selected = max(
+            timestamped.append((received_epoch, item))
+    if len(timestamped) == len(visible):
+        _received, selected = max(
             timestamped,
-            key=lambda item: (item[0], item[1]),
+            key=lambda item: (
+                item[0],
+                -int(item[1].get("index") or 0),
+            ),
         )
         received = str(selected.get("received") or "")
     else:
-        if received_after is not None:
-            return None
         selected = min(
             visible,
-            key=lambda item: (
-                int(item.get("index") or 0),
-                str(item.get("stable_id") or ""),
-            ),
+            key=lambda item: int(item.get("index") or 0),
         )
-        received = "1970-01-01T00:00:00+00:00"
+        if _received_epoch(selected.get("received")) is None:
+            if received_after is not None:
+                return None
+            received = "1970-01-01T00:00:00+00:00"
+        else:
+            received = str(selected.get("received") or "")
 
     opened = await page.evaluate(
         """(index) => {
@@ -450,6 +451,8 @@ async def fetch_claude_platform_from_broker(
     try:
         received_at = float(value.get("received_at") or 0.0)
     except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(received_at):
         return None
     return ClaudePlatformVerification(
         magic_link=magic_link,

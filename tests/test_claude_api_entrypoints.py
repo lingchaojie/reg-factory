@@ -173,6 +173,31 @@ class ClaudeApiMailboxEntrypointTests(unittest.TestCase):
         rendered = " ".join(str(item) for item in output.call_args_list)
         self.assertNotIn(raw, rendered)
 
+    def test_platform_broker_rejects_non_finite_received_at(self):
+        for raw in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(raw=raw):
+                capture = {}
+                payload = {
+                    "ok": True,
+                    "value": {"code": "482731", "received_at": raw},
+                }
+                with patch.dict(
+                    "os.environ", {"MAILBOX_BROKER": "http://broker.test"}, clear=True
+                ), patch.object(
+                    claude_platform_mailbox.aiohttp,
+                    "ClientSession",
+                    side_effect=lambda **kwargs: _Session(payload, capture, **kwargs),
+                ), patch("builtins.print") as output:
+                    result = asyncio.run(
+                        claude_platform_mailbox.fetch_claude_platform_from_broker(
+                            "person@example.com", "mail-pass", max_wait=30
+                        )
+                    )
+
+                self.assertIsNone(result)
+                rendered = " ".join(str(item) for item in output.call_args_list)
+                self.assertNotIn(raw, rendered)
+
 
 class BrokerPlatformTests(unittest.TestCase):
     def setUp(self):
