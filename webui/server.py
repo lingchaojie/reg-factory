@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import html
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -710,11 +709,18 @@ def index():
 
 
 def _safe_oauth_error(exc: Exception) -> str:
-    """Keep unexpected OAuth provider errors, especially token-bearing ones, out of responses."""
+    """Expose only fixed, locally generated OAuth validation messages."""
     message = str(exc).strip()
-    if not message or re.search(r"(?i)\b(?:access|refresh|id)?[_ -]?token\b\s*[=:]", message):
-        return "Google authorization could not be completed safely"
-    return message
+    if message in {
+        "a valid verification email is required",
+        "OAuth state is missing or expired",
+        "OAuth state does not match the authorization response",
+        "OAuth state returned by Google does not match the request",
+        "authorized Gmail address does not match the configured verification email",
+        "too many pending OAuth authorizations; try again",
+    }:
+        return message
+    return "Google authorization could not be completed safely"
 
 
 @app.post("/api/nexacard/oauth/start")

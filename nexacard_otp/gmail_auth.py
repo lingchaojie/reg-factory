@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import tempfile
 import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -36,13 +38,23 @@ class OAuthCoordinator:
     """Coordinate one-time desktop Google OAuth authorization attempts."""
 
     pending_ttl = timedelta(minutes=10)
+    MAX_PENDING = 100
 
     def __init__(self) -> None:
         self.pending: dict[str, tuple[object, ...]] = {}
+        self._pending_lock = threading.Lock()
+
+    @property
+    def max_pending(self) -> int:
+        return self.MAX_PENDING
+
+    @max_pending.setter
+    def max_pending(self, value: int) -> None:
+        self.MAX_PENDING = value
 
     def start(self, email: str, redirect_uri: str) -> str:
         normalized = email.strip().lower()
-        if "@" not in normalized:
+        if not self._is_valid_email(normalized):
             raise ValueError("a valid verification email is required")
 
         ensure_private_oauth_files()
@@ -56,16 +68,25 @@ class OAuthCoordinator:
             include_granted_scopes="true",
             state=requested_state,
         )
-        self.pending[returned_state] = (normalized, flow, datetime.now(timezone.utc))
+        if returned_state != requested_state:
+            raise ValueError("OAuth state returned by Google does not match the request")
+        with self._pending_lock:
+            self._cleanup_expired_locked(datetime.now(timezone.utc))
+            if len(self.pending) >= self.MAX_PENDING:
+                raise ValueError("too many pending OAuth authorizations; try again")
+            self.pending[requested_state] = (normalized, flow, datetime.now(timezone.utc))
         return authorization_url
 
     def complete(self, state: str, authorization_response: str) -> AuthStatus:
-        pending = self.pending.pop(state, None)
+        now = datetime.now(timezone.utc)
+        with self._pending_lock:
+            self._cleanup_expired_locked(now)
+            pending = self.pending.pop(state, None)
         if pending is None:
             raise ValueError("OAuth state is missing or expired")
 
         expected_email, flow, created_at = self._pending_values(pending)
-        if datetime.now(timezone.utc) - created_at > self.pending_ttl:
+        if now - created_at > self.pending_ttl:
             raise ValueError("OAuth state is missing or expired")
         returned_states = parse_qs(urlparse(authorization_response).query).get("state", [])
         if returned_states != [state]:
@@ -101,6 +122,30 @@ class OAuthCoordinator:
         expected_email, flow = pending[:2]
         created_at = pending[2] if len(pending) == 3 else datetime.now(timezone.utc)
         return str(expected_email), flow, created_at  # type: ignore[return-value]
+
+    def _cleanup_expired_locked(self, now: datetime) -> None:
+        expired_states = [
+            state
+            for state, pending in self.pending.items()
+            if now - self._pending_values(pending)[2] > self.pending_ttl
+        ]
+        for state in expired_states:
+            self.pending.pop(state, None)
+
+    @staticmethod
+    def _is_valid_email(email: str) -> bool:
+        if email.count("@") != 1 or len(email) > 254:
+            return False
+        local, domain = email.split("@")
+        if not local or local.startswith(".") or local.endswith(".") or ".." in local:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+", local):
+            return False
+        labels = domain.split(".")
+        return len(labels) >= 2 and all(
+            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+            for label in labels
+        )
 
     @staticmethod
     def _refresh_expiry(flow: Flow, now: datetime) -> tuple[datetime, bool]:
