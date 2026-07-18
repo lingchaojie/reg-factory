@@ -35,6 +35,7 @@ from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_async_process,
 )
+from config import _load_dotenv
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -250,6 +251,7 @@ def broker_release(broker_url, email):
 
 def child_env_for(args):
     """子进程环境：注入 MAILBOX_BROKER 让三脚本走共享取码（不再各自开 Outlook）。"""
+    _load_dotenv(os.path.join(ROOT, ".env"))
     env = dict(os.environ)
     if args.broker:
         env["MAILBOX_BROKER"] = args.broker

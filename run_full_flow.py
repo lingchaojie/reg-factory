@@ -143,6 +143,7 @@ def build_child_env(args):
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
     if args.proxy:
+        env["CLASH_PROXY"] = args.proxy
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = args.proxy
         env["http_proxy"] = env["https_proxy"] = args.proxy
         # 关键：localhost API(BitBrowser 54345 / Clash 控制器 9097) 必须直连，

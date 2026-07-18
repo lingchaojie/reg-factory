@@ -1,7 +1,7 @@
 import argparse
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import outlook_reg_loop
 import register
@@ -29,6 +29,44 @@ class NetworkRouteIntegrationTests(unittest.TestCase):
             env = run_full_flow.build_child_env(args)
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             self.assertNotIn(key, env)
+
+    def test_full_flow_explicit_proxy_overrides_clash_candidate(self):
+        args = argparse.Namespace(
+            proxy="http://explicit.example:8123",
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        base = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": "http://configured.example:7897",
+        }
+        connector = Mock(return_value=Mock())
+        with patch.object(run_full_flow.os, "environ", base), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            env = run_full_flow.build_child_env(args)
+        connector.assert_called_once_with(("explicit.example", 8123), 0.5)
+        self.assertEqual(env["CLASH_PROXY"], args.proxy)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertEqual(env[key], args.proxy)
+
+    def test_full_flow_explicit_proxy_is_candidate_without_clash_env(self):
+        args = argparse.Namespace(
+            proxy="http://explicit.example:8123",
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        base = {"IPMART_ENABLED": "0"}
+        connector = Mock(return_value=Mock())
+        with patch.object(run_full_flow.os, "environ", base), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            env = run_full_flow.build_child_env(args)
+        connector.assert_called_once_with(("explicit.example", 8123), 0.5)
+        self.assertEqual(env["CLASH_PROXY"], args.proxy)
+        self.assertEqual(env["HTTPS_PROXY"], args.proxy)
 
     def test_outlook_uses_direct_when_clash_is_unreachable(self):
         env = {

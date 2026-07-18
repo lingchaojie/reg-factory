@@ -45,6 +45,10 @@ from common.network_route import prepare_clash_or_direct  # noqa: E402
 
 
 def _ensure_proxy_env():
+    merged = _parse_env_file(ENV_PATH)
+    merged.update(BOOT_ENV)
+    merged.update(os.environ)
+    os.environ.update(merged)
     prepare_clash_or_direct(os.environ)
 
 

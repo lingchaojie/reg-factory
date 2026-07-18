@@ -1,4 +1,6 @@
 import argparse
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -106,6 +108,25 @@ class PlatformProxyEnvTests(unittest.TestCase):
                 )
             for key in HTTP_PROXY_KEYS:
                 self.assertNotIn(key, env)
+
+    def test_direct_entry_loads_dotenv_before_chatgpt_route(self):
+        args = argparse.Namespace(broker="", grok_timeout=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".env"), "w", encoding="utf-8") as f:
+                f.write("CLASH_PROXY=http://dotenv.example:7897\n")
+            with patch.object(
+                register_three_platforms, "ROOT", tmp
+            ), patch.dict(os.environ, {}, clear=True), patch(
+                "common.network_route.socket.create_connection",
+                return_value=Mock(),
+            ):
+                base_env = register_three_platforms.child_env_for(args)
+                child = register_three_platforms.platform_child_env(
+                    "chatgpt", base_env, ["chatgpt"]
+                )
+        self.assertEqual(
+            child["HTTPS_PROXY"], "http://dotenv.example:7897"
+        )
 
 
 class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):

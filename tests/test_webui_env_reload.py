@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from webui import server
 
@@ -29,6 +29,41 @@ class WebUIEnvReloadTests(unittest.TestCase):
                 with patch.dict(os.environ, {"DYNAMIC_TEST_KEY": "system-value"}):
                     child = server._child_env()
         self.assertEqual(child["DYNAMIC_TEST_KEY"], "system-value")
+
+    def test_startup_route_uses_dotenv_for_webui_process(self):
+        tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+        tmp.write("CLASH_PROXY=http://dotenv.example:7897\n")
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+
+        with patch.object(server, "ENV_PATH", tmp.name), patch.object(
+            server, "BOOT_ENV", {}
+        ), patch.dict(os.environ, {}, clear=True), patch(
+            "common.network_route.socket.create_connection",
+            return_value=Mock(),
+        ):
+            server._ensure_proxy_env()
+            self.assertEqual(
+                os.environ["HTTPS_PROXY"], "http://dotenv.example:7897"
+            )
+
+    def test_startup_route_keeps_process_proxy_over_dotenv(self):
+        tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+        tmp.write("CLASH_PROXY=http://dotenv.example:7897\n")
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+        process_proxy = "http://process.example:7898"
+
+        with patch.object(server, "ENV_PATH", tmp.name), patch.object(
+            server, "BOOT_ENV", {"CLASH_PROXY": process_proxy}
+        ), patch.dict(
+            os.environ, {"CLASH_PROXY": process_proxy}, clear=True
+        ), patch(
+            "common.network_route.socket.create_connection",
+            return_value=Mock(),
+        ):
+            server._ensure_proxy_env()
+            self.assertEqual(os.environ["HTTPS_PROXY"], process_proxy)
 
 
 if __name__ == "__main__":

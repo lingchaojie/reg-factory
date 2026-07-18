@@ -768,6 +768,8 @@ def main():
         lease=inherited_lease,
         ipmart_enabled=ipmart_settings.enabled,
     )
+    if not injected_proxy:
+        no_rotate = True
     if injected_proxy:
         log(f"proxy env ready: {injected_proxy}")
     proxy = clash_proxy_from_env()

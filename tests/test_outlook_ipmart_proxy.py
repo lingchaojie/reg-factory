@@ -101,6 +101,57 @@ class OutlookIPMartProxyTests(unittest.TestCase):
         self.assertEqual(env["CLASH_PROXY"], "http://127.0.0.1:7897")
         ensure.assert_not_called()
 
+    def test_direct_route_skips_reachable_controller_and_runs_attempt(self):
+        attempt = AsyncMock(return_value=(None, None, []))
+        controller = object()
+        env = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "CLASH_API": "http://127.0.0.1:9097",
+            "CLASH_GROUP": "GLOBAL",
+        }
+        with patch.object(
+            sys,
+            "argv",
+            ["outlook_reg_loop.py", "--count", "1", "--sleep", "0"],
+        ), patch.dict(
+            outlook_reg_loop.os.environ, env, clear=True
+        ), patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ), patch.object(
+            outlook_reg_loop, "lease_from_env", return_value=None
+        ), patch.object(
+            outlook_reg_loop,
+            "settings_from_env",
+            return_value=SimpleNamespace(enabled=False),
+        ), patch.object(
+            outlook_reg_loop, "load_standalone", return_value=object()
+        ), patch.object(
+            outlook_reg_loop,
+            "init_clash",
+            return_value=(controller, "GLOBAL"),
+        ) as init_clash, patch.object(
+            outlook_reg_loop,
+            "maybe_rotate_verified",
+            return_value={"ok": False},
+        ) as rotate, patch.object(
+            outlook_reg_loop, "count_pool", return_value=0
+        ), patch.object(
+            outlook_reg_loop, "one_attempt", attempt
+        ), patch.object(
+            outlook_reg_loop.os, "makedirs"
+        ), patch.object(
+            outlook_reg_loop.time, "sleep"
+        ), patch.object(
+            outlook_reg_loop, "log"
+        ):
+            outlook_reg_loop.main()
+
+        init_clash.assert_not_called()
+        rotate.assert_not_called()
+        attempt.assert_awaited_once()
+
     def test_graph_retry_does_not_rotate_clash_with_an_account_lease(self):
         responses = [None, {"refresh_token": "rt", "client_id": "cid"}]
         with patch(
