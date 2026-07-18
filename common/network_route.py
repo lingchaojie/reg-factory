@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 from common.account_proxy import strip_http_proxy_env
 
 
+RESOLVED_ROUTE_ENV_KEY = "NETWORK_ROUTE_MODE"
+
+
 @dataclass(frozen=True)
 class NetworkRoute:
     mode: Literal["clash", "direct"]
@@ -81,6 +84,19 @@ def prepare_clash_or_direct(
     timeout: float = 0.5,
 ) -> NetworkRoute:
     env = os.environ if env is None else env
-    route = resolve_clash_route(env, connector=connector, timeout=timeout)
+    inherited_mode = (env.get(RESOLVED_ROUTE_ENV_KEY) or "").strip().lower()
+    if inherited_mode == "direct":
+        route = NetworkRoute("direct", reason="inherited")
+    elif inherited_mode == "clash":
+        proxy_url = (env.get("CLASH_PROXY") or "").strip()
+        if _proxy_endpoint(proxy_url) is None:
+            route = NetworkRoute(
+                "direct", reason="invalid_inherited_clash"
+            )
+        else:
+            route = NetworkRoute("clash", proxy_url, "inherited")
+    else:
+        route = resolve_clash_route(env, connector=connector, timeout=timeout)
+        env[RESOLVED_ROUTE_ENV_KEY] = route.mode
     apply_clash_route(env, route)
     return route

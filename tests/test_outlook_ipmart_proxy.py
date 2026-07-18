@@ -59,7 +59,7 @@ class OutlookIPMartProxyTests(unittest.TestCase):
         env = {}
 
         self.assertEqual(outlook_reg_loop.ensure_clash_proxy_env(env), "")
-        self.assertEqual(env, {})
+        self.assertEqual(env, {"NETWORK_ROUTE_MODE": "direct"})
 
     def test_graph_extraction_forwards_the_lease_proxy(self):
         with patch(

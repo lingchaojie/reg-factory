@@ -10,6 +10,9 @@ import run_full_flow
 from common.network_route import NetworkRoute
 
 
+ROUTE_MODE_KEY = "NETWORK_ROUTE_MODE"
+
+
 class NetworkRouteIntegrationTests(unittest.TestCase):
     def test_full_flow_strips_dead_clash_when_ipmart_is_disabled(self):
         args = argparse.Namespace(
@@ -112,6 +115,80 @@ class NetworkRouteIntegrationTests(unittest.TestCase):
             env = run_full_flow.build_child_env(args)
         connector.assert_called_once_with(("default.example", 7897), 0.5)
         self.assertEqual(env["HTTPS_PROXY"], default_proxy)
+
+    def test_resolved_direct_stays_direct_when_listener_becomes_reachable(self):
+        proxy = "http://127.0.0.1:7897"
+        args = argparse.Namespace(
+            proxy=proxy,
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        with patch.object(
+            run_full_flow.os,
+            "environ",
+            {"IPMART_ENABLED": "0", "CLASH_PROXY": proxy},
+        ), patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            top_env = run_full_flow.build_child_env(args)
+
+        downstream_connector = Mock(return_value=Mock())
+        with patch(
+            "common.network_route.socket.create_connection",
+            downstream_connector,
+        ):
+            outlook_env = dict(top_env)
+            selected = outlook_reg_loop.prepare_outlook_network(outlook_env)
+            platform_env = register_three_platforms.platform_child_env(
+                "grok", top_env, ["grok"]
+            )
+
+        downstream_connector.assert_not_called()
+        self.assertEqual(top_env[ROUTE_MODE_KEY], "direct")
+        self.assertNotIn("://", top_env[ROUTE_MODE_KEY])
+        self.assertEqual(selected, "")
+        for env in (outlook_env, platform_env):
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                self.assertNotIn(key, env)
+
+    def test_resolved_clash_stays_clash_when_listener_becomes_unreachable(self):
+        proxy = "http://127.0.0.1:7897"
+        args = argparse.Namespace(
+            proxy=proxy,
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        with patch.object(
+            run_full_flow.os,
+            "environ",
+            {"IPMART_ENABLED": "0", "CLASH_PROXY": proxy},
+        ), patch(
+            "common.network_route.socket.create_connection",
+            return_value=Mock(),
+        ):
+            top_env = run_full_flow.build_child_env(args)
+
+        downstream_connector = Mock(side_effect=ConnectionRefusedError)
+        with patch(
+            "common.network_route.socket.create_connection",
+            downstream_connector,
+        ):
+            outlook_env = dict(top_env)
+            selected = outlook_reg_loop.prepare_outlook_network(outlook_env)
+            platform_env = register_three_platforms.platform_child_env(
+                "grok", top_env, ["grok"]
+            )
+
+        downstream_connector.assert_not_called()
+        self.assertEqual(top_env[ROUTE_MODE_KEY], "clash")
+        self.assertNotIn("://", top_env[ROUTE_MODE_KEY])
+        self.assertEqual(selected, proxy)
+        for env in (outlook_env, platform_env):
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                self.assertEqual(env[key], proxy)
 
     def test_outlook_uses_direct_when_clash_is_unreachable(self):
         env = {

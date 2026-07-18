@@ -257,6 +257,8 @@ def child_env_for(args):
         env["MAILBOX_BROKER"] = args.broker
         env["GROK_BROKER_TIMEOUT"] = str(args.grok_timeout)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if env.get("ACCOUNT_PROXY_SOURCE") != "ipmart":
+        prepare_clash_or_direct(env)
     return env
 
 

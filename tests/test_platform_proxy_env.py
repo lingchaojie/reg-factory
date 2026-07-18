@@ -111,6 +111,9 @@ class PlatformProxyEnvTests(unittest.TestCase):
 
     def test_direct_entry_loads_dotenv_before_chatgpt_route(self):
         args = argparse.Namespace(broker="", grok_timeout=40)
+        connector = Mock(
+            side_effect=[Mock(), ConnectionRefusedError("listener stopped")]
+        )
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, ".env"), "w", encoding="utf-8") as f:
                 f.write("CLASH_PROXY=http://dotenv.example:7897\n")
@@ -118,15 +121,20 @@ class PlatformProxyEnvTests(unittest.TestCase):
                 register_three_platforms, "ROOT", tmp
             ), patch.dict(os.environ, {}, clear=True), patch(
                 "common.network_route.socket.create_connection",
-                return_value=Mock(),
+                connector,
             ):
                 base_env = register_three_platforms.child_env_for(args)
-                child = register_three_platforms.platform_child_env(
+                chatgpt_env = register_three_platforms.platform_child_env(
                     "chatgpt", base_env, ["chatgpt"]
                 )
-        self.assertEqual(
-            child["HTTPS_PROXY"], "http://dotenv.example:7897"
-        )
+                grok_env = register_three_platforms.platform_child_env(
+                    "grok", base_env, ["grok"]
+                )
+        self.assertEqual(connector.call_count, 1)
+        for child in (chatgpt_env, grok_env):
+            self.assertEqual(
+                child["HTTPS_PROXY"], "http://dotenv.example:7897"
+            )
 
 
 class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
