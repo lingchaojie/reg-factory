@@ -1706,11 +1706,14 @@ async def navigate_to_claude_magic_link(page, magic_link, timeout):
     try:
         await page.goto(magic_link, timeout=timeout)
     except Exception:
-        await page.evaluate(
-            "(url) => { window.location.href = url; }",
-            magic_link,
-        )
-        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        try:
+            await page.evaluate(
+                "(url) => { window.location.href = url; }",
+                magic_link,
+            )
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        except Exception:
+            raise RuntimeError("magic_link_navigation_failed") from None
 
 
 def log_safe_page_origin(label, page_url):
@@ -2484,7 +2487,7 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
         # 检测是否被 logout（排除 returnTo=onboarding 的情况）
         current_url = page.url.lower()
         if '/logout' in current_url:
-            print(f"  [onboarding] detected logout: {page.url[:80]}")
+            log_safe_page_origin("  [onboarding] detected logout at origin: ", page.url)
             # 等一下看是否自动跳转回来
             await asyncio.sleep(5)
             if '/logout' in page.url.lower() or ('/login' in page.url.lower() and 'returnto' not in page.url.lower()):
@@ -2501,7 +2504,10 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                 body_text = ""
             body_lower = body_text.lower()
             if any(kw in body_lower for kw in ['contact sales', 'think fast', 'platform solutions', 'continue with']) or len(body_text.strip()) > 30:
-                print(f"  [onboarding] session lost — on login/marketing page: {page.url[:80]}")
+                log_safe_page_origin(
+                    "  [onboarding] session lost on login/marketing origin: ",
+                    page.url,
+                )
                 return "session_lost"
             # 空白页可能还在加载，继续等
             if len(body_text.strip()) < 30:
@@ -2551,10 +2557,14 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
             if any(k in url_path for k in ['/chat', '/new']):
                 print("  [onboarding] reached chat page during navigation!")
                 return True
-            print(f"  [onboarding] page navigating, URL: {page.url[:80]}")
+            log_safe_page_origin(
+                "  [onboarding] page navigating at origin: ", page.url
+            )
             continue
         page_lower = page_text.lower()
-        print(f"  [onboarding] round {round_i+1}, URL: {current_url}")
+        log_safe_page_origin(
+            f"  [onboarding] round {round_i+1}, origin: ", current_url
+        )
         print(f"  [onboarding] page text preview: {page_text[:150].replace(chr(10), ' ')}")
 
         clicked = False
@@ -2919,7 +2929,9 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     cookies = await context.cookies()
                     cookie_names = [c['name'] for c in cookies if 'claude' in c.get('domain', '')]
                     print(f"  [onboarding] pre-submit cookies: {cookie_names}")
-                    print(f"  [onboarding] pre-submit URL: {page.url}")
+                    log_safe_page_origin(
+                        "  [onboarding] pre-submit origin: ", page.url
+                    )
                 except Exception:
                     pass
                 # 用 Enter 提交
@@ -2928,7 +2940,9 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     print(f"  [onboarding] pressed Enter to submit name")
                     clicked = True
                     await asyncio.sleep(3)
-                    print(f"  [onboarding] post-submit URL: {page.url}")
+                    log_safe_page_origin(
+                        "  [onboarding] post-submit origin: ", page.url
+                    )
                 except Exception:
                     pass
 
@@ -3469,7 +3483,7 @@ async def register(
                 pass
             await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
             await asyncio.sleep(5)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
 
             # solve Cloudflare Turnstile
             await solve_turnstile(page, max_wait=60)
@@ -3579,7 +3593,7 @@ async def register(
                 except Exception:
                     print("  birthday submit button not clickable, skip")
                 await asyncio.sleep(3)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
             check_timeout()
 
             # detect and fill form fields
@@ -3674,9 +3688,9 @@ async def register(
                 await submit_btn.click(timeout=8000)
                 print("  submitted")
             except Exception:
-                print(f"  no submit button (likely already logged in at {page.url}), skip form submit")
+                print("  no submit button (likely already logged in), skip form submit")
             await asyncio.sleep(3)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
             check_timeout()
 
             # check for birthday page after submit
@@ -3692,7 +3706,7 @@ async def register(
                 except Exception:
                     print("  birthday(after) submit button not clickable, skip")
                 await asyncio.sleep(3)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
 
             # detect if phone verification needed
             await asyncio.sleep(2)
@@ -3848,7 +3862,7 @@ async def register(
 
                 # 等待进入聊天页面
                 await asyncio.sleep(5)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
 
                 from urllib.parse import urlparse as _urlparse
                 url_path = _urlparse(page.url).path
@@ -3889,7 +3903,9 @@ async def register(
                             print("  re-login: magic link not received")
                             break
                         print("  re-login magic link found")
-                        await page.goto(re_magic, timeout=30000)
+                        await navigate_to_claude_magic_link(
+                            page, re_magic, timeout=30000
+                        )
                         await asyncio.sleep(5)
                         log_safe_page_origin("  re-login URL origin: ", page.url)
 
@@ -3907,8 +3923,8 @@ async def register(
                         except Exception:
                             pass
                         continue  # 重试 onboarding
-                    except Exception as e:
-                        print(f"  re-login error: {e}")
+                    except Exception:
+                        print("  re-login error: registration_recovery_failed")
                         break
                 else:
                     break  # 其他失败，不重试

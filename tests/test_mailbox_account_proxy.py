@@ -151,17 +151,18 @@ class MailboxAccountProxyTests(unittest.TestCase):
 
     def test_link_polling_propagates_explicit_lease_to_refresh_and_reads(self):
         lease = make_lease()
+        magic_token = "SyntheticMagicSecret"
         message = {
             "subject": "Sign in",
             "from": "hello@anthropic.com",
-            "body": "https://claude.ai/magic-link#abc",
+            "body": f"https://claude.ai/magic-link#{magic_token}",
             "received": "",
         }
         with patch.object(
             mailbox, "_get_access_token", return_value="access-token"
         ) as get_token, patch.object(
             mailbox, "fetch_messages", return_value=[message]
-        ) as fetch:
+        ) as fetch, patch("builtins.print") as output:
             result = mailbox.get_link_by_token(
                 "a@outlook.com",
                 "refresh-token",
@@ -170,7 +171,10 @@ class MailboxAccountProxyTests(unittest.TestCase):
                 account_lease=lease,
             )
 
-        self.assertEqual(result, "https://claude.ai/magic-link#abc")
+        self.assertEqual(result, f"https://claude.ai/magic-link#{magic_token}")
+        printed = " ".join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertNotIn(magic_token, printed)
+        self.assertNotIn("magic-link", printed)
         get_token.assert_called_once_with(
             "refresh-token", mailbox.DEFAULT_CLIENT_ID, account_lease=lease
         )

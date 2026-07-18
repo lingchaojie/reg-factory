@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -16,6 +17,39 @@ def mailbox_account(provider):
 
 
 class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_magic_link_flow_never_interpolates_raw_page_urls(self):
+        source = "\n".join(
+            (
+                inspect.getsource(register.register),
+                inspect.getsource(register.handle_onboarding),
+            )
+        )
+        self.assertNotRegex(
+            source,
+            r"print\(f[^\n]*\{(?:page\.url|current_url)",
+        )
+
+    async def test_navigation_failure_exposes_only_stable_error_code(self):
+        token = "synthetic-magic-secret"
+        magic_link = f"https://claude.ai/magic-link#{token}"
+        page = Mock()
+        page.goto = AsyncMock(side_effect=RuntimeError(f"goto failed: {magic_link}"))
+        page.evaluate = AsyncMock(
+            side_effect=RuntimeError(f"evaluate failed: {magic_link}")
+        )
+        page.wait_for_load_state = AsyncMock()
+
+        with patch("builtins.print") as output, self.assertRaisesRegex(
+            RuntimeError, r"^magic_link_navigation_failed$"
+        ) as raised:
+            await register.navigate_to_claude_magic_link(
+                page, magic_link, timeout=30_000
+            )
+
+        printed = " ".join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertNotIn(token, printed)
+        self.assertNotIn(token, str(raised.exception))
+
     async def test_navigation_fallback_passes_magic_link_as_data(self):
         magic_link = (
             "https://claude.ai/magic-link#token`"
@@ -39,7 +73,10 @@ class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_safe_page_origin_log_omits_magic_link_and_fragment(self):
         token = "secret-token"
-        page_url = f"https://claude.ai/magic-link#token`$\u007b{token}\u007d`"
+        page_url = (
+            "https://url-user:url-pass@claude.ai:8443/magic-link"
+            f"?query-secret=yes#token`$\u007b{token}\u007d`"
+        )
 
         with patch("builtins.print") as output:
             register.log_safe_page_origin("  URL origin: ", page_url)
@@ -48,6 +85,10 @@ class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(printed, "  URL origin: https://claude.ai")
         self.assertNotIn(token, printed)
         self.assertNotIn("magic-link", printed)
+        self.assertNotIn("query-secret", printed)
+        self.assertNotIn("url-user", printed)
+        self.assertNotIn("url-pass", printed)
+        self.assertNotIn("8443", printed)
 
     async def test_ninemail_uses_only_hosted_client(self):
         context = Mock()
