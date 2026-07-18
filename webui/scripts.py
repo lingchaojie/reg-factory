@@ -34,6 +34,8 @@ SCRIPTS = [
             {"flag": "--skip-email", "type": "bool", "default": False, "help": "跳过邮箱注册，直接用下面指定的邮箱"},
             {"flag": "--email", "type": "str", "default": "", "help": "配合 --skip-email：现成邮箱"},
             {"flag": "--password", "type": "str", "default": "", "help": "配合 --email 的密码"},
+            {"flag": "--token", "type": "str", "default": "", "help": "配合 --skip-email：refresh token"},
+            {"flag": "--client-id", "type": "str", "default": "", "help": "配合 --skip-email：OAuth client_id"},
             {"flag": "--node", "type": "str", "default": "auto", "help": "claude/grok 走的 Clash 节点"},
             {"flag": "--email-attempts", "type": "int", "default": 30, "help": "邮箱注册最多尝试次数"},
             {"flag": "--platform-timeout", "type": "int", "default": 600, "help": "平台注册单号超时(秒)"},
@@ -140,6 +142,7 @@ SCRIPTS = [
             {"flag": "--email", "type": "str", "default": "", "help": "指定邮箱(调试)"},
             {"flag": "--password", "type": "str", "default": "", "help": "邮箱密码"},
             {"flag": "--token", "type": "str", "default": "", "help": "refresh token"},
+            {"flag": "--client-id", "type": "str", "default": "", "help": "OAuth client_id"},
             {"flag": "--node", "type": "str", "default": "none", "help": "Clash 节点(none=不切)"},
         ],
     },
@@ -277,6 +280,15 @@ EMBED_PAGES = []
 # group: 分组标题；key: 变量名；required: 是否必填(运行对应功能时)；help: 说明；
 # secret: True 时前端用密码框；default: 模板默认值(仅展示)。
 ENV_SCHEMA = [
+    {"group": "Claude 邮箱渠道", "items": [
+        {"key": "EMAIL_PROVIDER", "type": "choice", "choices": ["NINEMALL", "OUTLOOK"],
+         "default": "NINEMALL", "help": "Claude 邮箱渠道；默认 NINEMALL API 取信"},
+        {"key": "NINEMALL_EMAIL_FILE", "default": "mail.txt", "help": "NINEMALL 四列账号文件"},
+        {"key": "NINEMALL_API_BASE", "default": "https://www.appleemail.top", "help": "NINEMALL 取信 API 根地址"},
+        {"key": "NINEMALL_API_PASSWORD", "secret": True, "help": "小苹果服务访问密码；未启用时留空"},
+        {"key": "NINEMALL_HTTP_TIMEOUT", "type": "int", "default": 30, "help": "单次取信请求超时秒数"},
+        {"key": "NINEMALL_POLL_INTERVAL", "type": "int", "default": 5, "help": "Claude 邮件轮询间隔秒数"},
+    ]},
     {"group": "Codex K12 控制台", "tests": [{"target": "k12", "label": "测试 K12 控制台"}], "items": [
         {"key": "K12_CONSOLE_URL", "default": "http://127.0.0.1:8806",
          "help": "主 WebUI 内嵌的 Codex K12 地址。本地地址会由主 WebUI 自动管理进程。"},

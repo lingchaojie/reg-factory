@@ -51,6 +51,10 @@ from common.account_proxy import (
     lease_to_env,
     strip_http_proxy_env,
 )
+from common.claude_email_accounts import (
+    ClaudeEmailAccountStore,
+    normalize_email_provider,
+)
 from common.ipmart_proxy import (
     IPMartProxyError,
     acquire_proxy,
@@ -62,6 +66,35 @@ from common.ipmart_proxy import (
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
 PROXY_DEFAULT = os.environ.get("CLASH_PROXY", "http://127.0.0.1:7897")
+
+
+class PlatformLaunchError(RuntimeError):
+    pass
+
+
+class _ReservedStageAccount(tuple):
+    def __new__(cls, account, store):
+        values = (
+            account.email,
+            account.password,
+            account.refresh_token,
+            account.client_id,
+        )
+        instance = super().__new__(cls, values)
+        instance.account = account
+        instance.store = store
+        instance.active = True
+        return instance
+
+    def release(self):
+        if self.active:
+            self.store.release(self.account)
+            self.active = False
+
+
+def _release_stage_account(account):
+    if isinstance(account, _ReservedStageAccount):
+        account.release()
 
 
 def log(msg, level="INFO"):
@@ -168,6 +201,29 @@ def stage_email(args, env):
     return new_email
 
 
+def is_ninemail_claude_only(args, env=None):
+    env = os.environ if env is None else env
+    return (
+        normalize_email_provider(env.get("EMAIL_PROVIDER")) == "NINEMALL"
+        and set(args.platforms) == {"claude"}
+    )
+
+
+def acquire_stage_account(
+    args,
+    env,
+    stage_email_fn=stage_email,
+    store_factory=ClaudeEmailAccountStore,
+):
+    if is_ninemail_claude_only(args, env):
+        store = store_factory(provider="NINEMALL")
+        account = store.reserve_one()
+        if account is None:
+            return None
+        return _ReservedStageAccount(account, store)
+    return stage_email_fn(args, env)
+
+
 # ---------------------------------------------------------------- Stage B
 def stage_platforms(args, env, email, password, token="", client_id=""):
     log(f"Stage B 平台注册：{email}  platforms={','.join(args.platforms)}", "B")
@@ -199,10 +255,22 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
         cmd.append("--grok-sub2api")
         if args.grok_sub2api_group:
             cmd += ["--grok-sub2api-group", args.grok_sub2api_group]
-    log(f"Stage B cmd: {' '.join(cmd)}", "B")
+    if is_ninemail_claude_only(args, env):
+        log(
+            "Stage B cmd: register_three_platforms.py "
+            "[mailbox credentials redacted]",
+            "B",
+        )
+    else:
+        log(f"Stage B cmd: {' '.join(cmd)}", "B")
     if args.dry_run:
         return 0
-    proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+    try:
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+    except Exception as exc:
+        raise PlatformLaunchError(
+            "failed to launch platform orchestrator"
+        ) from exc
     return proc.wait()
 
 
@@ -233,16 +301,25 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
 
     # Stage A
     token = client_id = ""
+    reserved_account = None
     if args.skip_email:
         if not args.email:
             raise SystemExit("--skip-email 需要同时给 --email")
         email, password = args.email.strip(), args.password.strip()
+        token = (getattr(args, "token", "") or "").strip()
+        client_id = (getattr(args, "client_id", "") or "").strip()
         log(f"跳过邮箱注册，直接用 {email}", "A")
     else:
-        got = stage_email(args, round_env)
+        got = acquire_stage_account(
+            args,
+            round_env,
+            stage_email_fn=stage_email,
+            store_factory=ClaudeEmailAccountStore,
+        )
         if not got:
             log("Stage A 没拿到可用邮箱，本轮终止", "ERR")
             return 1, ""
+        reserved_account = got
         email, password, token, client_id = got
         # emails.txt 里可能没记密码，用快照里的
         password = password or args.password
@@ -256,6 +333,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             )
         except IPMartProxyError as exc:
             log(f"IPMart proxy changed before Claude: {exc}", "ERR")
+            _release_stage_account(reserved_account)
             return 1, email
 
     # Stage B
@@ -266,9 +344,15 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         platform_env = dict(round_env)
         platform_env.update(original_http_proxy_env)
     print("=" * 64)
-    rc = stage_platforms(
-        args, platform_env, email, password, token, client_id
-    )
+    try:
+        rc = stage_platforms(
+            args, platform_env, email, password, token, client_id
+        )
+    except PlatformLaunchError:
+        _release_stage_account(reserved_account)
+        raise
+    if args.dry_run or rc != 0:
+        _release_stage_account(reserved_account)
     print("=" * 64)
     dt = time.time() - t0
     log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
@@ -283,6 +367,8 @@ def main():
     ap.add_argument("--skip-email", action="store_true", help="跳过邮箱注册，直接用 --email")
     ap.add_argument("--email", default="", help="跳过邮箱注册时指定现成邮箱")
     ap.add_argument("--password", default="", help="配合 --email")
+    ap.add_argument("--token", default="", help="配合 --skip-email 的 refresh token")
+    ap.add_argument("--client-id", default="", help="配合 --skip-email 的 OAuth client_id")
     ap.add_argument("--email-attempts", type=int, default=30, help="邮箱注册最多尝试次数")
     ap.add_argument("--email-timeout", type=int, default=180, help="单次邮箱注册硬超时(s)")
     ap.add_argument("--email-total-timeout", type=int, default=1800, help="Stage A 总超时(s)")
