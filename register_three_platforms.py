@@ -71,18 +71,45 @@ class _ReservedPoolAccount(tuple):
     def release(self):
         if not self.active:
             return False
-        self.active = False
         if self.owned_processes:
             return False
         released = False
         for store in self.stores.values():
             released = store.release(self.account) or released
+        self.active = False
         return released
 
 
 def _release_pool_account(account):
     if isinstance(account, _ReservedPoolAccount):
         account.release()
+
+
+async def _cancel_and_wait_parallel_tasks(tasks, waiter=None):
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if waiter is not None:
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+async def _shield_parallel_cleanup(tasks, waiter=None):
+    cleanup = asyncio.create_task(
+        _cancel_and_wait_parallel_tasks(tasks, waiter)
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    if cleanup.done():
+        try:
+            cleanup.result()
+        except BaseException:
+            pass
 
 
 def is_claude_family_only(platforms):
@@ -349,18 +376,24 @@ async def process_account(account, args, child_env):
             **kwargs,
         )
 
+    parallel_tasks = []
+    parallel_waiter = None
     try:
         jobs = [(p, build_command(p, args, account)) for p in platforms]
         if args.parallel:
-            results = await asyncio.gather(*(
-                launch(p, cmd)
+            parallel_tasks = [
+                asyncio.create_task(launch(p, cmd))
                 for p, cmd in jobs
-            ))
+            ]
+            parallel_waiter = asyncio.gather(*parallel_tasks)
+            results = await asyncio.shield(parallel_waiter)
         else:
             results = []
             for platform, cmd in jobs:
                 results.append(await launch(platform, cmd))
     except BaseException:
+        if parallel_tasks:
+            await _shield_parallel_cleanup(parallel_tasks, parallel_waiter)
         _release_pool_account(account)
         raise
 

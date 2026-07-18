@@ -42,6 +42,23 @@ def account_tuple(account):
     )
 
 
+class RecordingStore:
+    def __init__(self, purpose, delegate, events):
+        self.purpose = purpose
+        self.delegate = delegate
+        self.events = events
+        self.calls = 0
+
+    def release(self, account):
+        self.calls += 1
+        self.events.append(f"release:{self.purpose}")
+        return self.delegate.release(account)
+
+
+class ParallelAbort(BaseException):
+    pass
+
+
 class _Response:
     def __init__(self, payload, status=200):
         self.payload = payload
@@ -474,6 +491,469 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
             purpose=purpose,
             source_file=self.source,
             root_dir=self.root,
+        )
+
+    def recorded_reserved(self, events):
+        account, stores = self.reserve()
+        recorded = {
+            purpose: RecordingStore(purpose, store, events)
+            for purpose, store in stores.items()
+        }
+        reserved = register_three_platforms._ReservedPoolAccount(
+            account, recorded
+        )
+        return account, recorded, reserved
+
+    def parallel_args(self):
+        args = self.args()
+        args.parallel = True
+        return args
+
+    async def drain_tasks(self, tasks):
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_release_stays_retryable_until_every_process_is_confirmed(self):
+        events = []
+        account, stores, reserved = self.recorded_reserved(events)
+        claude_process = object()
+        api_process = object()
+        reserved.track_process(claude_process)
+        reserved.track_process(api_process)
+
+        self.assertFalse(reserved.release())
+        self.assertTrue(reserved.active)
+        self.assertEqual(events, [])
+
+        reserved.confirm_process_stopped(claude_process, True)
+        reserved.confirm_process_stopped(api_process, False)
+        self.assertFalse(reserved.release())
+        self.assertTrue(reserved.active)
+        self.assertEqual(events, [])
+
+        reserved.confirm_process_stopped(api_process, True)
+        self.assertTrue(reserved.release())
+        self.assertFalse(reserved.active)
+        self.assertFalse(reserved.release())
+        self.assertEqual(
+            events, ["release:claude", "release:claude_api"]
+        )
+        self.assertEqual(
+            {purpose: store.calls for purpose, store in stores.items()},
+            {"claude": 1, "claude_api": 1},
+        )
+        for purpose in ("claude", "claude_api"):
+            self.assertEqual(
+                self.ledger(purpose),
+                [
+                    "person@example.com----reserved",
+                    "person@example.com----released",
+                ],
+            )
+
+    async def test_parallel_launch_failure_cleans_running_sibling_before_release(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        sibling_started = asyncio.Event()
+        sibling_finished = asyncio.Event()
+        child_tasks = []
+        running = set()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            task = asyncio.current_task()
+            child_tasks.append(task)
+            if platform == "claude_api":
+                await sibling_started.wait()
+                events.append("api:launch_failed")
+                raise register_three_platforms.PlatformLaunchError(
+                    "api launch failed"
+                )
+            process = object()
+            process_owner.track_process(process)
+            running.add(platform)
+            events.append("claude:tracked")
+            sibling_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("claude:cancelled")
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                sibling_finished.set()
+                events.append("claude:confirmed")
+                raise
+
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ), self.assertRaisesRegex(
+                register_three_platforms.PlatformLaunchError,
+                "api launch failed",
+            ):
+                await register_three_platforms.process_account(
+                    reserved, self.parallel_args(), {"EMAIL_PROVIDER": "NINEMALL"}
+                )
+
+            self.assertTrue(sibling_finished.is_set())
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, set())
+            self.assertFalse(reserved.active)
+            self.assertLess(
+                events.index("claude:confirmed"),
+                events.index("release:claude"),
+            )
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_runtime_error_preserves_primary_after_sibling_cleanup_error(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        both_started = asyncio.Event()
+        started = set()
+        child_tasks = []
+        running = set()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            child_tasks.append(asyncio.current_task())
+            process = object()
+            process_owner.track_process(process)
+            started.add(platform)
+            running.add(platform)
+            events.append(f"{platform}:tracked")
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+            if platform == "claude_api":
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                events.append("claude_api:confirmed")
+                raise RuntimeError("primary-runtime")
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                events.append("claude:confirmed")
+                raise ValueError("sibling-cleanup-error")
+
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ), self.assertRaisesRegex(RuntimeError, "primary-runtime"):
+                await register_three_platforms.process_account(
+                    reserved, self.parallel_args(), {"EMAIL_PROVIDER": "NINEMALL"}
+                )
+
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, set())
+            self.assertFalse(reserved.active)
+            self.assertLess(
+                events.index("claude:confirmed"),
+                events.index("release:claude"),
+            )
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_caller_cancellation_waits_for_both_children(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        both_started = asyncio.Event()
+        started = set()
+        child_tasks = []
+        running = set()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            child_tasks.append(asyncio.current_task())
+            process = object()
+            process_owner.track_process(process)
+            started.add(platform)
+            running.add(platform)
+            events.append(f"{platform}:tracked")
+            if len(started) == 2:
+                both_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                events.append(f"{platform}:confirmed")
+                raise
+
+        parent = None
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ):
+                parent = asyncio.create_task(
+                    register_three_platforms.process_account(
+                        reserved,
+                        self.parallel_args(),
+                        {"EMAIL_PROVIDER": "NINEMALL"},
+                    )
+                )
+                await both_started.wait()
+                parent.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await parent
+
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, set())
+            self.assertFalse(reserved.active)
+            release_index = events.index("release:claude")
+            self.assertTrue(all(
+                events.index(f"{platform}:confirmed") < release_index
+                for platform in ("claude", "claude_api")
+            ))
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            if parent is not None and not parent.done():
+                parent.cancel()
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_second_cancellation_cannot_skip_sibling_cleanup(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        both_started = asyncio.Event()
+        both_cleaning = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        started = set()
+        cleaning = set()
+        child_tasks = []
+        running = set()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            child_tasks.append(asyncio.current_task())
+            process = object()
+            process_owner.track_process(process)
+            started.add(platform)
+            running.add(platform)
+            if len(started) == 2:
+                both_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleaning.add(platform)
+                if len(cleaning) == 2:
+                    both_cleaning.set()
+                await allow_cleanup.wait()
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                events.append(f"{platform}:confirmed")
+                raise
+
+        parent = None
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ):
+                parent = asyncio.create_task(
+                    register_three_platforms.process_account(
+                        reserved,
+                        self.parallel_args(),
+                        {"EMAIL_PROVIDER": "NINEMALL"},
+                    )
+                )
+                await both_started.wait()
+                parent.cancel()
+                await both_cleaning.wait()
+                parent.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(parent.done())
+                allow_cleanup.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await parent
+
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, set())
+            self.assertFalse(reserved.active)
+            release_index = events.index("release:claude")
+            self.assertTrue(all(
+                events.index(f"{platform}:confirmed") < release_index
+                for platform in ("claude", "claude_api")
+            ))
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            allow_cleanup.set()
+            if parent is not None and not parent.done():
+                parent.cancel()
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_base_exception_cleans_sibling_then_reraises_original(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        sibling_started = asyncio.Event()
+        child_tasks = []
+        running = set()
+        original = ParallelAbort("keyboard-interrupt-like")
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            child_tasks.append(asyncio.current_task())
+            if platform == "claude_api":
+                await sibling_started.wait()
+                raise original
+            process = object()
+            process_owner.track_process(process)
+            running.add(platform)
+            sibling_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                process_owner.confirm_process_stopped(process, True)
+                running.discard(platform)
+                events.append("claude:confirmed")
+                raise
+
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ):
+                with self.assertRaises(ParallelAbort) as caught:
+                    await register_three_platforms.process_account(
+                        reserved,
+                        self.parallel_args(),
+                        {"EMAIL_PROVIDER": "NINEMALL"},
+                    )
+
+            self.assertIs(caught.exception, original)
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, set())
+            self.assertFalse(reserved.active)
+            self.assertLess(
+                events.index("claude:confirmed"),
+                events.index("release:claude"),
+            )
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_unconfirmed_shutdown_keeps_owner_active_for_retry(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        sibling_started = asyncio.Event()
+        child_tasks = []
+        running = set()
+        sibling_process = object()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            child_tasks.append(asyncio.current_task())
+            if platform == "claude_api":
+                await sibling_started.wait()
+                raise RuntimeError("primary-runtime")
+            process_owner.track_process(sibling_process)
+            running.add(platform)
+            sibling_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                process_owner.confirm_process_stopped(
+                    sibling_process, False
+                )
+                running.discard(platform)
+                events.append("claude:unconfirmed")
+                raise
+
+        try:
+            with patch.object(
+                register_three_platforms, "run_platform", side_effect=fake_run
+            ), self.assertRaisesRegex(RuntimeError, "primary-runtime"):
+                await register_three_platforms.process_account(
+                    reserved,
+                    self.parallel_args(),
+                    {"EMAIL_PROVIDER": "NINEMALL"},
+                )
+
+            self.assertEqual(running, set())
+            self.assertEqual(reserved.owned_processes, {id(sibling_process)})
+            self.assertTrue(reserved.active)
+            self.assertEqual(events, ["claude:unconfirmed"])
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 0, "claude_api": 0},
+            )
+
+            reserved.confirm_process_stopped(sibling_process, True)
+            self.assertTrue(reserved.release())
+            self.assertFalse(reserved.active)
+            self.assertFalse(reserved.release())
+            self.assertEqual(
+                events,
+                [
+                    "claude:unconfirmed",
+                    "release:claude",
+                    "release:claude_api",
+                ],
+            )
+            self.assertEqual(
+                {purpose: store.calls for purpose, store in stores.items()},
+                {"claude": 1, "claude_api": 1},
+            )
+        finally:
+            await self.drain_tasks(child_tasks)
+
+    async def test_parallel_success_results_stay_ordered_without_parent_release(self):
+        events = []
+        _account, stores, reserved = self.recorded_reserved(events)
+        allow_claude = asyncio.Event()
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            if platform == "claude":
+                await allow_claude.wait()
+            else:
+                allow_claude.set()
+            return platform, True, 0, f"{platform}.log"
+
+        with patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ):
+            results = await register_three_platforms.process_account(
+                reserved,
+                self.parallel_args(),
+                {"EMAIL_PROVIDER": "NINEMALL"},
+            )
+
+        self.assertEqual(
+            [result[0] for result in results], ["claude", "claude_api"]
+        )
+        self.assertTrue(reserved.active)
+        self.assertEqual(events, [])
+        self.assertEqual(
+            {purpose: store.calls for purpose, store in stores.items()},
+            {"claude": 0, "claude_api": 0},
         )
 
     async def test_from_pool_dual_family_uses_atomic_reservation(self):
