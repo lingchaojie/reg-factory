@@ -42,7 +42,7 @@
 
 ---
 
-**reg-factory** 是一套全自动注册流水线：先自注册 **Outlook** 邮箱，再用同一邮箱在
+**reg-factory** 是一套按邮箱渠道编排的全自动注册流水线：默认 NINEMALL 的 Claude 家族流程直接消费 AppleEmail 账号；显式 `EMAIL_PROVIDER=OUTLOOK` 或选择 ChatGPT/Grok 的混合流程才先注册 **Outlook** 邮箱，再在
 **ChatGPT / Grok / Claude** 上批量注册账号，并导出可直登的 cookie。底层用
 **比特浏览器(BitBrowser) / AdsPower** 做指纹隔离、**Clash Verge** 做节点切换绕区域封锁与 Cloudflare 风控、
 接码/打码平台过手机号与验证码。
@@ -75,7 +75,7 @@
   - 记下混合代理端口（mixed-port，默认 `7897`）。
 - 把 secret 填进 `.env` 的 `CLASH_SECRET`（见下）。
 
-> 只跑启用 IPMart 的默认 Outlook → Claude 流程时不需要 Clash；ChatGPT、Grok 和未启用 IPMart 的流程仍按各自原有代理规则运行。
+> 只跑启用 IPMart 且显式设置 `EMAIL_PROVIDER=OUTLOOK` 的 Outlook → Claude 流程时不需要 Clash；ChatGPT、Grok 和未启用 IPMart 的流程仍按各自原有代理规则运行。
 
 ### ③ Python
 - Python 3.10+。
@@ -313,8 +313,15 @@ python register_three_platforms.py --from-pool --platforms claude claude_api
 
 ### 端到端（注册邮箱 → 四平台任选）
 ```bash
-python run_full_flow.py                       # 注册 1 个 outlook 号后在 claude 上注册
+# 默认 EMAIL_PROVIDER=NINEMALL：纯 Claude，跳过 Outlook Stage A，严格使用 AppleEmail
+python run_full_flow.py
+
+# 含 ChatGPT/Grok：启动前选择 OUTLOOK，先执行 Outlook Stage A
 python run_full_flow.py --platforms claude chatgpt grok
+
+# .env 显式设置 EMAIL_PROVIDER=OUTLOOK 后：Outlook → Claude
+python run_full_flow.py --platforms claude --rounds 1
+
 python run_full_flow.py --platforms grok --grok-sub2api  # Grok 注册后直接导入 SUB2API Grok 渠道
 python run_full_flow.py --platforms chatgpt --import-c2a   # chatgpt 注册成功后即时导入 chatgpt2api
 python run_full_flow.py --platforms chatgpt --email-confirm-before-register  # Outlook 注册页自动点确认后再填写
@@ -323,7 +330,7 @@ python run_full_flow.py --dry-run             # 只打印将执行的命令
 ```
 > 自动注入 `HTTP(S)_PROXY` 与 `CLASH_API/SECRET/GROUP` 给子进程。
 > `--import-c2a` 逐层透传到 `register_chatgpt.py`，只对 chatgpt 平台生效，需先配 `CHATGPT2API_URL/KEY`。
-> `--email-confirm-before-register` 会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
+> `--email-confirm-before-register` 只在启动前选择 OUTLOOK 的流程中生效，会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
 
 #### 每个账号使用一个 IPMart 固定网关 SID 租约
 
@@ -347,15 +354,18 @@ IPMART_IP_CHECK_URL=https://api.ipify.org?format=json
 # Dry-run：不生成 SID、不执行 IP 校验、不创建浏览器 profile 或外部账号
 python run_full_flow.py --platforms claude --dry-run
 
-# 真实单账号：消耗 IPMart 代理流量，并创建外部 Outlook 和 Claude 账号
+# 默认 NINEMALL：消耗 IPMart 代理流量，跳过 Outlook Stage A，仅创建 Claude 账号
+python run_full_flow.py --platforms claude --rounds 1
+
+# .env 显式设置 EMAIL_PROVIDER=OUTLOOK 后：创建 Outlook 和 Claude 账号
 python run_full_flow.py --platforms claude --rounds 1
 ```
 
-启用后，每个候选 SID 都在本地生成并渲染进控制台用户名模板。同一个已验证的 SID 租约贯穿本轮 **Outlook BitBrowser、OAuth token 提取、Microsoft Graph 邮箱读取和 Claude BitBrowser**。正常首候选成功时恰好发起两次专用 IP 校验请求：获取租约时一次，进入 Claude 前再一次；失败或出口重复才会按 `IPMART_MAX_ATTEMPTS` 更换 SID 重试。出口变化会终止本轮。
+启用后，每个候选 SID 都在本地生成并渲染进控制台用户名模板。显式设置 `EMAIL_PROVIDER=OUTLOOK` 时，同一个已验证的 SID 租约贯穿本轮 **Outlook BitBrowser、OAuth token 提取、Microsoft Graph 邮箱读取和 Claude BitBrowser**；默认 NINEMALL 流程不会创建 Outlook 或调用 Microsoft Graph。正常首候选成功时恰好发起两次专用 IP 校验请求：获取租约时一次，进入 Claude 前再一次；失败或出口重复才会按 `IPMART_MAX_ATTEMPTS` 更换 SID 重试。出口变化会终止本轮。
 
-IPMart 的粘性时长由控制台/套餐决定，常见范围为 5-30 分钟；一轮 Outlook → Claude 必须在同一 SID 的有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。
+IPMart 的粘性时长由控制台/套餐决定，常见范围为 5-30 分钟；`EMAIL_PROVIDER=OUTLOOK` 的 Outlook → Claude 轮次必须在同一 SID 的有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。
 
-这项迁移只覆盖默认 Outlook → Claude 边界：启用 IPMart 后该链路不需要 Clash，也不会使用继承的 HTTP 代理。ChatGPT 和 Grok 不在这次迁移内，继续保持原有代理行为。
+这项迁移的 Outlook/Graph 部分只覆盖显式 `EMAIL_PROVIDER=OUTLOOK` 的 Outlook → Claude 边界：启用 IPMart 后该链路不需要 Clash，也不会使用继承的 HTTP 代理。默认 NINEMALL 的 Claude 家族流程跳过 Outlook Stage A 并严格使用 AppleEmail；ChatGPT 和 Grok 继续保持原有代理行为。
 
 ### 平台注册（已有邮箱或所选邮箱渠道的账号池）
 ```bash
@@ -739,7 +749,7 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 | `cookies/` | 注册成功导出的 cookie（`full_*.json` / `sk_*.txt`） |
 | `cookies/claude_api/` | Claude Platform 个人账户会话与脱敏索引 |
 | `_outlook_pool/` | outlook_reg_loop 产出的待用号（JSON 内含 `refresh_token` / `client_id`） |
-| `tri_register_logs/` | 三平台注册日志 |
+| `tri_register_logs/` | 多平台注册日志（四种选择） |
 | `screenshots*/` | 调试截图 |
 
 以上运行期数据均被 `.gitignore` 忽略，发布包内为空。

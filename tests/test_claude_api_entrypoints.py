@@ -473,6 +473,28 @@ class ClaudeAPIEntrypointTests(unittest.TestCase):
             self.assertIn("不会先尝试 NINEMALL", document)
             self.assertIn("不是 NINEMALL 失败后的回退", document)
 
+    def test_readme_default_run_and_outlook_examples_are_provider_accurate(self):
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("默认 `EMAIL_PROVIDER=NINEMALL`", readme)
+        self.assertIn("跳过 Outlook Stage A", readme)
+        self.assertIn("严格使用 AppleEmail", readme)
+        self.assertIn("显式设置 `EMAIL_PROVIDER=OUTLOOK`", readme)
+        self.assertNotIn(
+            "python run_full_flow.py                       # 注册 1 个 outlook 号后在 claude 上注册",
+            readme,
+        )
+        self.assertNotIn("这项迁移只覆盖默认 Outlook → Claude 边界", readme)
+
+    def test_readme_describes_tri_register_logs_as_multiplatform(self):
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "| `tri_register_logs/` | 多平台注册日志（四种选择） |",
+            readme,
+        )
+        self.assertNotIn("| `tri_register_logs/` | 三平台注册日志 |", readme)
+
     def test_claude_api_command_forwards_mailbox_credentials(self):
         command = register_three_platforms.build_command(
             "claude_api",
