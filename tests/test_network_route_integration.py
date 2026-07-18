@@ -68,6 +68,51 @@ class NetworkRouteIntegrationTests(unittest.TestCase):
         self.assertEqual(env["CLASH_PROXY"], args.proxy)
         self.assertEqual(env["HTTPS_PROXY"], args.proxy)
 
+    def test_full_flow_explicit_empty_proxy_forces_direct(self):
+        args = argparse.Namespace(
+            proxy="",
+            proxy_explicit=True,
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        base = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": "http://inherited.example:7897",
+            "HTTP_PROXY": "http://inherited.example:7897",
+            "HTTPS_PROXY": "http://inherited.example:7897",
+        }
+        connector = Mock(return_value=Mock())
+        with patch.object(run_full_flow.os, "environ", base), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            env = run_full_flow.build_child_env(args)
+        connector.assert_not_called()
+        self.assertNotIn("CLASH_PROXY", env)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertNotIn(key, env)
+
+    def test_full_flow_unprovided_proxy_uses_default_candidate(self):
+        default_proxy = "http://default.example:7897"
+        args = argparse.Namespace(
+            proxy=default_proxy,
+            proxy_explicit=False,
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        base = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": default_proxy,
+        }
+        connector = Mock(return_value=Mock())
+        with patch.object(run_full_flow.os, "environ", base), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            env = run_full_flow.build_child_env(args)
+        connector.assert_called_once_with(("default.example", 7897), 0.5)
+        self.assertEqual(env["HTTPS_PROXY"], default_proxy)
+
     def test_outlook_uses_direct_when_clash_is_unreachable(self):
         env = {
             "CLASH_PROXY": "http://127.0.0.1:7897",

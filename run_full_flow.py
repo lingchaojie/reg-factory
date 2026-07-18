@@ -142,6 +142,7 @@ def read_fresh_emails():
 def build_child_env(args):
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    proxy_explicit = getattr(args, "proxy_explicit", True)
     if args.proxy:
         env["CLASH_PROXY"] = args.proxy
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = args.proxy
@@ -150,6 +151,9 @@ def build_child_env(args):
         # 否则 urllib 把它们也塞进 7897 代理 -> 502 Bad Gateway。
         no_proxy = "127.0.0.1,localhost,::1"
         env["NO_PROXY"] = env["no_proxy"] = no_proxy
+    elif proxy_explicit:
+        env.pop("CLASH_PROXY", None)
+        strip_http_proxy_env(env)
     # 让 outlook_reg_loop 的 _clash_verge 能连控制器换节点
     env.setdefault("CLASH_API", args.clash_api)
     env.setdefault("CLASH_SECRET", args.clash_secret)
@@ -456,7 +460,7 @@ def main():
     ap.add_argument("--grok-sub2api-group", default=None,
                     help="SUB2API Grok 目标分组名（默认取 SUB2API_GROK_GROUP）")
     # 基建
-    ap.add_argument("--proxy", default=PROXY_DEFAULT, help="HTTP(S)_PROXY；传空串禁用")
+    ap.add_argument("--proxy", default=None, help="HTTP(S)_PROXY；传空串禁用")
     ap.add_argument("--clash-api", default=CLASH_API_DEFAULT)
     ap.add_argument("--clash-secret", default=CLASH_SECRET_DEFAULT)
     ap.add_argument("--clash-group", default="GLOBAL",
@@ -464,6 +468,9 @@ def main():
                          "传 'auto' 会 404。claude/grok 的节点选择模式见 --node")
     ap.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
     args = ap.parse_args()
+    args.proxy_explicit = args.proxy is not None
+    if args.proxy is None:
+        args.proxy = PROXY_DEFAULT
 
     if args.skip_email and args.rounds != 1:
         # --skip-email 每轮都用同一个固定邮箱，循环没意义（甚至会重复注册同号）
