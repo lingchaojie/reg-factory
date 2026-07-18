@@ -22,6 +22,7 @@ mailbox_broker.py — 共享取码服务（一号三用并行流水线的核心�
 
 import argparse
 import asyncio
+import math
 import re
 import sys
 import time
@@ -117,6 +118,7 @@ class Session:
         self.lock = asyncio.Lock()
         self.last_used = time.time()
         self.seen = set()          # 已返回过的值，防两平台抢同一封
+        self.platform_seen = set()
         self.logged_in = False
         self.just_created = False  # 本次 ensure_session 是否触发了新登录(用于规避基线 race)
 
@@ -228,10 +230,21 @@ class Broker:
         except Exception:
             return 0
 
-    async def _scan_platform_artifact(self, page):
+    async def _scan_platform_artifact(
+        self,
+        page,
+        received_after=None,
+        seen_ids=None,
+        deadline=None,
+    ):
         from common.claude_platform_mailbox import _scan_claude_platform_folder
 
-        result = await _scan_claude_platform_folder(page)
+        result = await _scan_claude_platform_folder(
+            page,
+            received_after=received_after,
+            deadline=deadline,
+            seen_ids=seen_ids,
+        )
         if not result:
             return None
         return {
@@ -240,7 +253,66 @@ class Broker:
             "received_at": result.received_at,
         }
 
-    async def fetch(self, email, password, sender_hint, subject_hint, regex, kind, timeout):
+    async def _fetch_platform(
+        self,
+        session,
+        folders,
+        timeout,
+        received_after,
+        display_email,
+    ):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        first_pass = True
+        while first_pass or time.monotonic() < deadline:
+            first_pass = False
+            for key, names in folders:
+                await _click_folder(session.page, names)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(2.0, remaining))
+                value = await self._scan_platform_artifact(
+                    session.page,
+                    received_after=received_after,
+                    seen_ids=session.platform_seen,
+                    deadline=deadline if timeout > 0 else None,
+                )
+                if not value:
+                    continue
+                fallback_identity = (
+                    str(value.get("magic_link") or ""),
+                    str(value.get("code") or ""),
+                    float(value.get("received_at") or 0.0),
+                )
+                if fallback_identity in session.seen:
+                    continue
+                session.seen.add(fallback_identity)
+                session.last_used = time.time()
+                print(
+                    f"  [broker] {display_email} claude_platform "
+                    f"artifact found ({key})"
+                )
+                return value
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(6.0, remaining))
+        print(
+            f"  [broker] {display_email} claude_platform timeout "
+            "(no current email arrived)"
+        )
+        return None
+
+    async def fetch(
+        self,
+        email,
+        password,
+        sender_hint,
+        subject_hint,
+        regex,
+        kind,
+        timeout,
+        received_after=None,
+    ):
         display_email = _masked_email(email)
         s = await self.ensure_session(email, password)
         async with s.lock:
@@ -248,6 +320,18 @@ class Broker:
             pat = re.compile(regex) if kind == "code" else None
             hints = [h.lower() for h in (tuple(sender_hint) + tuple(subject_hint)) if h]
             folders = [("inbox", INBOX_NAMES), ("junk", JUNK_NAMES)]
+            if kind == "claude_platform":
+                if received_after is None:
+                    return None
+                if not hasattr(s, "platform_seen"):
+                    s.platform_seen = set()
+                return await self._fetch_platform(
+                    s,
+                    folders,
+                    timeout,
+                    received_after,
+                    display_email,
+                )
 
             # 基线：记录每个文件夹"当前"匹配邮件数。注册脚本是先触发发码/发链接、再调 /fetch，
             # 故此刻收件箱里的匹配邮件都是【旧的】(MS 欢迎/安全码、上一轮旧验证码)，全部计入基线并忽略。
@@ -379,9 +463,45 @@ async def h_fetch(request):
     subject_hint = body.get("subject_hint") or ("code", "verify", "verification", "confirm")
     regex = body.get("regex") or r"\b(\d{6})\b"
     kind = body.get("kind") or "code"
-    timeout = int(body.get("timeout") or 150)
     try:
-        val = await broker.fetch(email, password, sender_hint, subject_hint, regex, kind, timeout)
+        timeout = float(
+            150 if body.get("timeout") in (None, "") else body.get("timeout")
+        )
+    except (TypeError, ValueError, OverflowError):
+        return web.json_response(
+            {"ok": False, "error": "invalid timeout"},
+            status=400,
+        )
+    if not math.isfinite(timeout) or timeout <= 0:
+        return web.json_response(
+            {"ok": False, "error": "invalid timeout"},
+            status=400,
+        )
+    received_after = None
+    if kind == "claude_platform":
+        try:
+            received_after = float(body.get("received_after"))
+        except (TypeError, ValueError, OverflowError):
+            return web.json_response(
+                {"ok": False, "error": "invalid received_after"},
+                status=400,
+            )
+        if not math.isfinite(received_after) or received_after < 0:
+            return web.json_response(
+                {"ok": False, "error": "invalid received_after"},
+                status=400,
+            )
+    try:
+        val = await broker.fetch(
+            email,
+            password,
+            sender_hint,
+            subject_hint,
+            regex,
+            kind,
+            timeout,
+            received_after,
+        )
         return web.json_response({"ok": bool(val), "value": val})
     except Exception as exc:
         return web.json_response(

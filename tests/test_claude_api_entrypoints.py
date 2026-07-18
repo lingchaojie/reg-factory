@@ -112,7 +112,10 @@ class ClaudeApiMailboxEntrypointTests(unittest.TestCase):
         ):
             result = asyncio.run(
                 claude_platform_mailbox.fetch_claude_platform_from_broker(
-                    "person@example.com", "mail-pass", max_wait=30
+                    "person@example.com",
+                    "mail-pass",
+                    max_wait=30,
+                    received_after=2_000_000_000.0,
                 )
             )
 
@@ -120,7 +123,7 @@ class ClaudeApiMailboxEntrypointTests(unittest.TestCase):
         self.assertEqual(result.magic_link, payload["value"]["magic_link"])
         self.assertEqual(result.received_at, 2_000_000_001.0)
         self.assertEqual(capture["url"], "http://broker.test/fetch")
-        self.assertEqual(capture["session_kwargs"]["timeout"].total, 90)
+        self.assertEqual(capture["session_kwargs"]["timeout"].total, 30)
         self.assertEqual(
             capture["json"],
             {
@@ -131,8 +134,116 @@ class ClaudeApiMailboxEntrypointTests(unittest.TestCase):
                 "regex": "",
                 "kind": "claude_platform",
                 "timeout": 30,
+                "received_after": 2_000_000_000.0,
             },
         )
+
+    def test_platform_broker_client_rejects_stale_and_raw_invalid_artifacts(self):
+        cases = (
+            {
+                "magic_link": "https://platform.claude.com.evil.test/magic-link?code=x",
+                "code": "",
+                "received_at": 2_000_000_001.0,
+            },
+            {
+                "magic_link": "",
+                "code": "482731 trailing-junk",
+                "received_at": 2_000_000_001.0,
+            },
+            {
+                "magic_link": "",
+                "code": "482731",
+                "received_at": 1_999_999_000.0,
+            },
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                capture = {}
+                with patch.dict(
+                    "os.environ",
+                    {"MAILBOX_BROKER": "http://broker.test"},
+                    clear=True,
+                ), patch.object(
+                    claude_platform_mailbox.aiohttp,
+                    "ClientSession",
+                    side_effect=lambda **kwargs: _Session(
+                        {"ok": True, "value": value},
+                        capture,
+                        **kwargs,
+                    ),
+                ):
+                    result = asyncio.run(
+                        claude_platform_mailbox.fetch_claude_platform_from_broker(
+                            "person@example.com",
+                            "mail-pass",
+                            max_wait=30,
+                            received_after=2_000_000_000.0,
+                        )
+                    )
+
+                self.assertIsNone(result)
+
+    def test_platform_broker_transport_and_json_failures_are_sanitized_misses(self):
+        class JsonFailureResponse(_Response):
+            async def json(self):
+                raise ValueError("json-secret")
+
+        class JsonFailureSession(_Session):
+            def post(self, url, json):
+                self.capture.update(url=url, json=json)
+                return JsonFailureResponse({}, self.status)
+
+        factories = (
+            lambda _capture: (_ for _ in ()).throw(
+                RuntimeError("connection-secret")
+            ),
+            lambda _capture: (_ for _ in ()).throw(
+                asyncio.TimeoutError("timeout-secret")
+            ),
+            lambda capture: JsonFailureSession({}, capture),
+        )
+        for factory in factories:
+            with self.subTest(factory=factory):
+                capture = {}
+                with patch.dict(
+                    "os.environ",
+                    {"MAILBOX_BROKER": "http://broker.test"},
+                    clear=True,
+                ), patch.object(
+                    claude_platform_mailbox.aiohttp,
+                    "ClientSession",
+                    side_effect=lambda **kwargs: factory(capture),
+                ):
+                    result = asyncio.run(
+                        claude_platform_mailbox.fetch_claude_platform_from_broker(
+                            "person@example.com",
+                            "mail-pass",
+                            max_wait=0.1,
+                            received_after=2_000_000_000.0,
+                        )
+                    )
+
+                self.assertIsNone(result)
+
+    def test_platform_broker_client_preserves_cancellation(self):
+        with patch.dict(
+            "os.environ",
+            {"MAILBOX_BROKER": "http://broker.test"},
+            clear=True,
+        ), patch.object(
+            claude_platform_mailbox.aiohttp,
+            "ClientSession",
+            side_effect=asyncio.CancelledError,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(
+                    claude_platform_mailbox.fetch_claude_platform_from_broker(
+                        "person@example.com",
+                        "mail-pass",
+                        max_wait=0.1,
+                        received_after=2_000_000_000.0,
+                    )
+                )
 
     def test_generic_broker_transport_preserves_structured_values_without_logging_them(self):
         capture = {}
@@ -260,6 +371,7 @@ class BrokerPlatformTests(unittest.TestCase):
         self.session.page = Mock()
         self.session.last_used = 0.0
         self.session.seen = set()
+        self.session.platform_seen = set()
         self.session.just_created = True
 
     def test_broker_platform_kind_returns_structured_artifact(self):
@@ -274,7 +386,10 @@ class BrokerPlatformTests(unittest.TestCase):
                     "received": "2033-05-18T03:33:21Z",
                     "stable_id": "message-a",
                 }],
-                True,
+                {
+                    "stable_id": "message-a",
+                    "received": "2033-05-18T03:33:21Z",
+                },
                 {"subject": "Claude login code 482731", "body": "Sign in"},
             )
         )
@@ -291,15 +406,78 @@ class BrokerPlatformTests(unittest.TestCase):
                     "",
                     "claude_platform",
                     30,
+                    2_000_000_000.0,
                 )
             )
 
         self.assertEqual(result["code"], "482731")
-        self.assertIn(("", "482731", 2_000_000_001.0), self.session.seen)
+        self.assertIn("message-a", self.session.platform_seen)
         rendered = " ".join(str(item) for item in output.call_args_list)
         self.assertNotIn("person@example.com", rendered)
         self.assertNotIn("482731", rendered)
         self.assertIn("pe***@example.com", rendered)
+
+    def test_accessible_minute_precision_survives_broker_round_trip(self):
+        accessible = "Sunday, July 19, 2033 at 3:33 AM"
+        minute_start = claude_platform_mailbox._received_epoch(accessible)
+        requested_at = minute_start + 25
+        broker = mailbox_broker.Broker()
+        broker.ensure_session = AsyncMock(return_value=self.session)
+        self.session.page.evaluate = AsyncMock(side_effect=(
+            [{
+                "index": 0,
+                "visible": True,
+                "received": accessible,
+                "stable_id": "message-accessible-minute",
+            }],
+            {
+                "stable_id": "message-accessible-minute",
+                "received": accessible,
+            },
+            {"subject": "Claude login code 482731", "body": "Sign in"},
+        ))
+
+        with patch.object(
+            mailbox_broker, "_click_folder", new=AsyncMock()
+        ), patch.object(
+            mailbox_broker.asyncio, "sleep", new=AsyncMock()
+        ), patch("builtins.print"):
+            wire_value = asyncio.run(
+                broker.fetch(
+                    "person@example.com",
+                    "mail-pass",
+                    ("anthropic", "claude"),
+                    ("code", "sign in", "login"),
+                    "",
+                    "claude_platform",
+                    0,
+                    requested_at,
+                )
+            )
+
+        capture = {}
+        with patch.dict(
+            "os.environ",
+            {"MAILBOX_BROKER": "http://broker.test"},
+            clear=True,
+        ), patch.object(
+            claude_platform_mailbox.aiohttp,
+            "ClientSession",
+            side_effect=lambda **kwargs: _Session(
+                {"ok": True, "value": wire_value}, capture, **kwargs
+            ),
+        ):
+            result = asyncio.run(
+                claude_platform_mailbox.fetch_claude_platform_from_broker(
+                    "person@example.com",
+                    "mail-pass",
+                    max_wait=30,
+                    received_after=requested_at,
+                )
+            )
+
+        self.assertEqual(result.code, "482731")
+        self.assertGreaterEqual(result.received_at, requested_at - 5)
 
     def test_broker_real_scanner_deduplicates_same_browser_message(self):
         broker = mailbox_broker.Broker()
@@ -307,7 +485,7 @@ class BrokerPlatformTests(unittest.TestCase):
         broker._count_matching = AsyncMock(return_value=0)
 
         async def evaluate(script, *args):
-            if "getBoundingClientRect" in script:
+            if "return items.map" in script:
                 return [{
                     "index": 0,
                     "visible": True,
@@ -315,7 +493,10 @@ class BrokerPlatformTests(unittest.TestCase):
                     "stable_id": "message-a",
                 }]
             if args:
-                return True
+                return {
+                    "stable_id": "message-a",
+                    "received": "2033-05-18T03:33:21Z",
+                }
             return {"subject": "Claude login code 482731", "body": "Sign in"}
 
         self.session.page.evaluate = AsyncMock(side_effect=evaluate)
@@ -327,6 +508,7 @@ class BrokerPlatformTests(unittest.TestCase):
             "",
             "claude_platform",
             0,
+            2_000_000_000.0,
         )
         with patch.object(mailbox_broker, "_click_folder", new=AsyncMock()), patch.object(
             mailbox_broker.asyncio, "sleep", new=AsyncMock()
@@ -337,10 +519,7 @@ class BrokerPlatformTests(unittest.TestCase):
         self.assertEqual(first["code"], "482731")
         self.assertEqual(first["received_at"], 2_000_000_001.0)
         self.assertIsNone(second)
-        self.assertEqual(
-            self.session.seen,
-            {("", "482731", 2_000_000_001.0)},
-        )
+        self.assertEqual(self.session.platform_seen, {"message-a"})
 
     def test_broker_new_message_path_preserves_both_artifacts(self):
         self.session.just_created = False
@@ -367,11 +546,121 @@ class BrokerPlatformTests(unittest.TestCase):
                     "",
                     "claude_platform",
                     30,
+                    2_000_000_000.0,
                 )
             )
 
         self.assertEqual(result["code"], "482731")
         self.assertIn("new-secret", result["magic_link"])
+
+    def test_existing_session_does_not_absorb_current_platform_mail_into_baseline(self):
+        self.session.just_created = False
+        broker = mailbox_broker.Broker()
+        broker.ensure_session = AsyncMock(return_value=self.session)
+        broker._count_matching = AsyncMock(return_value=1)
+        broker._scan_platform_artifact = AsyncMock(
+            return_value={
+                "magic_link": "",
+                "code": "482731",
+                "received_at": 2_000_000_001.0,
+            }
+        )
+
+        with patch.object(
+            mailbox_broker, "_click_folder", new=AsyncMock()
+        ), patch.object(
+            mailbox_broker.asyncio, "sleep", new=AsyncMock()
+        ), patch("builtins.print"):
+            result = asyncio.run(
+                broker.fetch(
+                    "person@example.com",
+                    "mail-pass",
+                    ("anthropic", "claude"),
+                    ("code", "sign in", "login"),
+                    "",
+                    "claude_platform",
+                    0,
+                    2_000_000_000.0,
+                )
+            )
+
+        self.assertEqual(result["code"], "482731")
+        broker._scan_platform_artifact.assert_awaited()
+
+    def test_new_session_does_not_return_old_platform_mail(self):
+        broker = mailbox_broker.Broker()
+        broker.ensure_session = AsyncMock(return_value=self.session)
+        self.session.page.evaluate = AsyncMock(side_effect=(
+            [{
+                "index": 0,
+                "visible": True,
+                "received": "2020-01-01T00:00:00Z",
+                "stable_id": "old-inbox-row",
+            }],
+            [{
+                "index": 0,
+                "visible": True,
+                "received": "2020-01-01T00:00:00Z",
+                "stable_id": "old-junk-row",
+            }],
+        ))
+
+        with patch.object(
+            mailbox_broker, "_click_folder", new=AsyncMock()
+        ), patch.object(
+            mailbox_broker.asyncio, "sleep", new=AsyncMock()
+        ), patch("builtins.print"):
+            result = asyncio.run(
+                broker.fetch(
+                    "person@example.com",
+                    "mail-pass",
+                    ("anthropic", "claude"),
+                    ("code", "sign in", "login"),
+                    "",
+                    "claude_platform",
+                    0,
+                    2_000_000_000.0,
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(self.session.platform_seen, set())
+
+    def test_http_handler_forwards_platform_received_after_to_broker(self):
+        broker = Mock()
+        broker.fetch = AsyncMock(
+            return_value={
+                "magic_link": "",
+                "code": "482731",
+                "received_at": 2_000_000_001.0,
+            }
+        )
+        request = Mock()
+        request.app = {"broker": broker}
+        request.json = AsyncMock(return_value={
+            "email": "person@example.com",
+            "password": "mail-pass",
+            "sender_hint": ["anthropic", "claude"],
+            "subject_hint": ["code", "login"],
+            "regex": "",
+            "kind": "claude_platform",
+            "timeout": 0.3,
+            "received_after": 2_000_000_000.0,
+        })
+
+        response = asyncio.run(mailbox_broker.h_fetch(request))
+
+        self.assertEqual(response.status, 200)
+        broker.fetch.assert_awaited_once_with(
+            "person@example.com",
+            "mail-pass",
+            ["anthropic", "claude"],
+            ["code", "login"],
+            r"\b(\d{6})\b",
+            "claude_platform",
+            0.3,
+            2_000_000_000.0,
+        )
 
     def test_session_initialization_masks_mailbox_address_on_failure(self):
         broker = mailbox_broker.Broker()

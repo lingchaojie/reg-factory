@@ -166,15 +166,189 @@ class ClaudeApiProviderDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, expected)
         self.assertEqual(events, ["graph", "broker", "new_page", "browser", "close"])
-        graph_call.assert_called_once_with(
-            "person@example.com",
-            "refresh-secret",
-            "client-guid",
-            45,
-            5,
-            1234.5,
-            "lease-object",
+        graph_args = graph_call.call_args.args
+        self.assertEqual(
+            graph_args[:3],
+            ("person@example.com", "refresh-secret", "client-guid"),
         )
+        self.assertGreater(graph_args[3], 0)
+        self.assertLess(graph_args[3], 45)
+        self.assertEqual(graph_args[4:], (5, 1234.5, "lease-object"))
+
+    async def test_outlook_channels_consume_subbudgets_and_browser_stays_reachable(self):
+        overall_budget = 0.30
+        received_after = 1234.5
+        channel_budgets = {}
+        expected = ClaudePlatformVerification(code="482731")
+        page = Mock()
+        page.close = AsyncMock()
+        context = Mock()
+        context.new_page = AsyncMock(return_value=page)
+
+        def graph(_email, _token, _client, max_wait, *_args):
+            channel_budgets["graph"] = max_wait
+            time.sleep(max_wait)
+            return None
+
+        async def broker(_email, _password, max_wait, received_after=None):
+            channel_budgets["broker"] = max_wait
+            channel_budgets["broker_received_after"] = received_after
+            await asyncio.sleep(max_wait)
+            return None
+
+        async def browser(
+            _page,
+            _email,
+            _password,
+            *,
+            max_wait,
+            received_after,
+        ):
+            channel_budgets["browser"] = max_wait
+            channel_budgets["browser_received_after"] = received_after
+            await asyncio.sleep(max_wait / 2)
+            return expected
+
+        started = time.monotonic()
+        with patch.dict(
+            register_claude_api.os.environ,
+            {"MAILBOX_BROKER": "http://broker.test"},
+            clear=True,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_by_token",
+            side_effect=graph,
+        ), patch.object(
+            register_claude_api,
+            "fetch_claude_platform_from_broker",
+            side_effect=broker,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_outlook_pw",
+            side_effect=browser,
+        ):
+            result = await register_claude_api.fetch_platform_verification(
+                context,
+                account("OUTLOOK"),
+                overall_budget,
+                received_after,
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertIs(result, expected)
+        self.assertEqual(channel_budgets["broker_received_after"], received_after)
+        self.assertEqual(channel_budgets["browser_received_after"], received_after)
+        for channel in ("graph", "broker", "browser"):
+            self.assertGreater(channel_budgets[channel], 0)
+            self.assertLess(channel_budgets[channel], overall_budget)
+        self.assertLess(elapsed, 0.55)
+
+    async def test_cancellation_resistant_broker_cannot_block_browser_channel(self):
+        expected = ClaudePlatformVerification(code="482731")
+        page = Mock()
+        page.close = AsyncMock()
+        context = Mock()
+        context.new_page = AsyncMock(return_value=page)
+
+        async def broker(*_args, **_kwargs):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.12)
+                return None
+
+        with patch.dict(
+            register_claude_api.os.environ,
+            {"MAILBOX_BROKER": "http://broker.test"},
+            clear=True,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_by_token",
+            return_value=None,
+        ), patch.object(
+            register_claude_api,
+            "fetch_claude_platform_from_broker",
+            side_effect=broker,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_outlook_pw",
+            new=AsyncMock(return_value=expected),
+        ):
+            started = time.monotonic()
+            result = await asyncio.wait_for(
+                register_claude_api.fetch_platform_verification(
+                    context,
+                    account("OUTLOOK"),
+                    0.15,
+                    1234.5,
+                ),
+                timeout=0.4,
+            )
+            elapsed = time.monotonic() - started
+        await asyncio.sleep(0.13)
+
+        self.assertIs(result, expected)
+        context.new_page.assert_awaited_once()
+        self.assertLess(elapsed, 0.14)
+
+    async def test_outlook_page_close_failure_does_not_replace_found_artifact(self):
+        expected = ClaudePlatformVerification(code="482731")
+        page = Mock()
+        page.close = AsyncMock(side_effect=RuntimeError("close-secret"))
+        context = Mock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with patch.dict(
+            register_claude_api.os.environ,
+            {},
+            clear=True,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_by_token",
+            return_value=None,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_outlook_pw",
+            new=AsyncMock(return_value=expected),
+        ):
+            result = await register_claude_api.fetch_platform_verification(
+                context,
+                account("OUTLOOK"),
+                0.1,
+                1234.5,
+            )
+
+        self.assertIs(result, expected)
+
+    async def test_outlook_page_close_failure_does_not_replace_primary_error(self):
+        class PrimaryError(RuntimeError):
+            pass
+
+        page = Mock()
+        page.close = AsyncMock(side_effect=RuntimeError("close-secret"))
+        context = Mock()
+        context.new_page = AsyncMock(return_value=page)
+
+        with patch.dict(
+            register_claude_api.os.environ,
+            {},
+            clear=True,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_by_token",
+            return_value=None,
+        ), patch.object(
+            register_claude_api,
+            "get_claude_platform_verification_outlook_pw",
+            new=AsyncMock(side_effect=PrimaryError("primary-secret")),
+        ):
+            with self.assertRaises(PrimaryError):
+                await register_claude_api.fetch_platform_verification(
+                    context,
+                    account("OUTLOOK"),
+                    0.1,
+                    1234.5,
+                )
 
     async def test_ninemail_cancellation_signals_and_awaits_worker(self):
         class CancellableClient:

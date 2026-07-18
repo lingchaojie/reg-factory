@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import threading
 import traceback
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
 
 from common.claude_email_accounts import ClaudeEmailAccount
@@ -202,7 +202,11 @@ class DelayedPlatformPage(FakePlatformPage):
         self.state_probes = 0
 
     def locator(self, selector):
-        if selector == 'a[href*="/settings/keys"]' and self.state == "pending":
+        if (
+            selector
+            == 'input[name="organizationName"], input[placeholder*="organization"]'
+            and self.state == "pending"
+        ):
             self.state_probes += 1
             if self.state_probes >= self.transition_after:
                 self.state = self.transition_to
@@ -292,7 +296,7 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(
             register_claude_api.ClaudeApiRegistrationError,
-            "^verification_rejected$",
+            "^magic_link_invalid$",
         ):
             await register_claude_api.apply_verification_artifact(
                 page, raw_broker_artifact
@@ -357,6 +361,68 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         login.url = "https://platform.claude.com/login"
         self.assertFalse(await register_claude_api.is_console_ready(login))
 
+    async def test_console_ready_requires_exact_https_origin_without_credentials_or_port(self):
+        for url in (
+            "http://platform.claude.com/workbench",
+            "https://platform.claude.com:444/workbench",
+            "https://user:pass@platform.claude.com/workbench",
+        ):
+            with self.subTest(url=url):
+                page = FakePlatformPage(state="authenticated")
+                page.url = url
+                self.assertFalse(await register_claude_api.is_console_ready(page))
+
+    async def test_console_ready_rejects_auth_and_onboarding_route_boundaries(self):
+        for path in (
+            "/login",
+            "/magic-link",
+            "/onboarding",
+            "/setup/profile",
+            "/organization/new",
+            "/organizations/new",
+            "/settings/organization",
+        ):
+            with self.subTest(path=path):
+                page = FakePlatformPage(state="authenticated")
+                page.url = f"https://platform.claude.com{path}"
+                self.assertFalse(await register_claude_api.is_console_ready(page))
+
+    async def test_console_ready_requires_console_exclusive_workspace_marker(self):
+        class NavigationOnlyPage(FakePlatformPage):
+            def element_count(self, kind):
+                if kind == (
+                    "selector",
+                    '[data-testid="workspace-switcher"]',
+                ):
+                    return 0
+                return super().element_count(kind)
+
+        page = NavigationOnlyPage(state="authenticated")
+        self.assertFalse(await register_claude_api.is_console_ready(page))
+
+    async def test_organization_state_is_detected_before_console_marker(self):
+        class OrganizationWithConsoleChrome(FakePlatformPage):
+            def element_count(self, kind):
+                if kind == (
+                    "selector",
+                    '[data-testid="workspace-switcher"]',
+                ):
+                    return 1
+                return super().element_count(kind)
+
+        page = OrganizationWithConsoleChrome(state="organization")
+        page.url = "https://platform.claude.com/workbench"
+
+        with self.assertRaisesRegex(
+            register_claude_api.ClaudeApiRegistrationError,
+            "^personal_account_not_available$",
+        ):
+            await register_claude_api._wait_for_post_verification_state(
+                page,
+                "magic_link",
+                timeout=0.1,
+            )
+
     async def test_console_locator_failure_is_safe_console_error(self):
         page = FakePlatformPage(
             state="authenticated",
@@ -396,8 +462,86 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(fetches[0][2], 0)
         self.assertLessEqual(fetches[0][2], 7)
         self.assertGreater(fetches[1][2], 0)
-        self.assertLessEqual(fetches[1][2], fetches[0][2])
+        self.assertLessEqual(fetches[1][2], 7 * 0.8 + 0.01)
         self.assertLessEqual(fetches[0][3], fetches[1][3])
+
+    async def test_first_mail_poll_consumes_its_subbudget_but_resend_and_transition_remain_reachable(self):
+        page = FakePlatformPage()
+        waits = []
+
+        async def fetch_verification(
+            _context,
+            _account,
+            wait_budget,
+            _received_after,
+        ):
+            waits.append(wait_budget)
+            if len(waits) == 1:
+                await asyncio.sleep(wait_budget)
+                return None
+            await asyncio.sleep(wait_budget / 2)
+            return ClaudePlatformVerification(code="482731")
+
+        started = asyncio.get_running_loop().time()
+        with patch.object(
+            register_claude_api,
+            "save_claude_platform_session",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ):
+            result = await register_claude_api.run_claude_platform_flow(
+                page,
+                FakeBrowserContext([]),
+                self.account,
+                fetch_verification,
+                0.16,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        self.assertEqual(result, "cookies/session.json")
+        self.assertEqual(page.resend_count, 1)
+        self.assertEqual(len(waits), 2)
+        self.assertLess(waits[0], 0.10)
+        self.assertGreater(waits[1], 0)
+        self.assertLess(elapsed, 0.24)
+
+    async def test_cancellation_resistant_first_poll_cannot_consume_resend_window(self):
+        page = FakePlatformPage()
+        fetch_count = 0
+
+        async def fetch_verification(*_args):
+            nonlocal fetch_count
+            fetch_count += 1
+            if fetch_count == 1:
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.15)
+                    return None
+            return ClaudePlatformVerification(code="482731")
+
+        started = asyncio.get_running_loop().time()
+        with patch.object(
+            register_claude_api,
+            "save_claude_platform_session",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ):
+            result = await asyncio.wait_for(
+                register_claude_api.run_claude_platform_flow(
+                    page,
+                    FakeBrowserContext([]),
+                    self.account,
+                    fetch_verification,
+                    0.25,
+                ),
+                timeout=0.5,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(0.16)
+
+        self.assertEqual(result, "cookies/session.json")
+        self.assertEqual(fetch_count, 2)
+        self.assertEqual(page.resend_count, 1)
+        self.assertLess(elapsed, 0.20)
 
     async def test_received_after_is_captured_before_verification_request(self):
         class RequestTimingPage(FakePlatformPage):

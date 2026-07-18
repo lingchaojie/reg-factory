@@ -1,4 +1,4 @@
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 import argparse
 import asyncio
 import functools
@@ -52,6 +52,17 @@ _CLAUDE_CHALLENGE_MARKERS = (
     "just a moment",
     "performing security",
 )
+_CONSOLE_BLOCKED_PATH_SEGMENTS = {
+    "login",
+    "magic-link",
+    "onboarding",
+    "setup",
+    "organization",
+    "organizations",
+}
+_CONSOLE_EXCLUSIVE_MARKER = '[data-testid="workspace-switcher"]'
+_FIRST_MAIL_FRACTION = 0.40
+_SECOND_MAIL_END_FRACTION = 0.80
 
 
 class ClaudeApiRegistrationError(RuntimeError):
@@ -78,7 +89,7 @@ async def apply_verification_artifact(page, artifact, navigation_timeout=60000):
         if artifact.magic_link:
             magic_link = validate_claude_platform_magic_link(artifact.magic_link)
             if not magic_link:
-                raise ClaudeApiRegistrationError("verification_rejected")
+                raise ClaudeApiRegistrationError("magic_link_invalid")
             await page.goto(magic_link, timeout=navigation_timeout)
             return "magic_link"
 
@@ -104,8 +115,35 @@ async def apply_verification_artifact(page, artifact, navigation_timeout=60000):
         raise ClaudeApiRegistrationError("verification_rejected") from None
 
 
+async def _organization_state(page):
+    parsed = urlparse(page.url)
+    path_segments = [
+        segment
+        for segment in unquote(parsed.path or "").lower().split("/")
+        if segment
+    ]
+    if any(
+        segment in {"organization", "organizations"}
+        for segment in path_segments
+    ):
+        return True
+    organization_input = page.locator(
+        'input[name="organizationName"], input[placeholder*="organization"]'
+    )
+    if await organization_input.count() > 0:
+        return True
+    headings = page.locator("h1, h2")
+    heading_text = " ".join(await headings.all_text_contents()).lower()
+    return (
+        "create an organization" in heading_text
+        or "create your organization" in heading_text
+    )
+
+
 async def select_personal_account(page):
     try:
+        if await _organization_state(page):
+            raise ClaudeApiRegistrationError("personal_account_not_available")
         for name in ("Personal account", "Personal"):
             candidate = page.get_by_role("button", name=name, exact=True)
             count = await candidate.count()
@@ -114,19 +152,6 @@ async def select_personal_account(page):
                 return True
             if count > 1:
                 raise ClaudeApiRegistrationError("personal_account_not_available")
-
-        organization_input = page.locator(
-            'input[name="organizationName"], input[placeholder*="organization"]'
-        )
-        if await organization_input.count() > 0:
-            raise ClaudeApiRegistrationError("personal_account_not_available")
-        headings = page.locator("h1, h2")
-        heading_text = " ".join(await headings.all_text_contents()).lower()
-        if (
-            "create an organization" in heading_text
-            or "create your organization" in heading_text
-        ):
-            raise ClaudeApiRegistrationError("personal_account_not_available")
         return False
     except ClaudeApiRegistrationError:
         raise
@@ -137,20 +162,32 @@ async def select_personal_account(page):
 async def is_console_ready(page):
     try:
         parsed = urlparse(page.url)
-        if parsed.hostname != "platform.claude.com":
+        try:
+            port = parsed.port
+        except ValueError:
             return False
-        if parsed.path.startswith(("/login", "/magic-link")):
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "platform.claude.com"
+            or port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             return False
-        selectors = (
-            'a[href*="/settings/keys"]',
-            'a[href*="/workbench"]',
-            '[data-testid="workspace-switcher"]',
-        )
-        for selector in selectors:
-            locator = page.locator(selector)
-            if await locator.count() == 1 and await locator.is_visible():
-                return True
-        return False
+        path_segments = [
+            segment
+            for segment in unquote(parsed.path or "").lower().split("/")
+            if segment
+        ]
+        if any(
+            segment in _CONSOLE_BLOCKED_PATH_SEGMENTS
+            for segment in path_segments
+        ):
+            return False
+        if await _organization_state(page):
+            return False
+        marker = page.locator(_CONSOLE_EXCLUSIVE_MARKER)
+        return await marker.count() == 1 and await marker.is_visible()
     except ClaudeApiRegistrationError:
         raise
     except Exception:
@@ -267,6 +304,14 @@ async def _await_by_deadline(awaitable, deadline):
     return await asyncio.wait_for(awaitable, timeout=remaining)
 
 
+async def _await_external_by_deadline(awaitable, deadline):
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        _close_unawaited(awaitable)
+        raise asyncio.TimeoutError
+    return await _run_bounded(awaitable, remaining, cancel_grace=0)
+
+
 def _navigation_timeout(deadline):
     return max(1, min(60000, int(_remaining(deadline) * 1000)))
 
@@ -297,6 +342,20 @@ async def _wait_for_post_verification_state(
     while True:
         if _remaining(deadline) <= 0:
             await _raise_post_verification_timeout(page, method)
+        try:
+            organization_state = await _await_by_deadline(
+                _organization_state(page), deadline
+            )
+        except asyncio.TimeoutError:
+            await _raise_post_verification_timeout(page, method)
+        except ClaudeApiRegistrationError:
+            raise
+        except Exception:
+            raise ClaudeApiRegistrationError("console_not_reached") from None
+        if organization_state:
+            raise ClaudeApiRegistrationError(
+                "personal_account_not_available"
+            )
         try:
             console_ready = await _await_by_deadline(
                 is_console_ready(page), deadline
@@ -361,29 +420,56 @@ async def run_claude_platform_flow(
     except Exception:
         raise ClaudeApiRegistrationError("registration_error") from None
 
-    async def fetch_artifact(received_after):
-        remaining = _remaining(deadline)
+    mail_phase_started = _clock()
+    mail_available = _remaining(deadline)
+    first_mail_deadline = (
+        mail_phase_started + mail_available * _FIRST_MAIL_FRACTION
+    )
+    second_mail_deadline = (
+        mail_phase_started + mail_available * _SECOND_MAIL_END_FRACTION
+    )
+
+    async def fetch_artifact(received_after, phase_deadline):
+        remaining = max(0.0, phase_deadline - _clock())
         if remaining <= 0:
-            raise asyncio.TimeoutError
-        return await _await_by_deadline(
-            fetch_verification(
-                context,
-                account,
-                remaining,
-                received_after,
-            ),
-            deadline,
-        )
+            return None, True
+        try:
+            return (
+                await _await_external_by_deadline(
+                    fetch_verification(
+                        context,
+                        account,
+                        remaining,
+                        received_after,
+                    ),
+                    phase_deadline,
+                ),
+                False,
+            )
+        except asyncio.TimeoutError:
+            return None, True
 
     try:
-        artifact = await fetch_artifact(requested_at)
+        artifact, _first_timed_out = await fetch_artifact(
+            requested_at, first_mail_deadline
+        )
         if artifact is None:
             resend = page.get_by_role("button", name="Resend email", exact=True)
-            if await _await_by_deadline(resend.count(), deadline) != 1:
+            if (
+                await _await_by_deadline(
+                    resend.count(), second_mail_deadline
+                )
+                != 1
+            ):
                 raise ClaudeApiRegistrationError("mail_timeout")
             requested_at = time.time()
-            await _await_by_deadline(resend.click(), deadline)
-            artifact = await fetch_artifact(requested_at)
+            await _await_by_deadline(resend.click(), second_mail_deadline)
+            artifact, second_timed_out = await fetch_artifact(
+                requested_at,
+                second_mail_deadline,
+            )
+            if artifact is None and second_timed_out:
+                raise ClaudeApiRegistrationError("mail_timeout")
         if artifact is None:
             raise ClaudeApiRegistrationError("verification_artifact_not_found")
     except ClaudeApiRegistrationError:
@@ -475,38 +561,84 @@ async def fetch_platform_verification(
             await confirm_worker_stopped(worker, cancel_event)
             raise
 
+    deadline = _clock() + max(0.0, float(max_wait))
+    channels = []
     if account.refresh_token:
-        result = await asyncio.to_thread(
-            get_claude_platform_verification_by_token,
-            account.email,
-            account.refresh_token,
-            account.client_id,
-            max_wait,
-            5,
-            received_after,
-            account_lease,
-        )
-        if result:
-            return result
+        channels.append("graph")
     if os.environ.get("MAILBOX_BROKER"):
-        result = await fetch_claude_platform_from_broker(
-            account.email,
-            account.password,
-            max_wait,
-        )
-        if result:
-            return result
-    outlook_page = await context.new_page()
-    try:
-        return await get_claude_platform_verification_outlook_pw(
-            outlook_page,
-            account.email,
-            account.password,
-            max_wait=max_wait,
-            received_after=received_after,
-        )
-    finally:
-        await outlook_page.close()
+        channels.append("broker")
+    channels.append("browser")
+
+    for index, channel in enumerate(channels):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            return None
+        channels_left = len(channels) - index
+        channel_budget = remaining / channels_left
+        channel_deadline = _clock() + channel_budget
+        try:
+            if channel == "graph":
+                result = await _await_external_by_deadline(
+                    asyncio.to_thread(
+                        get_claude_platform_verification_by_token,
+                        account.email,
+                        account.refresh_token,
+                        account.client_id,
+                        channel_budget,
+                        5,
+                        received_after,
+                        account_lease,
+                    ),
+                    channel_deadline,
+                )
+            elif channel == "broker":
+                result = await _await_external_by_deadline(
+                    fetch_claude_platform_from_broker(
+                        account.email,
+                        account.password,
+                        channel_budget,
+                        received_after,
+                    ),
+                    channel_deadline,
+                )
+            else:
+                outlook_page = None
+                try:
+                    outlook_page = await _await_external_by_deadline(
+                        context.new_page(), channel_deadline
+                    )
+                    result = await _await_external_by_deadline(
+                        get_claude_platform_verification_outlook_pw(
+                            outlook_page,
+                            account.email,
+                            account.password,
+                            max_wait=max(
+                                0.0, channel_deadline - _clock()
+                            ),
+                            received_after=received_after,
+                        ),
+                        channel_deadline,
+                    )
+                finally:
+                    if outlook_page is not None:
+                        try:
+                            close_awaitable = outlook_page.close()
+                            close_remaining = _remaining(deadline)
+                            if close_remaining > 0:
+                                await _await_external_by_deadline(
+                                    close_awaitable, deadline
+                                )
+                            else:
+                                _close_unawaited(close_awaitable)
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException:
+                            pass
+            if result:
+                return result
+        except asyncio.TimeoutError:
+            continue
+    return None
 
 
 def log_flow_error(code, error=None, *, account=None):

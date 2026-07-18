@@ -53,10 +53,11 @@ def visible_text(value):
     return unescape(" ".join(parser.parts))
 
 
-def _received_epoch(value):
+def _received_epoch(value, *, end_of_precision=False):
     text = str(value or "").strip()
     if not text:
         return None
+    minute_precision = False
     try:
         numeric = float(text)
     except ValueError:
@@ -71,27 +72,64 @@ def _received_epoch(value):
         try:
             parsed = parsedate_to_datetime(text)
         except (TypeError, ValueError):
-            return None
+            parsed = None
+        if parsed is None:
+            accessible = re.sub(r"\s+at\s+", " ", text, flags=re.IGNORECASE)
+            for format_string in (
+                "%A, %B %d, %Y %I:%M %p",
+                "%B %d, %Y %I:%M %p",
+                "%m/%d/%Y %I:%M %p",
+            ):
+                try:
+                    parsed = datetime.strptime(accessible, format_string)
+                    parsed = parsed.replace(
+                        tzinfo=datetime.now().astimezone().tzinfo
+                    )
+                    minute_precision = True
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
+    received = parsed.timestamp()
+    if minute_precision and end_of_precision:
+        received += 59.999999
+    return received
 
 
 _URL_RE = re.compile(r"https://[^\s\"'<>]+", re.IGNORECASE)
+_CODE_URL_RE = re.compile(
+    r"(?:https?://|www\.)[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_CODE_LABEL = r"(?:verification|login|sign[ -]?in)\s+code"
 _CODE_PATTERNS = (
     re.compile(
-        r"(?:verification|login|sign[ -]?in)\s+code\D{0,24}(?<!\d)(\d{4,10})(?!\d)",
+        rf"\b{_CODE_LABEL}\b(?:\s+(?:is\s+)?|\s*[:=-]\s*)"
+        r"(?<![0-9])([0-9]{4,10})(?![0-9])",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?<!\d)(\d{4,10})(?!\d)\D{0,24}(?:verification|login|sign[ -]?in)\s+code",
+        rf"(?<![0-9])([0-9]{{4,10}})(?![0-9])\s+"
+        rf"(?:is\s+)?(?:your\s+)?"
+        rf"{_CODE_LABEL}\b",
         re.IGNORECASE,
     ),
 )
+_REJECTED_CODE_PREFIX = re.compile(
+    r"\b(?:account[- ]+ending|date|expir(?:ed|es?|y|ation)|reference|phone|order)"
+    r"[\s:=-]*$",
+    re.IGNORECASE,
+)
+_RAW_CODE_RE = re.compile(r"[0-9]{4,10}")
 
 
 def validate_claude_platform_magic_link(candidate, allow_safelink=True):
     value = unescape(str(candidate or "")).rstrip(".,);]")
+    if re.search(r"[\x00-\x1f\x7f]", value):
+        return ""
     try:
         parsed = urlparse(value)
         port = parsed.port
@@ -125,13 +163,53 @@ def validate_claude_platform_magic_link(candidate, allow_safelink=True):
     return ""
 
 
+def validate_claude_platform_code(candidate):
+    value = str(candidate or "").strip()
+    return value if _RAW_CODE_RE.fullmatch(value) else ""
+
+
 def _verification_code(subject, body):
     text = " ".join((visible_text(subject), visible_text(body)))
+    text = _CODE_URL_RE.sub(" ", text)
     for pattern in _CODE_PATTERNS:
-        match = pattern.search(text)
-        if match:
+        for match in pattern.finditer(text):
+            prefix = text[max(0, match.start() - 40):match.start()]
+            if _REJECTED_CODE_PREFIX.search(prefix):
+                continue
             return match.group(1)
     return ""
+
+
+def validate_claude_platform_verification(
+    magic_link,
+    code,
+    received_at,
+    received_after=None,
+):
+    received = _received_epoch(received_at)
+    if received is None:
+        return None
+    if received_after is not None:
+        try:
+            baseline = float(received_after)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(baseline) or baseline < 0:
+            return None
+        received_latest = _received_epoch(
+            received_at, end_of_precision=True
+        )
+        if received_latest < baseline - 5:
+            return None
+    link = validate_claude_platform_magic_link(magic_link)
+    numeric_code = validate_claude_platform_code(code)
+    if not link and not numeric_code:
+        return None
+    return ClaudePlatformVerification(
+        magic_link=link,
+        code=numeric_code,
+        received_at=received,
+    )
 
 
 def extract_claude_platform_verification(messages, received_after=None):
@@ -141,8 +219,12 @@ def extract_claude_platform_verification(messages, received_after=None):
         if not any(key in identity for key in ("anthropic", "claude")):
             continue
         received = _received_epoch(message.received)
+        received_latest = _received_epoch(
+            message.received, end_of_precision=True
+        )
         if received_after is not None and (
-            received is None or received < received_after - 5
+            received_latest is None
+            or received_latest < received_after - 5
         ):
             continue
         candidates.append((received or 0.0, message))
@@ -235,6 +317,7 @@ async def _scan_claude_platform_folder(
     page,
     received_after=None,
     deadline=None,
+    seen_ids=None,
 ):
     candidates = await page.evaluate("""
         () => {
@@ -249,14 +332,22 @@ async def _scan_claude_platform_folder(
                 const visible = style.display !== 'none' &&
                     style.visibility !== 'hidden' &&
                     rect.width > 0 && rect.height > 0;
-                const time = item.querySelector('time[datetime]');
+                const time = item.querySelector(
+                    'time, [data-testid*="time"], [data-testid*="date"]'
+                );
                 const received = (time && time.getAttribute('datetime')) ||
                     item.getAttribute('data-received') ||
                     item.getAttribute('data-timestamp') ||
-                    item.getAttribute('data-time') || '';
-                const stableId = item.getAttribute('data-convid') ||
-                    item.getAttribute('data-item-id') ||
-                    item.getAttribute('data-id') || item.id || String(index);
+                    item.getAttribute('data-time') ||
+                    (time && time.getAttribute('aria-label')) ||
+                    (time && time.getAttribute('title')) ||
+                    (time && time.textContent) || '';
+                const messageId = item.getAttribute('data-item-id') ||
+                    item.getAttribute('data-id') || item.id;
+                const conversationId = item.getAttribute('data-convid');
+                const stableId = messageId || (conversationId
+                    ? `${conversationId}|${received}|${text.trim()}`
+                    : `${received}|${text.trim()}`);
                 return {index, visible, received, stable_id: stableId};
             }).filter(Boolean);
         }
@@ -271,59 +362,112 @@ async def _scan_claude_platform_folder(
     if not visible:
         return None
 
-    timestamped = []
+    inspected = seen_ids if seen_ids is not None else set()
+    eligible = []
     for item in visible:
+        stable_id = str(item.get("stable_id") or "")
+        if stable_id in inspected:
+            continue
         received_epoch = _received_epoch(item.get("received"))
-        if received_epoch is not None:
-            timestamped.append((received_epoch, item))
-    if len(timestamped) == len(visible):
-        _received, selected = max(
-            timestamped,
-            key=lambda item: (
-                item[0],
-                -int(item[1].get("index") or 0),
-            ),
+        received_latest = _received_epoch(
+            item.get("received"), end_of_precision=True
         )
-        received = str(selected.get("received") or "")
-    else:
-        selected = min(
-            visible,
-            key=lambda item: int(item.get("index") or 0),
-        )
-        if _received_epoch(selected.get("received")) is None:
+        if received_epoch is None:
             if received_after is not None:
-                return None
-            received = "1970-01-01T00:00:00+00:00"
-        else:
-            received = str(selected.get("received") or "")
+                continue
+        elif (
+            received_after is not None
+            and received_latest < float(received_after) - 5
+        ):
+            continue
+        eligible.append((received_epoch, item))
+    if not eligible:
+        return None
+    if all(entry[0] is not None for entry in eligible):
+        eligible.sort(
+            key=lambda entry: (
+                -(entry[0] or 0.0),
+                int(entry[1].get("index") or 0),
+            )
+        )
+    else:
+        eligible.sort(key=lambda entry: int(entry[1].get("index") or 0))
 
-    opened = await page.evaluate(
-        """(index) => {
+    from common.mailbox import _async_sleep_bounded
+
+    for received_epoch, selected in eligible:
+        selection = {
+            "stable_id": str(selected.get("stable_id") or ""),
+            "index": int(selected.get("index") or 0),
+        }
+        opened = await page.evaluate(
+            """(selection) => {
             const items = Array.from(
                 document.querySelectorAll('[role="option"], [role="listitem"]')
             );
-            const item = items[index];
+            const identify = (item) => {
+                const text = (item.textContent || '').toLowerCase();
+                const time = item.querySelector(
+                    'time, [data-testid*="time"], [data-testid*="date"]'
+                );
+                const received = (time && time.getAttribute('datetime')) ||
+                    item.getAttribute('data-received') ||
+                    item.getAttribute('data-timestamp') ||
+                    item.getAttribute('data-time') ||
+                    (time && time.getAttribute('aria-label')) ||
+                    (time && time.getAttribute('title')) ||
+                    (time && time.textContent) || '';
+                const messageId = item.getAttribute('data-item-id') ||
+                    item.getAttribute('data-id') || item.id;
+                const conversationId = item.getAttribute('data-convid');
+                const stableId = messageId || (conversationId
+                    ? `${conversationId}|${received}|${text.trim()}`
+                    : `${received}|${text.trim()}`);
+                return {text, received, stable_id: stableId};
+            };
+            const item = items.find(
+                candidate => identify(candidate).stable_id === selection.stable_id
+            );
             if (!item) return false;
-            const text = (item.textContent || '').toLowerCase();
+            const current = identify(item);
             const style = window.getComputedStyle(item);
             const rect = item.getBoundingClientRect();
-            if ((!text.includes('anthropic') && !text.includes('claude')) ||
+            if ((!current.text.includes('anthropic') &&
+                !current.text.includes('claude')) ||
                 style.display === 'none' || style.visibility === 'hidden' ||
                 rect.width <= 0 || rect.height <= 0) return false;
             item.click();
-            return true;
+            return {
+                stable_id: current.stable_id,
+                received: current.received,
+            };
         }""",
-        int(selected.get("index") or 0),
-    )
-    if not opened:
-        return None
-    from common.mailbox import _async_sleep_bounded
-
-    if not await _async_sleep_bounded(2, deadline):
-        return None
-    payload = await page.evaluate("""
+            selection,
+        )
+        if (
+            not isinstance(opened, dict)
+            or str(opened.get("stable_id") or "") != selection["stable_id"]
+        ):
+            continue
+        inspected.add(selection["stable_id"])
+        clicked_received = str(opened.get("received") or "")
+        clicked_epoch = _received_epoch(clicked_received)
+        clicked_latest = _received_epoch(
+            clicked_received, end_of_precision=True
+        )
+        if received_after is not None and (
+            clicked_latest is None
+            or clicked_latest < float(received_after) - 5
+        ):
+            continue
+        if not await _async_sleep_bounded(2, deadline):
+            return None
+        payload = await page.evaluate("""
         () => {
-            const pane = document.querySelector('[role="main"]') || document.body;
+            const pane = document.querySelector(
+                '[aria-label="Reading Pane"], [data-app-section="ReadingPane"], '
+                + '[data-testid="reading-pane"], [role="main"]'
+            ) || document.body;
             const links = Array.from(pane.querySelectorAll('a[href^="https://"]'))
                 .map(a => a.href).join(' ');
             return {
@@ -331,19 +475,37 @@ async def _scan_claude_platform_folder(
                 body: `${pane.innerText || ''} ${links}`,
             };
         }
-    """)
-    if not isinstance(payload, dict):
-        return None
-    message = ClaudePlatformMessage(
-        sender="claude",
-        subject=str(payload.get("subject") or ""),
-        received=received,
-        body=str(payload.get("body") or ""),
-    )
-    return extract_claude_platform_verification(
-        [message],
-        received_after=received_after,
-    )
+        """)
+        if not isinstance(payload, dict):
+            continue
+        received = (
+            clicked_received
+            if clicked_epoch is not None
+            else "1970-01-01T00:00:00+00:00"
+        )
+        message = ClaudePlatformMessage(
+            sender="claude",
+            subject=str(payload.get("subject") or ""),
+            received=received,
+            body=str(payload.get("body") or ""),
+        )
+        result = extract_claude_platform_verification(
+            [message],
+            received_after=received_after,
+        )
+        if result:
+            # Keep minute-only freshness intact after numeric broker JSON.
+            if (
+                clicked_latest is not None
+                and clicked_latest > result.received_at
+            ):
+                return ClaudePlatformVerification(
+                    magic_link=result.magic_link,
+                    code=result.code,
+                    received_at=clicked_latest,
+                )
+            return result
+    return None
 
 
 async def get_claude_platform_verification_outlook_pw(
@@ -388,6 +550,7 @@ async def get_claude_platform_verification_outlook_pw(
         )
     except asyncio.TimeoutError:
         return None
+    seen_ids = set()
     while time.monotonic() < deadline:
         for names in (INBOX_NAMES, JUNK_NAMES):
             remaining = deadline - time.monotonic()
@@ -411,6 +574,7 @@ async def get_claude_platform_verification_outlook_pw(
                         page,
                         received_after=received_after,
                         deadline=deadline,
+                        seen_ids=seen_ids,
                     ),
                     timeout=remaining,
                 )
@@ -427,9 +591,16 @@ async def fetch_claude_platform_from_broker(
     email,
     password,
     max_wait=120,
+    received_after=None,
 ):
     base = os.environ.get("MAILBOX_BROKER")
     if not base:
+        return None
+    try:
+        wait_budget = float(max_wait)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(wait_budget) or wait_budget <= 0:
         return None
     payload = {
         "email": email,
@@ -439,33 +610,30 @@ async def fetch_claude_platform_from_broker(
         "regex": "",
         "kind": "claude_platform",
         "timeout": max_wait,
+        "received_after": received_after,
     }
-    timeout = aiohttp.ClientTimeout(total=max_wait + 60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            base.rstrip("/") + "/fetch",
-            json=payload,
-        ) as response:
-            if not 200 <= int(response.status) < 300:
-                return None
-            data = await response.json()
+    timeout = aiohttp.ClientTimeout(total=wait_budget)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                base.rstrip("/") + "/fetch",
+                json=payload,
+            ) as response:
+                if not 200 <= int(response.status) < 300:
+                    return None
+                data = await response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
     if not isinstance(data, dict) or data.get("ok") is not True:
         return None
     value = data.get("value")
     if not isinstance(value, dict):
         return None
-    magic_link = str(value.get("magic_link") or "")
-    code = str(value.get("code") or "")
-    if not magic_link and not code:
-        return None
-    try:
-        received_at = float(value.get("received_at") or 0.0)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not math.isfinite(received_at):
-        return None
-    return ClaudePlatformVerification(
-        magic_link=magic_link,
-        code=code,
-        received_at=received_at,
+    return validate_claude_platform_verification(
+        value.get("magic_link"),
+        value.get("code"),
+        value.get("received_at"),
+        received_after=received_after,
     )
