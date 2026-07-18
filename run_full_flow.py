@@ -46,7 +46,7 @@ try:
 except Exception:
     pass
 
-from common.account_proxy import lease_to_env
+from common.account_proxy import lease_to_env, strip_http_proxy_env
 from common.ipmart_proxy import (
     IPMartProxyError,
     acquire_proxy,
@@ -216,6 +216,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             log(f"IPMart proxy acquisition failed: {exc}", "ERR")
             return 1, ""
         round_env.update(lease_to_env(account_lease))
+        strip_http_proxy_env(round_env)
         log(
             "IPMart proxy reserved for this account: "
             f"{account_lease.host}:{account_lease.port} "

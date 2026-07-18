@@ -35,8 +35,7 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
     def setUp(self):
         self.lease = ProxyLease(
             "http", "gateway.example", 8080,
-            "account-res-US-sid-00000042", "proxy-secret",
-            "00000042", "203.0.113.8",
+            "account-res-US-sid-00000042", "proxy-secret", "00000042", "203.0.113.8",
         )
         self.base_env = {
             "IPMART_ENABLED": "1",
@@ -44,6 +43,9 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
             "IPMART_PROXY_PORT": "8080",
             "IPMART_PROXY_USERNAME_TEMPLATE": "account-res-US-sid-{sid}",
             "IPMART_PROXY_PASSWORD": "proxy-secret",
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "CLASH_PROXY": "http://127.0.0.1:7897",
         }
 
     def test_one_lease_reaches_both_stages_and_is_rechecked(self):
@@ -78,20 +80,11 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
         self.assertEqual((rc, email), (0, "a@outlook.com"))
         self.assertEqual(len(captured), 2)
         self.assertEqual(captured[0], captured[1])
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_SOURCE"], "ipmart")
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_HOST"], "gateway.example")
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_PORT"], "8080")
-        self.assertEqual(
-            captured[0]["ACCOUNT_PROXY_USERNAME"],
-            "account-res-US-sid-00000042",
-        )
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_PASSWORD"], "proxy-secret")
+        self.assertNotIn("HTTP_PROXY", captured[0])
+        self.assertNotIn("HTTPS_PROXY", captured[0])
         self.assertEqual(captured[0]["ACCOUNT_PROXY_SID"], "00000042")
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_EXIT_IP"], "203.0.113.8")
-        self.assertEqual(
-            verify_calls,
-            [(self.lease, "203.0.113.8")],
-        )
+        self.assertEqual(captured[0]["ACCOUNT_PROXY_PASSWORD"], "proxy-secret")
+        self.assertEqual(verify_calls, [(self.lease, "203.0.113.8")])
 
     def test_changed_exit_aborts_before_platform_stage(self):
         with patch.object(
@@ -124,22 +117,22 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
         self.assertEqual((rc, email), (1, ""))
         email_stage.assert_not_called()
 
-    def test_dry_run_does_not_consume_ipmart_allocation(self):
+    def test_dry_run_does_not_generate_a_sid_or_probe(self):
         with patch.object(
             run_full_flow,
             "stage_email",
             return_value=("dry-run@outlook.com", "Pass1!", "", ""),
-        ), patch.object(
-            run_full_flow, "stage_platforms", return_value=0
-        ):
+        ), patch.object(run_full_flow, "stage_platforms", return_value=0):
             rc, _email = run_full_flow.run_once(
                 args_for_test(dry_run=True),
                 self.base_env,
                 acquire=lambda **_kwargs: self.fail(
-                    "dry-run consumed an IPMart allocation"
+                    "dry-run consumed IPMart acquisition"
+                ),
+                verify=lambda **_kwargs: self.fail(
+                    "dry-run consumed IPMart verification"
                 ),
             )
-
         self.assertEqual(rc, 0)
 
 

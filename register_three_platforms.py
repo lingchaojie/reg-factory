@@ -21,6 +21,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 from common import emails as email_pool
+from common.account_proxy import strip_account_proxy_env, strip_http_proxy_env
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +165,20 @@ def child_env_for(args):
     return env
 
 
+def platform_child_env(platform, base_env):
+    env = dict(base_env)
+    if platform == "claude" and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
+        strip_http_proxy_env(env)
+        return env
+    if platform in {"chatgpt", "grok"}:
+        strip_account_proxy_env(env)
+        clash_proxy = (env.get("CLASH_PROXY") or "").strip()
+        if clash_proxy:
+            env["HTTP_PROXY"] = env["HTTPS_PROXY"] = clash_proxy
+            env["http_proxy"] = env["https_proxy"] = clash_proxy
+    return env
+
+
 async def process_account(account, args, child_env):
     email = account[0]
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + email.split("@")[0][:8]
@@ -173,11 +188,19 @@ async def process_account(account, args, child_env):
 
     jobs = [(p, build_command(p, args, account)) for p in args.platforms]
     if args.parallel:
-        results = await asyncio.gather(*(run_platform(p, cmd, run_id, child_env) for p, cmd in jobs))
+        results = await asyncio.gather(*(
+            run_platform(p, cmd, run_id, platform_child_env(p, child_env))
+            for p, cmd in jobs
+        ))
     else:
         results = []
         for platform, cmd in jobs:
-            results.append(await run_platform(platform, cmd, run_id, child_env))
+            results.append(await run_platform(
+                platform,
+                cmd,
+                run_id,
+                platform_child_env(platform, child_env),
+            ))
 
     broker_release(args.broker, email)   # 释放该号 Outlook 会话
     print(f"\n  Summary [{email}]")
