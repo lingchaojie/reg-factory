@@ -11,7 +11,9 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 """
 import asyncio
 import contextlib
+import html
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +47,7 @@ from common.network_route import (  # noqa: E402
     RESOLVED_ROUTE_ENV_KEY,
     prepare_clash_or_direct,
 )
+from nexacard_otp.gmail_auth import OAuthCoordinator, get_auth_status  # noqa: E402
 
 
 def _ensure_proxy_env():
@@ -60,6 +63,7 @@ def _ensure_proxy_env():
 
 
 app = FastAPI(title="reg-factory WebUI")
+NEXACARD_OAUTH = OAuthCoordinator()
 
 # 运行中的任务：run_id -> {proc, lines:[], done:bool, script, cmd, started}
 RUNS = {}
@@ -703,6 +707,55 @@ def api_sms_rents():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return open(os.path.join(WEBUI, "static", "index.html"), encoding="utf-8").read()
+
+
+def _safe_oauth_error(exc: Exception) -> str:
+    """Keep unexpected OAuth provider errors, especially token-bearing ones, out of responses."""
+    message = str(exc).strip()
+    if not message or re.search(r"(?i)\b(?:access|refresh|id)?[_ -]?token\b\s*[=:]", message):
+        return "Google authorization could not be completed safely"
+    return message
+
+
+@app.post("/api/nexacard/oauth/start")
+async def nexacard_oauth_start(request: Request):
+    data = await request.json()
+    email = str(data.get("email") or "").strip()
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/nexacard/oauth/callback"
+    try:
+        authorization_url = NEXACARD_OAUTH.start(email, redirect_uri)
+    except (ValueError, FileNotFoundError) as exc:
+        return {"ok": False, "error": _safe_oauth_error(exc)}
+    except Exception:
+        return {"ok": False, "error": "Google authorization could not be started safely"}
+    return {"ok": True, "authorization_url": authorization_url}
+
+
+@app.get("/api/nexacard/oauth/callback", response_class=HTMLResponse)
+async def nexacard_oauth_callback(request: Request):
+    state = request.query_params.get("state", "")
+    try:
+        status = await asyncio.to_thread(NEXACARD_OAUTH.complete, state, str(request.url))
+    except Exception as exc:
+        message = html.escape(_safe_oauth_error(exc))
+        return HTMLResponse(f"<h2>Google 鉴权失败</h2><p>{message}</p>", status_code=400)
+    email = html.escape(status.authorized_email or "")
+    return HTMLResponse(f"<h2>Google 鉴权成功</h2><p>{email}</p>")
+
+
+@app.get("/api/nexacard/oauth/status")
+async def nexacard_oauth_status(email: str = ""):
+    try:
+        status = await asyncio.to_thread(get_auth_status, email.strip().lower())
+    except Exception:
+        return {"state": "unknown", "message": "Gmail authorization status is temporarily unavailable", "authorized_email": None, "estimated_expires_at": None, "estimated": False}
+    return {
+        "state": status.state,
+        "message": status.message,
+        "authorized_email": status.authorized_email,
+        "estimated_expires_at": status.estimated_expires_at.isoformat() if status.estimated_expires_at else None,
+        "estimated": status.estimated,
+    }
 
 
 @app.get("/api/status")

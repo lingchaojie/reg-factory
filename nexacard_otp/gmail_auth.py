@@ -1,18 +1,26 @@
 import json
 import os
 import tempfile
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_oauthlib.flow import Flow
 
 from .errors import GmailAuthorizationRequired, GmailTemporarilyUnavailable
 from .models import AuthStatus
-from .settings import PRIVATE_TOKEN_META_PATH, PRIVATE_TOKEN_PATH, ensure_private_oauth_files
+from .settings import (
+    PRIVATE_CREDENTIALS_PATH,
+    PRIVATE_TOKEN_META_PATH,
+    PRIVATE_TOKEN_PATH,
+    ensure_private_oauth_files,
+)
 
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -21,8 +29,89 @@ _META_KEYS = {
     "authorized_at",
     "estimated_expires_at",
     "estimated",
-    "refresh_token_expires_in",
 }
+
+
+class OAuthCoordinator:
+    """Coordinate one-time desktop Google OAuth authorization attempts."""
+
+    pending_ttl = timedelta(minutes=10)
+
+    def __init__(self) -> None:
+        self.pending: dict[str, tuple[object, ...]] = {}
+
+    def start(self, email: str, redirect_uri: str) -> str:
+        normalized = email.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("a valid verification email is required")
+
+        ensure_private_oauth_files()
+        flow = Flow.from_client_secrets_file(str(PRIVATE_CREDENTIALS_PATH), scopes=SCOPES)
+        flow.redirect_uri = redirect_uri
+        requested_state = secrets.token_urlsafe(32)
+        authorization_url, returned_state = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            login_hint=normalized,
+            include_granted_scopes="true",
+            state=requested_state,
+        )
+        self.pending[returned_state] = (normalized, flow, datetime.now(timezone.utc))
+        return authorization_url
+
+    def complete(self, state: str, authorization_response: str) -> AuthStatus:
+        pending = self.pending.pop(state, None)
+        if pending is None:
+            raise ValueError("OAuth state is missing or expired")
+
+        expected_email, flow, created_at = self._pending_values(pending)
+        if datetime.now(timezone.utc) - created_at > self.pending_ttl:
+            raise ValueError("OAuth state is missing or expired")
+        returned_states = parse_qs(urlparse(authorization_response).query).get("state", [])
+        if returned_states != [state]:
+            raise ValueError("OAuth state does not match the authorization response")
+
+        flow.fetch_token(authorization_response=authorization_response)
+        profile = build("gmail", "v1", credentials=flow.credentials, cache_discovery=False)
+        authorized_email = str(profile.users().getProfile(userId="me").execute()["emailAddress"]).strip().lower()
+        if authorized_email != expected_email:
+            raise ValueError("authorized Gmail address does not match the configured verification email")
+
+        now = datetime.now(timezone.utc)
+        expires_at, estimated = self._refresh_expiry(flow, now)
+        atomic_write_text(PRIVATE_TOKEN_PATH, flow.credentials.to_json())
+        atomic_write_text(
+            PRIVATE_TOKEN_META_PATH,
+            json.dumps(
+                {
+                    "authorized_email": authorized_email,
+                    "authorized_at": now.isoformat(),
+                    "estimated_expires_at": expires_at.isoformat(),
+                    "estimated": estimated,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        return AuthStatus("valid", "Google authorization completed", authorized_email, expires_at, estimated)
+
+    @staticmethod
+    def _pending_values(pending: tuple[object, ...]) -> tuple[str, Flow, datetime]:
+        """Accept legacy test/setup entries while recording timestamps for new attempts."""
+        expected_email, flow = pending[:2]
+        created_at = pending[2] if len(pending) == 3 else datetime.now(timezone.utc)
+        return str(expected_email), flow, created_at  # type: ignore[return-value]
+
+    @staticmethod
+    def _refresh_expiry(flow: Flow, now: datetime) -> tuple[datetime, bool]:
+        remaining = getattr(flow.oauth2session, "token", {}).get("refresh_token_expires_in")
+        try:
+            seconds = int(remaining)
+            if seconds < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return now + timedelta(days=7), True
+        return now + timedelta(seconds=seconds), False
 
 
 def atomic_write_text(path: Path, text: str) -> None:
