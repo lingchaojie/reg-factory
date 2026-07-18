@@ -10,6 +10,7 @@ import time
 from playwright.async_api import async_playwright
 
 from bitbrowser import BitBrowser
+from common import proxy_switch
 from common.account_proxy import (
     bitbrowser_proxy_fields,
     lease_from_env,
@@ -40,6 +41,13 @@ from config import (
 
 
 PLATFORM_URL = "https://platform.claude.com/"
+EMERGENCY_TIMEOUT_CUSHION = 5.0
+_CLAUDE_CHALLENGE_MARKERS = (
+    "app-unavailable-in-region",
+    "unavailable in your",
+    "just a moment",
+    "performing security",
+)
 
 
 class ClaudeApiRegistrationError(RuntimeError):
@@ -48,7 +56,7 @@ class ClaudeApiRegistrationError(RuntimeError):
         self.code = code
 
 
-async def apply_verification_artifact(page, artifact):
+async def apply_verification_artifact(page, artifact, navigation_timeout=60000):
     try:
         code_input = page.locator('[data-testid="code"]')
         code_visible = (
@@ -67,7 +75,7 @@ async def apply_verification_artifact(page, artifact):
             magic_link = validate_claude_platform_magic_link(artifact.magic_link)
             if not magic_link:
                 raise ClaudeApiRegistrationError("verification_rejected")
-            await page.goto(magic_link, timeout=60000)
+            await page.goto(magic_link, timeout=navigation_timeout)
             return "magic_link"
 
         if artifact.code:
@@ -158,33 +166,86 @@ async def _verification_rejected(page):
     return False
 
 
-async def _wait_for_post_verification_state(page, method, timeout):
-    deadline = time.monotonic() + max(0.0, float(timeout))
+def _clock():
+    return time.monotonic()
+
+
+def _remaining(deadline):
+    return max(0.0, deadline - _clock())
+
+
+def _close_unawaited(awaitable):
+    close = getattr(awaitable, "close", None)
+    if close is not None:
+        close()
+
+
+async def _await_by_deadline(awaitable, deadline):
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        _close_unawaited(awaitable)
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
+def _navigation_timeout(deadline):
+    return max(1, min(60000, int(_remaining(deadline) * 1000)))
+
+
+async def _raise_post_verification_timeout(page, method):
+    if method == "code":
+        try:
+            code_input = page.locator('[data-testid="code"]')
+            if await code_input.count() == 1 and await code_input.is_visible():
+                raise ClaudeApiRegistrationError("verification_rejected")
+        except ClaudeApiRegistrationError:
+            raise
+        except Exception:
+            pass
+    raise ClaudeApiRegistrationError("console_not_reached")
+
+
+async def _wait_for_post_verification_state(
+    page,
+    method,
+    timeout=None,
+    *,
+    deadline=None,
+):
+    if deadline is None:
+        deadline = _clock() + max(0.0, float(timeout or 0.0))
     personal_selected = False
     while True:
-        if await is_console_ready(page):
+        if _remaining(deadline) <= 0:
+            await _raise_post_verification_timeout(page, method)
+        try:
+            console_ready = await _await_by_deadline(
+                is_console_ready(page), deadline
+            )
+        except asyncio.TimeoutError:
+            await _raise_post_verification_timeout(page, method)
+        if console_ready:
             return
-        if await _verification_rejected(page):
+        try:
+            rejected = await _await_by_deadline(
+                _verification_rejected(page), deadline
+            )
+        except asyncio.TimeoutError:
+            await _raise_post_verification_timeout(page, method)
+        if rejected:
             raise ClaudeApiRegistrationError("verification_rejected")
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            code_input = page.locator('[data-testid="code"]')
-            code_still_visible = (
-                method == "code"
-                and await code_input.count() == 1
-                and await code_input.is_visible()
-            )
-            if code_still_visible:
-                raise ClaudeApiRegistrationError("verification_rejected")
-            raise ClaudeApiRegistrationError("console_not_reached")
-
         if not personal_selected:
-            personal_selected = await select_personal_account(page)
+            try:
+                personal_selected = await _await_by_deadline(
+                    select_personal_account(page), deadline
+                )
+            except asyncio.TimeoutError:
+                await _raise_post_verification_timeout(page, method)
 
-        remaining = deadline - time.monotonic()
+        remaining = _remaining(deadline)
         if remaining <= 0:
-            raise ClaudeApiRegistrationError("console_not_reached")
+            await _raise_post_verification_timeout(page, method)
         await asyncio.sleep(min(0.05, remaining))
 
 
@@ -196,8 +257,13 @@ async def run_claude_platform_flow(
     max_wait,
     output_dir="cookies/claude_api",
 ):
-    try:
-        await page.goto(PLATFORM_URL, timeout=60000)
+    deadline = _clock() + max(0.0, float(max_wait))
+
+    async def start_registration():
+        await page.goto(
+            PLATFORM_URL,
+            timeout=_navigation_timeout(deadline),
+        )
         email = page.locator('[data-testid="email"]')
         submit = page.locator('button[data-testid="continue"]')
         if await email.count() != 1 or await submit.count() != 1:
@@ -205,30 +271,40 @@ async def run_claude_platform_flow(
         await email.fill(account.email)
         requested_at = time.time()
         await submit.click()
+        return requested_at
+
+    try:
+        requested_at = await _await_by_deadline(
+            start_registration(), deadline
+        )
     except ClaudeApiRegistrationError:
         raise
     except Exception:
         raise ClaudeApiRegistrationError("registration_error") from None
 
-    try:
-        artifact = await fetch_verification(
-            context,
-            account,
-            max_wait,
-            requested_at,
-        )
-        if artifact is None:
-            resend = page.get_by_role("button", name="Resend email", exact=True)
-            if await resend.count() != 1:
-                raise ClaudeApiRegistrationError("mail_timeout")
-            requested_at = time.time()
-            await resend.click()
-            artifact = await fetch_verification(
+    async def fetch_artifact(received_after):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await _await_by_deadline(
+            fetch_verification(
                 context,
                 account,
-                max_wait,
-                requested_at,
-            )
+                remaining,
+                received_after,
+            ),
+            deadline,
+        )
+
+    try:
+        artifact = await fetch_artifact(requested_at)
+        if artifact is None:
+            resend = page.get_by_role("button", name="Resend email", exact=True)
+            if await _await_by_deadline(resend.count(), deadline) != 1:
+                raise ClaudeApiRegistrationError("mail_timeout")
+            requested_at = time.time()
+            await _await_by_deadline(resend.click(), deadline)
+            artifact = await fetch_artifact(requested_at)
         if artifact is None:
             raise ClaudeApiRegistrationError("verification_artifact_not_found")
     except ClaudeApiRegistrationError:
@@ -237,18 +313,32 @@ async def run_claude_platform_flow(
         raise ClaudeApiRegistrationError("mail_timeout") from None
 
     try:
-        method = await apply_verification_artifact(page, artifact)
-        await _wait_for_post_verification_state(page, method, max_wait)
+        method = await _await_by_deadline(
+            apply_verification_artifact(
+                page,
+                artifact,
+                navigation_timeout=_navigation_timeout(deadline),
+            ),
+            deadline,
+        )
+        await _wait_for_post_verification_state(
+            page,
+            method,
+            deadline=deadline,
+        )
     except ClaudeApiRegistrationError:
         raise
     except Exception:
         raise ClaudeApiRegistrationError("console_not_reached") from None
 
     try:
-        return await save_claude_platform_session(
-            context,
-            account.email,
-            output_dir,
+        return await _await_by_deadline(
+            save_claude_platform_session(
+                context,
+                account.email,
+                output_dir,
+            ),
+            deadline,
         )
     except ClaudeApiRegistrationError:
         raise
@@ -351,18 +441,47 @@ def log_flow_error(code, error=None, *, account=None):
     print(value)
 
 
+async def _cleanup_registration_resources(bb, browser, profile_id):
+    cleanup_cancelled = None
+    if browser is not None:
+        try:
+            await browser.close()
+        except asyncio.CancelledError as exc:
+            cleanup_cancelled = exc
+        except BaseException as exc:
+            log_flow_error("browser_cleanup_failed", exc)
+    if profile_id is not None:
+        try:
+            bb.close_browser(profile_id)
+        except BaseException as exc:
+            log_flow_error("profile_close_failed", exc)
+        try:
+            bb.delete_browser(profile_id)
+        except BaseException as exc:
+            log_flow_error("profile_delete_failed", exc)
+    return cleanup_cancelled
+
+
 async def register_one(
     bb,
     account,
     account_store,
     timeout,
     account_lease=None,
+    browser_proxy_fields=None,
 ):
     profile_id = None
     browser = None
+    cookie_path = None
+    error_code = None
+    escaped = None
+    cancelled = None
+    release_on_error = False
     try:
         proxy_fields = (
-            bitbrowser_proxy_fields(account_lease) if account_lease else {}
+            bitbrowser_proxy_fields(account_lease)
+            if account_lease
+            else dict(browser_proxy_fields or {})
         )
         profile_id = bb.create_browser(
             name=f"claude_api_{int(time.time())}",
@@ -382,37 +501,79 @@ async def register_one(
                         fetch_platform_verification,
                         account_lease=account_lease,
                     ),
-                    max_wait=min(120, timeout),
+                    max_wait=timeout,
                 ),
-                timeout=timeout,
+                timeout=float(timeout) + EMERGENCY_TIMEOUT_CUSHION,
             )
+    except asyncio.TimeoutError:
+        error_code = "timeout"
+    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
+        error_code = exc.code
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+    except BaseException as exc:
+        escaped = exc
+        if profile_id is None:
+            release_on_error = True
+        else:
+            error_code = "registration_error"
+
+    cleanup_cancelled = await _cleanup_registration_resources(
+        bb, browser, profile_id
+    )
+    if cancelled is not None or cleanup_cancelled is not None:
+        account_store.release(account)
+        raise cancelled or cleanup_cancelled
+    if cookie_path is not None:
         account_store.mark_used(account)
         return cookie_path
-    except asyncio.TimeoutError:
-        account_store.mark_error(account, "timeout")
-        return None
-    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
-        account_store.mark_error(account, exc.code)
-        return None
-    except asyncio.CancelledError:
+    if release_on_error:
         account_store.release(account)
-        raise
-    except BaseException:
-        if profile_id is None:
-            account_store.release(account)
-        else:
-            account_store.mark_error(account, "registration_error")
-        raise
-    finally:
-        try:
-            if browser is not None:
-                await browser.close()
-        finally:
-            if profile_id is not None:
-                try:
-                    bb.close_browser(profile_id)
-                finally:
-                    bb.delete_browser(profile_id)
+    elif error_code is not None:
+        account_store.mark_error(account, error_code)
+    if escaped is not None:
+        raise escaped
+    return None
+
+
+def _proxy_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "--proxy-port must be between 1 and 65535"
+        ) from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            "--proxy-port must be between 1 and 65535"
+        )
+    return port
+
+
+def _configure_clash_proxy(node, port, *, account_lease, ipmart_enabled):
+    if account_lease is not None or ipmart_enabled:
+        return {}
+    selected = str(node or "none").strip()
+    if not selected or selected.lower() == "none":
+        return {}
+    if selected.lower() == "auto":
+        candidates = proxy_switch.concrete_nodes()
+        selected = proxy_switch.find_working_node(
+            test_url=PLATFORM_URL,
+            challenge_markers=_CLAUDE_CHALLENGE_MARKERS,
+            candidates=candidates,
+            verbose=False,
+        )
+        if not selected:
+            raise RuntimeError("clash_node_unavailable")
+    else:
+        proxy_switch.set_node(selected)
+    return {
+        "proxyMethod": 2,
+        "proxyType": "http",
+        "host": "127.0.0.1",
+        "port": str(port),
+    }
 
 
 def _build_parser():
@@ -428,7 +589,7 @@ def _build_parser():
     parser.add_argument("--token", default="")
     parser.add_argument("--client-id", default="")
     parser.add_argument("--node", default="none")
-    parser.add_argument("--proxy-port", default="7897")
+    parser.add_argument("--proxy-port", type=_proxy_port, default=7897)
     return parser
 
 
@@ -474,11 +635,18 @@ async def main():
     accounts, account_store = _prepare_accounts(args, provider)
     inherited_lease = None
     ipmart_settings = None
+    browser_proxy_fields = {}
     try:
         inherited_lease = lease_from_env()
         ipmart_settings = settings_from_env()
         if inherited_lease is not None or ipmart_settings.enabled:
             strip_http_proxy_env(os.environ)
+        browser_proxy_fields = _configure_clash_proxy(
+            args.node,
+            args.proxy_port,
+            account_lease=inherited_lease,
+            ipmart_enabled=ipmart_settings.enabled,
+        )
         bb = BitBrowser()
     except BaseException as exc:
         for selected in accounts:
@@ -488,48 +656,69 @@ async def main():
         return 1
 
     semaphore = asyncio.Semaphore(args.concurrency)
+    ownership = [
+        {"handed_to_register": False, "released": False}
+        for _selected in accounts
+    ]
 
-    async def run_selected(selected):
-        async with semaphore:
-            account_lease = inherited_lease
-            if account_lease is None and ipmart_settings.enabled:
-                try:
-                    account_lease = await asyncio.to_thread(acquire_proxy)
-                except IPMartProxyError as exc:
-                    account_store.release(selected)
-                    log_flow_error("proxy_unavailable", exc, account=selected)
-                    return None
-                except BaseException as exc:
-                    account_store.release(selected)
-                    log_flow_error(
-                        "proxy_acquisition_failed", exc, account=selected
-                    )
-                    return None
-            try:
+    def release_once(index, selected):
+        state = ownership[index]
+        if state["released"] or state["handed_to_register"]:
+            return
+        state["released"] = True
+        account_store.release(selected)
+
+    async def run_selected(index, selected):
+        try:
+            async with semaphore:
+                account_lease = inherited_lease
+                if account_lease is None and ipmart_settings.enabled:
+                    try:
+                        account_lease = await asyncio.to_thread(acquire_proxy)
+                    except asyncio.CancelledError:
+                        release_once(index, selected)
+                        raise
+                    except IPMartProxyError as exc:
+                        release_once(index, selected)
+                        log_flow_error(
+                            "proxy_unavailable", exc, account=selected
+                        )
+                        return None
+                    except BaseException as exc:
+                        release_once(index, selected)
+                        log_flow_error(
+                            "proxy_acquisition_failed", exc, account=selected
+                        )
+                        return None
+                ownership[index]["handed_to_register"] = True
                 return await register_one(
                     bb,
                     selected,
                     account_store,
                     args.timeout,
                     account_lease=account_lease,
+                    browser_proxy_fields=browser_proxy_fields,
                 )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:
-                log_flow_error("registration_error", exc, account=selected)
-                return None
+        except asyncio.CancelledError:
+            release_once(index, selected)
+            raise
+        except BaseException as exc:
+            log_flow_error("registration_error", exc, account=selected)
+            return None
 
-    tasks = [asyncio.create_task(run_selected(selected)) for selected in accounts]
+    tasks = [
+        asyncio.create_task(run_selected(index, selected))
+        for index, selected in enumerate(accounts)
+    ]
     try:
         results = await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for index, selected in enumerate(accounts):
+            release_once(index, selected)
         raise
-    finally:
-        for selected in accounts:
-            account_store.release(selected)
 
     success_count = sum(result is not None for result in results)
     print(f"success: {success_count}/{len(accounts)}")

@@ -8,8 +8,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import register_claude_api
+from common import proxy_switch
 from common.claude_email_accounts import ClaudeEmailAccount
+from common.claude_platform_mailbox import ClaudePlatformVerification
 from common.ipmart_proxy import ProxyLease
+from tests.test_claude_api_registration import (
+    DelayedPlatformPage,
+    FakePlatformPage,
+)
 
 
 def account(provider="NINEMALL"):
@@ -236,6 +242,12 @@ class ClaudeApiRegistrationLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.store,
                 timeout=90,
                 account_lease=inherited,
+                browser_proxy_fields={
+                    "proxyMethod": 2,
+                    "proxyType": "http",
+                    "host": "127.0.0.1",
+                    "port": "7897",
+                },
             )
 
         self.assertEqual(result, "cookies/session.json")
@@ -255,6 +267,49 @@ class ClaudeApiRegistrationLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.bb.method_calls[-2:],
             [call.close_browser("profile-a"), call.delete_browser("profile-a")],
+        )
+
+    async def test_clash_proxy_fields_reach_profile_creation_without_ipmart(self):
+        proxy_fields = {
+            "proxyMethod": 2,
+            "proxyType": "http",
+            "host": "127.0.0.1",
+            "port": "8899",
+        }
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ):
+            await register_claude_api.register_one(
+                self.bb,
+                self.account,
+                self.store,
+                timeout=90,
+                browser_proxy_fields=proxy_fields,
+            )
+
+        self.bb.create_browser.assert_called_once_with(
+            name=unittest.mock.ANY,
+            **proxy_fields,
+        )
+
+    async def test_none_proxy_keeps_profile_direct(self):
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ):
+            await register_claude_api.register_one(
+                self.bb,
+                self.account,
+                self.store,
+                timeout=90,
+                browser_proxy_fields={},
+            )
+
+        self.bb.create_browser.assert_called_once_with(
+            name=unittest.mock.ANY
         )
 
     async def test_stable_flow_failure_marks_safe_code_and_cleans_up(self):
@@ -403,7 +458,12 @@ class ClaudeApiCliTests(unittest.IsolatedAsyncioTestCase):
             purpose="claude_api",
         )
         register.assert_awaited_once_with(
-            bb, mailbox, store, 77, account_lease=inherited
+            bb,
+            mailbox,
+            store,
+            77,
+            account_lease=inherited,
+            browser_proxy_fields={},
         )
         self.assertEqual(output.getvalue().splitlines()[-1], "success: 1/1")
 
@@ -450,6 +510,503 @@ class ClaudeApiCliTests(unittest.IsolatedAsyncioTestCase):
             SystemExit, "requires --token and --client-id"
         ):
             await register_claude_api.main()
+
+
+class ClaudeApiClashProxyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.mailbox = account()
+        self.store = Mock()
+        self.store.reserve_many.return_value = [self.mailbox]
+        self.bb = Mock()
+
+    def base_patches(self, argv, *, inherited=None, enabled=False):
+        return (
+            patch.object(register_claude_api.sys, "argv", argv),
+            patch.object(register_claude_api, "EMAIL_PROVIDER", "NINEMALL"),
+            patch.object(
+                register_claude_api,
+                "ClaudeEmailAccountStore",
+                return_value=self.store,
+            ),
+            patch.object(
+                register_claude_api, "lease_from_env", return_value=inherited
+            ),
+            patch.object(
+                register_claude_api,
+                "settings_from_env",
+                return_value=SimpleNamespace(enabled=enabled),
+            ),
+            patch.object(register_claude_api, "BitBrowser", return_value=self.bb),
+        )
+
+    async def test_explicit_node_switches_and_supplies_local_proxy_profile_fields(self):
+        argv = [
+            "register_claude_api.py",
+            "--node",
+            "tokyo-01",
+            "--proxy-port",
+            "8899",
+        ]
+        argv_patch, provider, store, inherited, settings, browser = self.base_patches(
+            argv
+        )
+        with argv_patch, provider, store, inherited, settings, browser, patch.object(
+            proxy_switch, "set_node", return_value=True
+        ) as set_node, patch.object(
+            proxy_switch, "find_working_node"
+        ) as probe, patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ) as register:
+            status = await register_claude_api.main()
+
+        self.assertEqual(status, 0)
+        set_node.assert_called_once_with("tokyo-01")
+        probe.assert_not_called()
+        register.assert_awaited_once_with(
+            self.bb,
+            self.mailbox,
+            self.store,
+            480,
+            account_lease=None,
+            browser_proxy_fields={
+                "proxyMethod": 2,
+                "proxyType": "http",
+                "host": "127.0.0.1",
+                "port": "8899",
+            },
+        )
+
+    async def test_auto_node_probes_existing_candidates_and_supplies_proxy(self):
+        argv = ["register_claude_api.py", "--node", "auto"]
+        argv_patch, provider, store, inherited, settings, browser = self.base_patches(
+            argv
+        )
+        candidates = ["tokyo-01", "osaka-02"]
+        with argv_patch, provider, store, inherited, settings, browser, patch.object(
+            proxy_switch,
+            "concrete_nodes",
+            return_value=candidates,
+        ), patch.object(
+            proxy_switch,
+            "find_working_node",
+            return_value="osaka-02",
+        ) as probe, patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ) as register:
+            status = await register_claude_api.main()
+
+        self.assertEqual(status, 0)
+        probe.assert_called_once_with(
+            test_url="https://platform.claude.com/",
+            challenge_markers=(
+                "app-unavailable-in-region",
+                "unavailable in your",
+                "just a moment",
+                "performing security",
+            ),
+            candidates=candidates,
+            verbose=False,
+        )
+        self.assertEqual(
+            register.await_args.kwargs["browser_proxy_fields"]["port"], "7897"
+        )
+
+    async def test_none_node_does_not_switch_or_add_profile_proxy(self):
+        argv = ["register_claude_api.py", "--node", "none"]
+        argv_patch, provider, store, inherited, settings, browser = self.base_patches(
+            argv
+        )
+        with argv_patch, provider, store, inherited, settings, browser, patch.object(
+            proxy_switch, "set_node"
+        ) as set_node, patch.object(
+            proxy_switch, "find_working_node"
+        ) as probe, patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ) as register:
+            await register_claude_api.main()
+
+        set_node.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(register.await_args.kwargs["browser_proxy_fields"], {})
+
+    async def test_ipmart_lease_wins_and_skips_clash(self):
+        inherited_lease = lease()
+        argv = ["register_claude_api.py", "--node", "tokyo-01"]
+        argv_patch, provider, store, inherited, settings, browser = self.base_patches(
+            argv, inherited=inherited_lease
+        )
+        with argv_patch, provider, store, inherited, settings, browser, patch.object(
+            proxy_switch, "set_node"
+        ) as set_node, patch.object(
+            proxy_switch, "find_working_node"
+        ) as probe, patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ) as register:
+            await register_claude_api.main()
+
+        set_node.assert_not_called()
+        probe.assert_not_called()
+        self.assertIs(register.await_args.kwargs["account_lease"], inherited_lease)
+        self.assertEqual(register.await_args.kwargs["browser_proxy_fields"], {})
+
+    async def test_invalid_proxy_port_fails_before_reservation_or_browser_launch(self):
+        with patch.object(
+            register_claude_api.sys,
+            "argv",
+            ["register_claude_api.py", "--proxy-port", "70000"],
+        ), patch.object(
+            register_claude_api, "ClaudeEmailAccountStore"
+        ) as store, patch.object(
+            register_claude_api, "BitBrowser"
+        ) as browser, self.assertRaises(SystemExit):
+            await register_claude_api.main()
+
+        store.assert_not_called()
+        browser.assert_not_called()
+
+
+class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
+    async def test_stuck_code_is_classified_before_emergency_timeout(self):
+        page = FakePlatformPage(code_submit_target_state="code")
+        self.context.pages = [page]
+        now = 0.0
+
+        async def advance(delay):
+            nonlocal now
+            now += delay
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "fetch_platform_verification",
+            new=AsyncMock(return_value=ClaudePlatformVerification(code="482731")),
+        ), patch.object(
+            register_claude_api, "_clock", side_effect=lambda: now
+        ), patch.object(
+            register_claude_api.asyncio, "sleep", side_effect=advance
+        ), patch.object(
+            register_claude_api,
+            "EMERGENCY_TIMEOUT_CUSHION",
+            0.05,
+            create=True,
+        ):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=0.02
+            )
+
+        self.assertIsNone(result)
+        self.store.mark_error.assert_called_once_with(
+            self.account, "verification_rejected"
+        )
+
+    async def test_delayed_success_near_deadline_remains_success(self):
+        page = DelayedPlatformPage(
+            code_submit_target_state="pending",
+            transition_after=2,
+            transition_to="authenticated",
+        )
+        self.context.pages = [page]
+        now = 0.0
+
+        async def advance(delay):
+            nonlocal now
+            now += delay
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "fetch_platform_verification",
+            new=AsyncMock(return_value=ClaudePlatformVerification(code="482731")),
+        ), patch.object(
+            register_claude_api,
+            "save_claude_platform_session",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ), patch.object(
+            register_claude_api, "_clock", side_effect=lambda: now
+        ), patch.object(
+            register_claude_api.asyncio, "sleep", side_effect=advance
+        ), patch.object(
+            register_claude_api,
+            "EMERGENCY_TIMEOUT_CUSHION",
+            0.05,
+            create=True,
+        ):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=0.08
+            )
+
+        self.assertEqual(result, "cookies/session.json")
+        self.store.mark_used.assert_called_once_with(self.account)
+
+    async def test_hung_mailbox_is_classified_as_mail_timeout(self):
+        async def hang(*_args, **_kwargs):
+            await asyncio.Future()
+
+        self.context.pages = [FakePlatformPage()]
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "fetch_platform_verification",
+            side_effect=hang,
+        ), patch.object(
+            register_claude_api,
+            "EMERGENCY_TIMEOUT_CUSHION",
+            0.05,
+            create=True,
+        ):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=0.02
+            )
+
+        self.assertIsNone(result)
+        self.store.mark_error.assert_called_once_with(self.account, "mail_timeout")
+
+    async def test_hard_hang_is_stopped_by_emergency_cushion(self):
+        async def hang(*_args, **_kwargs):
+            await asyncio.Future()
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api, "run_claude_platform_flow", side_effect=hang
+        ), patch.object(
+            register_claude_api,
+            "EMERGENCY_TIMEOUT_CUSHION",
+            0.01,
+            create=True,
+        ):
+            result = await asyncio.wait_for(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=0.01
+                ),
+                timeout=0.1,
+            )
+
+        self.assertIsNone(result)
+        self.store.mark_error.assert_called_once_with(self.account, "timeout")
+
+    def make_cleanup_failures(self):
+        self.browser.close.side_effect = RuntimeError("browser close secret")
+        self.bb.close_browser.side_effect = RuntimeError("profile close secret")
+        self.bb.delete_browser.side_effect = RuntimeError("profile delete secret")
+
+    def assert_all_cleanup_attempted(self):
+        self.browser.close.assert_awaited_once_with()
+        self.bb.close_browser.assert_called_once_with("profile-a")
+        self.bb.delete_browser.assert_called_once_with("profile-a")
+
+    async def test_cleanup_errors_do_not_change_success(self):
+        self.make_cleanup_failures()
+        output = io.StringIO()
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ), redirect_stdout(output):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=90
+            )
+
+        self.assertEqual(result, "cookies/session.json")
+        self.store.mark_used.assert_called_once_with(self.account)
+        self.assert_all_cleanup_attempted()
+        self.assertNotIn("secret", output.getvalue())
+
+    async def test_cleanup_errors_do_not_change_stable_failure(self):
+        self.make_cleanup_failures()
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(
+                side_effect=register_claude_api.ClaudeApiRegistrationError(
+                    "verification_rejected"
+                )
+            ),
+        ):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=90
+            )
+
+        self.assertIsNone(result)
+        self.store.mark_error.assert_called_once_with(
+            self.account, "verification_rejected"
+        )
+        self.assert_all_cleanup_attempted()
+
+    async def test_cleanup_errors_do_not_replace_cancellation(self):
+        self.make_cleanup_failures()
+        started = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            started.set()
+            await asyncio.Future()
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api, "run_claude_platform_flow", side_effect=hang
+        ):
+            task = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=90
+                )
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.store.release.assert_called_once_with(self.account)
+        self.assert_all_cleanup_attempted()
+
+
+class ClaudeApiMainBatchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.accounts = [
+            ClaudeEmailAccount(
+                "NINEMALL",
+                f"person{index}@example.com",
+                f"mail-pass-{index}",
+                f"client-{index}",
+                f"refresh-{index}",
+            )
+            for index in range(3)
+        ]
+        self.store = Mock()
+        self.store.reserve_many.return_value = self.accounts
+
+    def main_stack(self, argv):
+        return (
+            patch.object(register_claude_api.sys, "argv", argv),
+            patch.object(register_claude_api, "EMAIL_PROVIDER", "NINEMALL"),
+            patch.object(
+                register_claude_api,
+                "ClaudeEmailAccountStore",
+                return_value=self.store,
+            ),
+            patch.object(register_claude_api, "lease_from_env", return_value=None),
+            patch.object(
+                register_claude_api,
+                "settings_from_env",
+                return_value=SimpleNamespace(enabled=False),
+            ),
+            patch.object(register_claude_api, "BitBrowser", return_value=Mock()),
+        )
+
+    async def test_main_enforces_multi_account_concurrency(self):
+        active = 0
+        maximum = 0
+        first_pair = asyncio.Event()
+        release = asyncio.Event()
+
+        async def registration(*_args, **_kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                first_pair.set()
+            await release.wait()
+            active -= 1
+            return "cookies/session.json"
+
+        stack = self.main_stack([
+            "register_claude_api.py", "--count", "3", "--concurrency", "2"
+        ])
+        with stack[0], stack[1], stack[2], stack[3], stack[4], stack[5], patch.object(
+            register_claude_api, "register_one", side_effect=registration
+        ):
+            task = asyncio.create_task(register_claude_api.main())
+            await asyncio.wait_for(first_pair.wait(), timeout=0.2)
+            self.assertEqual(maximum, 2)
+            release.set()
+            status = await task
+
+        self.assertEqual(status, 0)
+        self.assertEqual(maximum, 2)
+
+    async def test_ctrl_c_releases_each_queued_reservation_once(self):
+        started = asyncio.Event()
+
+        async def registration(_bb, selected, store, *_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                store.release(selected)
+                raise
+
+        stack = self.main_stack([
+            "register_claude_api.py", "--count", "3", "--concurrency", "1"
+        ])
+        with stack[0], stack[1], stack[2], stack[3], stack[4], stack[5], patch.object(
+            register_claude_api, "register_one", side_effect=registration
+        ):
+            task = asyncio.create_task(register_claude_api.main())
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        for selected in self.accounts:
+            self.assertEqual(
+                self.store.release.call_args_list.count(call(selected)), 1
+            )
+
+    async def test_ipmart_acquires_and_propagates_one_lease_per_account(self):
+        leases = [
+            lease(),
+            ProxyLease(
+                "http", "gateway.example", 8080,
+                "account-res-US-sid-00000043", "proxy-secret-2",
+                "00000043", "203.0.113.9",
+            ),
+            ProxyLease(
+                "http", "gateway.example", 8080,
+                "account-res-US-sid-00000044", "proxy-secret-3",
+                "00000044", "203.0.113.10",
+            ),
+        ]
+        stack = self.main_stack([
+            "register_claude_api.py", "--count", "3", "--concurrency", "3"
+        ])
+        output = io.StringIO()
+        with stack[0], stack[1], stack[2], stack[3], patch.object(
+            register_claude_api,
+            "settings_from_env",
+            return_value=SimpleNamespace(enabled=True),
+        ), stack[5], patch.object(
+            register_claude_api, "acquire_proxy", side_effect=leases
+        ) as acquire, patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ) as register, redirect_stdout(output):
+            status = await register_claude_api.main()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(acquire.call_count, 3)
+        self.assertEqual(
+            {id(item.kwargs["account_lease"]) for item in register.await_args_list},
+            {id(item) for item in leases},
+        )
+        for secret in ("proxy-secret", "proxy-secret-2", "proxy-secret-3"):
+            self.assertNotIn(secret, output.getvalue())
+
+    async def test_final_marker_matches_mixed_results(self):
+        stack = self.main_stack([
+            "register_claude_api.py", "--count", "3", "--concurrency", "2"
+        ])
+        output = io.StringIO()
+        with stack[0], stack[1], stack[2], stack[3], stack[4], stack[5], patch.object(
+            register_claude_api,
+            "register_one",
+            new=AsyncMock(side_effect=["one.json", None, "three.json"]),
+        ), redirect_stdout(output):
+            status = await register_claude_api.main()
+
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue().splitlines()[-1], "success: 2/3")
 
 
 if __name__ == "__main__":

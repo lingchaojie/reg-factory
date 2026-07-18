@@ -392,8 +392,51 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.resend_count, 1)
         self.assertEqual(len(fetches), 2)
         self.assertIs(fetches[0][0], context)
-        self.assertEqual(fetches[0][1:3], (self.account, 7))
+        self.assertIs(fetches[0][1], self.account)
+        self.assertGreater(fetches[0][2], 0)
+        self.assertLessEqual(fetches[0][2], 7)
+        self.assertGreater(fetches[1][2], 0)
+        self.assertLessEqual(fetches[1][2], fetches[0][2])
         self.assertLessEqual(fetches[0][3], fetches[1][3])
+
+    async def test_received_after_is_captured_before_verification_request(self):
+        class RequestTimingPage(FakePlatformPage):
+            def click_element(self, kind):
+                if (
+                    self.state == "start"
+                    and kind == (
+                        "selector", 'button[data-testid="continue"]'
+                    )
+                ):
+                    self.request_clicked_at = register_claude_api.time.time()
+                return super().click_element(kind)
+
+        page = RequestTimingPage()
+        received_after = []
+
+        async def fetch_verification(_context, _account, _wait, requested_at):
+            received_after.append(requested_at)
+            return ClaudePlatformVerification(code="482731")
+
+        with patch.object(
+            register_claude_api.time,
+            "time",
+            side_effect=(1000.0, 1001.0),
+        ), patch.object(
+            register_claude_api,
+            "save_claude_platform_session",
+            return_value="cookies/session.json",
+        ):
+            await register_claude_api.run_claude_platform_flow(
+                page,
+                FakeBrowserContext([]),
+                self.account,
+                fetch_verification,
+                1,
+            )
+
+        self.assertEqual(received_after, [1000.0])
+        self.assertEqual(page.request_clicked_at, 1001.0)
 
     async def test_flow_never_resends_more_than_once(self):
         page = FakePlatformPage()
@@ -550,21 +593,14 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_code_screen_remaining_until_timeout_is_verification_rejected(self):
-        page = FakePlatformPage(code_submit_target_state="code")
-
-        async def fetch_verification(*_args):
-            return ClaudePlatformVerification(code="482731")
+        page = FakePlatformPage(state="code")
 
         with self.assertRaisesRegex(
             register_claude_api.ClaudeApiRegistrationError,
             "^verification_rejected$",
         ):
-            await register_claude_api.run_claude_platform_flow(
-                page,
-                FakeBrowserContext([]),
-                self.account,
-                fetch_verification,
-                0.02,
+            await register_claude_api._wait_for_post_verification_state(
+                page, "code", timeout=0
             )
 
     async def test_flow_waits_for_delayed_console_transition(self):
@@ -622,22 +658,15 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_deadline_does_not_click_visible_personal_option(self):
         page = FakePlatformPage(magic_link_target_state="personal")
-
-        async def fetch_verification(*_args):
-            return ClaudePlatformVerification(
-                magic_link="https://platform.claude.com/magic-link?code=abc"
-            )
+        page.state = "personal"
+        page.url = "https://platform.claude.com/onboarding"
 
         with self.assertRaisesRegex(
             register_claude_api.ClaudeApiRegistrationError,
             "^console_not_reached$",
         ):
-            await register_claude_api.run_claude_platform_flow(
-                page,
-                FakeBrowserContext([]),
-                self.account,
-                fetch_verification,
-                0,
+            await register_claude_api._wait_for_post_verification_state(
+                page, "magic_link", timeout=0
             )
 
         self.assertEqual(page.personal_clicks, 0)
