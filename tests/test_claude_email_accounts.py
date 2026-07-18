@@ -89,6 +89,37 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         self.assertIn("http_401", state)
         self.assertNotIn("refresh-secret", state)
 
+    def test_released_reservation_is_selectable_after_store_restart(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        account = store.reserve_one()
+
+        store.release(account)
+
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root
+        ).reserve_one()
+        self.assertEqual(selected.email, account.email)
+        state = (self.root / "mail_used_claude.txt").read_text(encoding="utf-8")
+        self.assertIn("person@example.com----released", state)
+        self.assertNotIn(account.password, state)
+        self.assertNotIn(account.client_id, state)
+        self.assertNotIn(account.refresh_token, state)
+
+    def test_terminal_reservation_cannot_be_released(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
+        account = store.reserve_one()
+        store.mark_used(account)
+
+        store.release(account)
+
+        self.assertIsNone(
+            ClaudeEmailAccountStore("NINEMALL", source, self.root).reserve_one()
+        )
+        state = (self.root / "mail_used_claude.txt").read_text(encoding="utf-8")
+        self.assertNotIn("released", state)
+
 
 if __name__ == "__main__":
     unittest.main()

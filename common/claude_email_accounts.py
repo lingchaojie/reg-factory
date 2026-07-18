@@ -61,6 +61,7 @@ class ClaudeEmailAccountStore:
         else:
             self.used_file = self.root_dir / "emails_used.txt"
             self.error_file = self.root_dir / "emails_error.txt"
+        self._active_reservations = set()
 
     @staticmethod
     def parse_line(line, provider, line_number=0, source_file=""):
@@ -86,13 +87,35 @@ class ClaudeEmailAccountStore:
 
     def _blocked(self):
         blocked = set()
-        for path in (self.used_file, self.error_file):
-            if not path.exists():
-                continue
-            for raw in path.read_text(encoding="utf-8").splitlines():
+        error_blocked = set()
+        if self.error_file.exists():
+            for raw in self.error_file.read_text(encoding="utf-8").splitlines():
                 value = raw.strip()
                 if value and not value.startswith("#"):
-                    blocked.add(value.split("----", 1)[0].strip().lower())
+                    error_blocked.add(
+                        value.split("----", 1)[0].strip().lower()
+                    )
+        blocked.update(error_blocked)
+        if self.used_file.exists():
+            for raw in self.used_file.read_text(encoding="utf-8").splitlines():
+                value = raw.strip()
+                if not value or value.startswith("#"):
+                    continue
+                parts = [part.strip() for part in value.split("----")]
+                email = parts[0].lower()
+                released = (
+                    self.provider == "NINEMALL"
+                    and len(parts) == 2
+                    and parts[1].lower() == "released"
+                ) or (
+                    self.provider == "OUTLOOK"
+                    and len(parts) >= 3
+                    and parts[-1].lower() == "released"
+                )
+                if released and email not in error_blocked:
+                    blocked.discard(email)
+                else:
+                    blocked.add(email)
         return blocked
 
     def _append_state(self, path, account, status):
@@ -103,29 +126,43 @@ class ClaudeEmailAccountStore:
             else:
                 handle.write(f"{account.email}----{status}\n")
 
+    def _load_accounts(self, limit=None):
+        if not self.source_file.exists():
+            return []
+        selected = []
+        for line_number, raw in enumerate(
+            self.source_file.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            value = raw.strip()
+            if not value or value.startswith("#"):
+                continue
+            try:
+                account = self.parse_line(
+                    value, self.provider, line_number, self.source_file
+                )
+            except AccountFormatError as exc:
+                print(f"  [email-file] {exc}")
+                continue
+            selected.append(account)
+            if limit is not None and len(selected) >= limit:
+                break
+        return selected
+
+    def load_many(self, limit=None):
+        with _POOL_LOCK:
+            return self._load_accounts(limit=limit)
+
     def reserve_many(self, limit=None):
         with _POOL_LOCK:
-            if not self.source_file.exists():
-                return []
             blocked = self._blocked()
             selected = []
-            for line_number, raw in enumerate(
-                self.source_file.read_text(encoding="utf-8").splitlines(), 1
-            ):
-                value = raw.strip()
-                if not value or value.startswith("#"):
-                    continue
-                try:
-                    account = self.parse_line(
-                        value, self.provider, line_number, self.source_file
-                    )
-                except AccountFormatError as exc:
-                    print(f"  [email-file] {exc}")
-                    continue
+            for account in self._load_accounts():
                 if account.email.lower() in blocked:
                     continue
                 self._append_state(self.used_file, account, "reserved")
-                blocked.add(account.email.lower())
+                email = account.email.lower()
+                blocked.add(email)
+                self._active_reservations.add(email)
                 selected.append(account)
                 if limit is not None and len(selected) >= limit:
                     break
@@ -138,6 +175,7 @@ class ClaudeEmailAccountStore:
     def mark_used(self, account):
         with _POOL_LOCK:
             self._append_state(self.used_file, account, "ok")
+            self._active_reservations.discard(account.email.lower())
 
     def mark_error(self, account, reason):
         raw = str(reason or "unknown").lower()
@@ -151,3 +189,13 @@ class ClaudeEmailAccountStore:
             safe_reason = "registration_error"
         with _POOL_LOCK:
             self._append_state(self.error_file, account, safe_reason)
+            self._active_reservations.discard(account.email.lower())
+
+    def release(self, account):
+        email = account.email.lower()
+        with _POOL_LOCK:
+            if email not in self._active_reservations:
+                return False
+            self._append_state(self.used_file, account, "released")
+            self._active_reservations.discard(email)
+            return True

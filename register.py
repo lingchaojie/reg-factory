@@ -115,7 +115,9 @@ def _pick_claude_node():
     try:
         alln = proxy_switch.concrete_nodes()
     except Exception as e:
-        print(f"  [proxy] 取节点列表失败: {e}")
+        log_claude_flow_error(
+            "[proxy] node_list_failed", e, provider=EMAIL_PROVIDER
+        )
         return None
     recent = set(_recent_claude_nodes())
     fresh = [n for n in alln if n not in recent] or alln
@@ -136,6 +138,16 @@ def prepare_claude_network(
     if account_lease is not None or ipmart_enabled:
         strip_http_proxy_env(env)
     return env
+
+
+def log_claude_flow_error(message, error=None, *, account=None, provider=None):
+    selected_provider = normalize_email_provider(
+        provider or (account.provider if account is not None else EMAIL_PROVIDER)
+    )
+    if selected_provider == "NINEMALL" or error is None:
+        print(f"  {message}")
+        return
+    print(f"  {message}: {error}")
 
 
 def configure_claude_proxy(
@@ -180,7 +192,11 @@ def configure_claude_proxy(
         CLAUDE_PROXY_NODE = node_arg
         print(f"  [proxy] selected node: {proxy_switch.current_node()}")
     except Exception as exc:
-        print(f"  [proxy] Clash node selection failed: {exc}")
+        log_claude_flow_error(
+            "[proxy] clash_node_selection_failed",
+            exc,
+            provider=EMAIL_PROVIDER,
+        )
 
 
 def create_claude_profile(bb, name, account_lease=None):
@@ -435,7 +451,9 @@ def prepare_email_accounts(
         )
         return [account], store
     if args.emails:
-        return store.reserve_many(limit=None), store
+        if provider == "NINEMALL":
+            return store.reserve_many(limit=None), store
+        return store.load_many(limit=None), store
     if provider == "NINEMALL":
         return store.reserve_many(limit=args.count), store
     return [None] * args.count, store
@@ -463,6 +481,14 @@ def mark_claude_account_error(account, account_store, reason):
         return
     if account is not None:
         mark_email_error(account.email, account.password, reason)
+
+
+def release_claude_accounts(accounts, account_store):
+    if account_store is None:
+        return
+    for account in accounts:
+        if account is not None and account.provider == "NINEMALL":
+            account_store.release(account)
 
 
 # Arkose Labs public key for Microsoft signup
@@ -2055,7 +2081,11 @@ def hero_get_phone_number():
         countries = [c for _, _, c in ranked]
         print(f"  [hero-sms] {len(countries)} countries sorted by price (cheapest: ${ranked[0][0]} id={ranked[0][2]})")
     except Exception as e:
-        print(f"  [hero-sms] getPrices failed: {e}, using default order")
+        log_claude_flow_error(
+            "[hero-sms] price_lookup_failed_using_default_order",
+            e,
+            provider=EMAIL_PROVIDER,
+        )
         countries = HERO_SMS_COUNTRY_PREFER
 
     for country in countries:
@@ -2078,7 +2108,11 @@ def hero_get_phone_number():
                 return full_phone, pkey
             # NO_NUMBERS 等，继续试下一个国家
         except Exception as e:
-            print(f"  [hero-sms] error country={country}: {e}")
+            log_claude_flow_error(
+                f"[hero-sms] country_{country}_request_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
     return None
 
 
@@ -2122,7 +2156,11 @@ def hero_get_sms_code(pkey, max_wait=120, interval=5):
             else:
                 print(f"  [hero-sms] status: {text}")
         except Exception as e:
-            print(f"  [hero-sms] error: {e}")
+            log_claude_flow_error(
+                "[hero-sms] sms_poll_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
         time.sleep(interval)
     return None
 
@@ -2268,7 +2306,9 @@ async def solve_turnstile(page, max_wait=60):
                         print("  [cf] method1: clicked checkbox in iframe")
                         clicked = True
                 except Exception as e:
-                    print(f"  [cf] method1 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method1_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 2: click CF iframe body center
             if not clicked and cf_frame:
@@ -2282,7 +2322,9 @@ async def solve_turnstile(page, max_wait=60):
                         print(f"  [cf] method2: clicked iframe body ({cx:.0f},{cy:.0f})")
                         clicked = True
                 except Exception as e:
-                    print(f"  [cf] method2 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method2_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 3: click iframe element from parent page coords
             if not clicked:
@@ -2299,7 +2341,9 @@ async def solve_turnstile(page, max_wait=60):
                             print(f"  [cf] method3: clicked iframe coords ({box['x']+30:.0f},{box['y']+box['height']/2:.0f})")
                             clicked = True
                 except Exception as e:
-                    print(f"  [cf] method3 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method3_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 4: click .cf-turnstile or [data-sitekey] container
             if not clicked:
@@ -2312,7 +2356,9 @@ async def solve_turnstile(page, max_wait=60):
                             print(f"  [cf] method4: clicked turnstile container")
                             clicked = True
                 except Exception as e:
-                    print(f"  [cf] method4 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method4_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 5: find ANY iframe with cloudflare src
             if not clicked:
@@ -2330,7 +2376,9 @@ async def solve_turnstile(page, max_wait=60):
                                 clicked = True
                                 break
                 except Exception as e:
-                    print(f"  [cf] method5 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method5_failed", e, provider=EMAIL_PROVIDER
+                    )
 
         if clicked:
             await asyncio.sleep(3)
@@ -2477,7 +2525,11 @@ async def handle_birthday_page(page, birth_year, birth_month, birth_day):
                 filled += 1
                 await asyncio.sleep(0.3)
             except Exception as e:
-                print(f"    select failed ({target_text}): {e}")
+                log_claude_flow_error(
+                    f"birthday_{target_text}_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
         if filled > 0:
             return True
 
@@ -2520,7 +2572,11 @@ async def handle_birthday_page(page, birth_year, birth_month, birth_day):
                         break
                 await asyncio.sleep(0.3)
             except Exception as e:
-                print(f"    select failed ({target_text}): {e}")
+                log_claude_flow_error(
+                    f"birthday_{target_text}_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
         return True
 
     # method 4: date input
@@ -2718,7 +2774,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         clicked = True
                         need_continue = True
                 except Exception as e:
-                    print(f"  [onboarding] personal JS-click failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] personal_js_click_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
 
             # after selecting personal use card, click Continue/Next to proceed
             if need_continue:
@@ -2781,7 +2841,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     print(f"  [onboarding] JS plan select: {clicked_js}")
                     clicked = True
             except Exception as e:
-                print(f"  [onboarding] JS plan select failed: {e}")
+                log_claude_flow_error(
+                    "[onboarding] plan_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
             # fallback: Playwright 点击（只用 button，不用 a 标签避免导航）
             if not clicked:
                 for label in ['Free', 'Meet Claude', 'Start for free', 'Continue with Free']:
@@ -2823,7 +2887,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         print(f"  [onboarding] JS-clicked plan: {clicked_js}")
                         clicked = True
                 except Exception as e:
-                    print(f"  [onboarding] plan click failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] plan_click_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
 
         # "Before your first chat" page — 直接点 Continue（不动 toggle）
         if not clicked and ('before your first' in page_lower or 'setting to review' in page_lower):
@@ -2891,7 +2959,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                             clicked = True
                             break
                         except Exception as e:
-                            print(f"  [onboarding] click {label} failed: {e}")
+                            log_claude_flow_error(
+                                "[onboarding] continue_click_failed",
+                                e,
+                                provider=EMAIL_PROVIDER,
+                            )
                 if clicked:
                     break
                 print(f"  [onboarding] Continue not found, retrying ({_attempt+1}/3)...")
@@ -2924,9 +2996,13 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         _json.dump(cookies, _f, indent=2, ensure_ascii=False)
                     with open(os.path.join(COOKIE_OUTPUT_DIR, f"sk_pre_skip_{ts}.txt"), "w", encoding="utf-8") as _f:
                         _f.write(sk)
-                    print(f"  [onboarding] pre-saved sessionKey: {sk[:60]}...")
+                    print("  [onboarding] pre-saved sessionKey")
             except Exception as e:
-                print(f"  [onboarding] pre-save error: {e}")
+                log_claude_flow_error(
+                    "[onboarding] pre_save_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
             # 点 Skip
             for label in ['Skip', 'Not now', 'Maybe later']:
                 btn = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
@@ -3134,7 +3210,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         dismissed = True
                         await asyncio.sleep(1)
                 except Exception as e:
-                    print(f"  [onboarding] dialog method1 failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] dialog_method1_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
                 # 方法2: 按文字找 Later 按钮
                 if not dismissed:
                     for label in ['Later', 'Maybe later', 'Not now', 'Skip for now', 'Skip']:
@@ -3191,7 +3271,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                             print("  [onboarding] picked a role from dropdown")
                             await asyncio.sleep(1)
                 except Exception as e:
-                    print(f"  [onboarding] role dropdown pick failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] role_dropdown_pick_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
                 for label in ['Continue', 'Next', 'Submit', 'Get started', 'Set up later']:
                     btn = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
                     if await btn.count() > 0:
@@ -3360,7 +3444,11 @@ async def _get_and_verify_phone(page, max_attempts=2):
             return True
 
         except Exception as e:
-            print(f"  [re-verify] error: {e}")
+            log_claude_flow_error(
+                "[re-verify] phone_attempt_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
             if pkey:
                 release_phone(pkey)
     return False
@@ -3611,7 +3699,9 @@ async def register(
                     await click_continue_email(page)
                     print("  resent magic link")
                 except Exception as e:
-                    print(f"  resend error: {e}")
+                    log_claude_flow_error(
+                        "resend_failed", e, account=account
+                    )
                 await asyncio.sleep(3)
                 magic_link = await fetch_claude_magic_link(
                     context,
@@ -3905,7 +3995,11 @@ async def register(
                     except TimeoutError:
                         raise
                     except Exception as e:
-                        print(f"  exception: {e}")
+                        log_claude_flow_error(
+                            "phone_verification_attempt_failed",
+                            e,
+                            account=account,
+                        )
                         if pkey:
                             release_phone(pkey)
                         if attempt < MAX_PHONE_ATTEMPTS:
@@ -4009,7 +4103,9 @@ async def register(
                         mark_claude_account_used(account, account_store)
                         return session_key
                 except Exception as e:
-                    print(f"  cookie read error: {e}")
+                    log_claude_flow_error(
+                        "cookie_read_failed", e, account=account
+                    )
 
                 print("  ERROR: not on chat page, not saving cookies")
                 mark_claude_account_error(
@@ -4029,7 +4125,7 @@ async def register(
                 )
 
     except TimeoutError as e:
-        print(f"\n  TIMEOUT: {e}")
+        log_claude_flow_error("timeout", e, account=account)
         if account is not None:
             mark_claude_account_error(account, account_store, "timeout")
     except Exception as e:
@@ -4042,7 +4138,7 @@ async def register(
             print(f"\n  ERROR: {reason}")
             mark_claude_account_error(account, account_store, reason)
         else:
-            print(f"\n  ERROR: {e}")
+            log_claude_flow_error("registration_error", e, account=account)
             import traceback
             traceback.print_exc()
             if account is not None:
@@ -4116,7 +4212,16 @@ async def main():
     elif args.emails:
         print(f"  loaded {len(accounts)} emails from {args.emails}")
 
-    bb = BitBrowser()
+    try:
+        bb = BitBrowser()
+    except Exception:
+        release_claude_accounts(accounts, account_store)
+        if any(
+            account is not None and account.provider == "NINEMALL"
+            for account in accounts
+        ):
+            raise RuntimeError("browser_initialization_failed") from None
+        raise
     results = []
     results_lock = asyncio.Lock()
     sem = asyncio.Semaphore(args.concurrency)
@@ -4153,7 +4258,25 @@ async def main():
                             account, account_store, "registration_error"
                         )
                     else:
-                        print(f"  FATAL: IPMart proxy unavailable: {exc}")
+                        log_claude_flow_error(
+                            "FATAL: IPMart proxy unavailable",
+                            exc,
+                            account=account,
+                        )
+                    async with results_lock:
+                        results.append({
+                            "index": i,
+                            "profile": "-",
+                            "status": "ERROR",
+                            "sk": None,
+                    })
+                    return
+                except Exception as exc:
+                    if account is None or account.provider != "NINEMALL":
+                        raise
+                    log_claude_flow_error(
+                        "proxy_acquisition_failed", exc, account=account
+                    )
                     async with results_lock:
                         results.append({
                             "index": i,
@@ -4190,7 +4313,11 @@ async def main():
                         if safe_category is None:
                             print(f"\n  窗口数量已满，自动清理...")
                         else:
-                            print(f"\n  {e}; window quota, cleaning up...")
+                            log_claude_flow_error(
+                                "window_quota_reached",
+                                e,
+                                account=account,
+                            )
                         bb.cleanup_browsers(keep=0)
                         continue
                     elif safe_category == "transient" or (
@@ -4204,7 +4331,11 @@ async def main():
                             or 'timeout' in err_msg
                         )
                     ):
-                        print(f"  create browser network error (retry {_retry+1}/3): {err_msg[:80]}")
+                        log_claude_flow_error(
+                            f"create_browser_network_error_retry_{_retry + 1}",
+                            e,
+                            account=account,
+                        )
                         await asyncio.sleep(5)
                         continue
                     else:
@@ -4241,7 +4372,11 @@ async def main():
                     })
                     print(f"  [proxy] window via {CLAUDE_PROXY_HOST}:{CLAUDE_PROXY_PORT} (node={CLAUDE_PROXY_NODE})")
                 except Exception as e:
-                    print(f"  [proxy] window update failed: {e}")
+                    log_claude_flow_error(
+                        "[proxy] window_update_failed",
+                        e,
+                        account=account,
+                    )
             try:
                 sk = await register(
                     profile_id,
@@ -4258,11 +4393,20 @@ async def main():
                         account, account_store, "registration_error"
                     )
                 else:
-                    print(f"  FATAL: {e}")
+                    log_claude_flow_error(
+                        "FATAL: registration_error", e, account=account
+                    )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
 
-    await asyncio.gather(*[run_one(i) for i in range(1, total + 1)])
+    try:
+        await asyncio.gather(*[run_one(i) for i in range(1, total + 1)])
+    except Exception:
+        if EMAIL_PROVIDER == "NINEMALL":
+            raise RuntimeError("registration_batch_failed") from None
+        raise
+    finally:
+        release_claude_accounts(accounts, account_store)
 
     # summary
     print(f"\n{'=' * 50}")

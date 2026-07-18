@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import tempfile
 import unittest
@@ -82,6 +83,27 @@ class ClaudeNineMallCliTests(unittest.TestCase):
         )
         self.assertEqual(accounts, [None, None])
 
+    def test_outlook_explicit_file_is_read_without_preconsuming_rows(self):
+        source = self.root / "custom-outlook.txt"
+        source.write_text(
+            "a@example.com----pa----refresh-a----client-a\n"
+            "b@example.com----pb----refresh-b----client-b\n",
+            encoding="utf-8",
+        )
+        accounts, store = register.prepare_email_accounts(
+            args(emails=str(source)),
+            provider="OUTLOOK",
+            store_factory=self.factory,
+        )
+
+        self.assertEqual(
+            [account.email for account in accounts],
+            ["a@example.com", "b@example.com"],
+        )
+        self.assertFalse((self.root / "emails_used.txt").exists())
+        self.assertFalse((self.root / "emails_error.txt").exists())
+        self.assertEqual(store.reserve_one().email, "a@example.com")
+
     def test_explicit_ninemail_account_keeps_all_four_fields(self):
         accounts, _store = register.prepare_email_accounts(
             args(
@@ -123,6 +145,7 @@ class ClaudeNineMallCliTests(unittest.TestCase):
         source = "\n".join(
             (
                 inspect.getsource(register.save_cookies),
+                inspect.getsource(register.handle_onboarding),
                 inspect.getsource(register.register),
                 inspect.getsource(register.main),
             )
@@ -131,10 +154,56 @@ class ClaudeNineMallCliTests(unittest.TestCase):
         self.assertNotRegex(
             inspect.getsource(register.save_cookies), r"print\(f[^\n]*\{e\}"
         )
+        for function in (
+            register._pick_claude_node,
+            register.configure_claude_proxy,
+            register.solve_turnstile,
+            register.hero_get_phone_number,
+            register.hero_get_sms_code,
+            register.handle_birthday_page,
+            register.handle_onboarding,
+            register._get_and_verify_phone,
+            register.register,
+            register.main,
+        ):
+            self.assertNotRegex(
+                inspect.getsource(function),
+                r"print\(f[^\n]*\{(?:e|exc|err_msg)\}",
+            )
+        self.assertNotRegex(
+            inspect.getsource(register.handle_onboarding),
+            r"log_claude_flow_error\(\s*f",
+        )
+
+    def test_ninemail_safe_logger_never_renders_exception_or_account_secrets(self):
+        account = ClaudeEmailAccount(
+            "NINEMALL", "a@example.com", "pa", "client-a", "refresh-a"
+        )
+        leaked = (
+            "https://claude.ai/magic-link/path?password=pa&"
+            "client_id=client-a#refresh-a"
+        )
+        with patch("builtins.print") as output:
+            register.log_claude_flow_error(
+                "registration_step_failed", RuntimeError(leaked), account=account
+            )
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("registration_step_failed", rendered)
+        for secret in (
+            leaked,
+            "magic-link/path",
+            "password=pa",
+            "client_id=client-a",
+            "refresh-a",
+        ):
+            self.assertNotIn(secret, rendered)
 
 
 class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
         self.account = ClaudeEmailAccount(
             "NINEMALL", "a@example.com", "pa", "client-a", "refresh-a"
         )
@@ -150,9 +219,30 @@ class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return values
 
-    async def test_proxy_failure_marks_reserved_account_error(self):
-        leaked = "proxy failed with synthetic-secret"
+    def assert_secret_free(self, output, leaked):
+        rendered = " ".join(str(call) for call in output.call_args_list)
+        for secret in (
+            leaked,
+            "magic-link/path",
+            "password=pa",
+            "client_id=client-a",
+            "refresh-a",
+        ):
+            self.assertNotIn(secret, rendered)
+
+    async def test_unexpected_proxy_failure_releases_account_for_reselection(self):
+        (self.root / "mail.txt").write_text(
+            "a@example.com----pa----client-a----refresh-a\n",
+            encoding="utf-8",
+        )
+        store = ClaudeEmailAccountStore("NINEMALL", "mail.txt", self.root)
+        account = store.reserve_one()
+        leaked = (
+            "proxy failed https://claude.ai/magic-link/path?password=pa&"
+            "client_id=client-a#refresh-a"
+        )
         patches = self.main_patches(
+            prepare_email_accounts=([account], store),
             settings_from_env=SimpleNamespace(enabled=True),
             acquire_proxy=RuntimeError(leaked),
         )
@@ -169,14 +259,15 @@ class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             register, "BitBrowser", return_value=patches["BitBrowser"]
         ), patch.object(
-            register, "acquire_proxy", side_effect=register.IPMartProxyError(leaked)
+            register, "acquire_proxy", side_effect=patches["acquire_proxy"]
         ), patch("builtins.print") as output:
             await register.main()
 
-        self.store.mark_error.assert_called_once_with(
-            self.account, "registration_error"
-        )
-        self.assertNotIn(leaked, " ".join(str(call) for call in output.call_args_list))
+        self.assert_secret_free(output, leaked)
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", "mail.txt", self.root
+        ).reserve_one()
+        self.assertEqual(selected.email, account.email)
 
     async def test_escaped_registration_exception_is_sanitized_and_terminal(self):
         leaked = "registration failed with synthetic-secret"
@@ -203,10 +294,13 @@ class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.store.mark_error.assert_called_once_with(
             self.account, "registration_error"
         )
-        self.assertNotIn(leaked, " ".join(str(call) for call in output.call_args_list))
+        self.assert_secret_free(output, leaked)
 
     async def test_profile_creation_exception_is_sanitized_and_terminal(self):
-        leaked = "profile failed with synthetic-secret"
+        leaked = (
+            "network https://claude.ai/magic-link/path?password=pa&"
+            "client_id=client-a#refresh-a"
+        )
         patches = self.main_patches()
         with patch.object(sys, "argv", ["register.py", "--node", "none"]), patch.object(
             register, "prepare_email_accounts", return_value=patches["prepare_email_accounts"]
@@ -222,13 +316,95 @@ class ClaudeNineMallMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             register, "BitBrowser", return_value=patches["BitBrowser"]
         ), patch.object(
             register, "create_claude_profile", side_effect=RuntimeError(leaked)
+        ), patch.object(
+            register.asyncio, "sleep", new=AsyncMock()
         ), patch("builtins.print") as output:
             await register.main()
 
         self.store.mark_error.assert_called_once_with(
             self.account, "registration_error"
         )
-        self.assertNotIn(leaked, " ".join(str(call) for call in output.call_args_list))
+        self.assert_secret_free(output, leaked)
+
+    async def test_bitbrowser_construction_failure_releases_reserved_account(self):
+        (self.root / "mail.txt").write_text(
+            "a@example.com----pa----client-a----refresh-a\n",
+            encoding="utf-8",
+        )
+        store = ClaudeEmailAccountStore("NINEMALL", "mail.txt", self.root)
+        account = store.reserve_one()
+        leaked = "constructor failed #refresh-a?client_id=client-a"
+        with patch.object(sys, "argv", ["register.py", "--node", "none"]), patch.object(
+            register, "prepare_email_accounts", return_value=([account], store)
+        ), patch.object(
+            register, "lease_from_env", return_value=None
+        ), patch.object(
+            register, "settings_from_env", return_value=SimpleNamespace(enabled=False)
+        ), patch.object(
+            register, "prepare_claude_network"
+        ), patch.object(
+            register, "configure_claude_proxy"
+        ), patch.object(
+            register, "BitBrowser", side_effect=RuntimeError(leaked)
+        ), patch("builtins.print") as output, self.assertRaisesRegex(
+            RuntimeError, "browser_initialization_failed"
+        ):
+            await register.main()
+
+        self.assert_secret_free(output, leaked)
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", "mail.txt", self.root
+        ).reserve_one()
+        self.assertEqual(selected.email, account.email)
+
+    async def test_cancelled_partial_batch_releases_only_unfinished_accounts(self):
+        (self.root / "mail.txt").write_text(
+            "a@example.com----pa----client-a----refresh-a\n"
+            "b@example.com----pb----client-b----refresh-b\n",
+            encoding="utf-8",
+        )
+        store = ClaudeEmailAccountStore("NINEMALL", "mail.txt", self.root)
+        accounts = store.reserve_many(limit=2)
+        second_started = asyncio.Event()
+
+        async def registration(_profile_id, *, account, account_store, **_kwargs):
+            if account.email == "a@example.com":
+                account_store.mark_used(account)
+                return "synthetic-session"
+            second_started.set()
+            await asyncio.Future()
+
+        with patch.object(
+            sys, "argv", ["register.py", "--count", "2", "--concurrency", "2", "--node", "none"]
+        ), patch.object(
+            register, "prepare_email_accounts", return_value=(accounts, store)
+        ), patch.object(
+            register, "lease_from_env", return_value=None
+        ), patch.object(
+            register, "settings_from_env", return_value=SimpleNamespace(enabled=False)
+        ), patch.object(
+            register, "prepare_claude_network"
+        ), patch.object(
+            register, "configure_claude_proxy"
+        ), patch.object(
+            register, "BitBrowser", return_value=Mock()
+        ), patch.object(
+            register, "create_claude_profile", return_value="profile"
+        ), patch.object(
+            register, "register", new=registration
+        ), patch.object(
+            register.random, "uniform", return_value=0
+        ):
+            batch = asyncio.create_task(register.main())
+            await second_started.wait()
+            batch.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await batch
+
+        selected = ClaudeEmailAccountStore(
+            "NINEMALL", "mail.txt", self.root
+        ).reserve_many(limit=2)
+        self.assertEqual([account.email for account in selected], ["b@example.com"])
 
 
 if __name__ == "__main__":
