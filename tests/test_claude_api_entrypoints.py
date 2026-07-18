@@ -409,6 +409,16 @@ class ClaudeAPIEntrypointTests(unittest.TestCase):
             )
             self.assertIn("claude_api", platforms["choices"])
 
+    def test_webui_orchestrator_copy_describes_four_choices_and_prelaunch_routing(self):
+        for script_id in ("run_full_flow", "register_three_platforms"):
+            item = scripts.script_by_id(script_id)
+            copy = f'{item["title"]} {item["desc"]}'
+            self.assertIn("四平台", item["title"])
+            self.assertNotIn("三平台", copy)
+            self.assertIn("NINEMALL", item["desc"])
+            self.assertIn("OUTLOOK", item["desc"])
+            self.assertIn("启动前", item["desc"])
+
     def test_webui_claude_api_preview_redacts_mailbox_secrets(self):
         item = scripts.script_by_id("register_claude_api")
         values = {
@@ -452,6 +462,16 @@ class ClaudeAPIEntrypointTests(unittest.TestCase):
         ):
             self.assertIn(term, readme)
             self.assertIn(term, changelog)
+
+    def test_documentation_distinguishes_preselected_outlook_from_fallback(self):
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        for document in (readme, changelog):
+            self.assertIn("Claude 家族专用流程在启动前选择 NINEMALL", document)
+            self.assertIn("混合流程在启动前直接选择 OUTLOOK", document)
+            self.assertIn("不会先尝试 NINEMALL", document)
+            self.assertIn("不是 NINEMALL 失败后的回退", document)
 
     def test_claude_api_command_forwards_mailbox_credentials(self):
         command = register_three_platforms.build_command(

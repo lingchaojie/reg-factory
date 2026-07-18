@@ -257,7 +257,7 @@ NINEMALL 只接受精确的 HTTPS AppleEmail 源 `https://www.appleemail.top`，
 
 NINEMALL 的账号源是 `NINEMALL_EMAIL_FILE`（默认 `mail.txt`）；Claude 网页号的消费记录仅写入被忽略的旁路状态文件 `mail_used_claude.txt` 与 `mail_error_claude.txt`，不会写回源文件。预留只提供**进程内**保护，不提供跨进程锁；进程被强制终止后也不会自动恢复预留，必要时应审查这些旁路文件并保守地人工修复。
 
-只有平台列表完全属于 Claude 家族（`claude`、`claude_api`，可单选或同时选择）时，`register_three_platforms.py` 和 `run_full_flow.py` 才从 NINEMALL 池预留账号。包含 ChatGPT 或 Grok 的混合流程保持既有 Outlook 兼容路由；即使环境变量为 NINEMALL，Claude 子流程也会使用 Outlook 路径。因此不要把 NINEMALL 当作跨平台邮箱 provider。这个路由不表示 NINEMALL 失败后会降级：一旦进入 NINEMALL 流程，就严格不回退 Outlook、Graph、broker 或 Outlook 浏览器。
+Claude 家族专用流程在启动前选择 NINEMALL：平台列表完全属于 Claude 家族（`claude`、`claude_api`，可单选或同时选择）时，`register_three_platforms.py` 和 `run_full_flow.py` 从 NINEMALL 池预留账号；选定后严格不回退 OUTLOOK、Graph、broker 或 Outlook 浏览器。包含 ChatGPT 或 Grok 的混合流程在启动前直接选择 OUTLOOK，沿用原有邮箱池和兼容链路；它不会先尝试 NINEMALL，因此不是 NINEMALL 失败后的回退。不要把 NINEMALL 当作跨平台邮箱 provider。
 
 常用的纯 Claude 命令：
 
@@ -271,7 +271,7 @@ python run_full_flow.py --platforms claude --rounds 1
 
 `register_claude_api.py` 面向 `platform.claude.com`，只完成个人账户注册并保存登录会话。流程会明确选择“个人账户”；如果页面只提供组织创建则安全失败，绝不会创建或提交组织。本阶段也不创建 API Key，不执行充值、付费或支付操作。
 
-默认 `EMAIL_PROVIDER=NINEMALL` 时，邮箱轮询会按 Anthropic/Claude 发件信息和发码时间严格匹配新邮件，并从同一套消息扫描中提取两类验证产物：`https://platform.claude.com/magic-link` 与数字验证码。拿到任一当前页面可用的产物即可继续；超时会失败，严格不回退 Outlook。显式设置 `EMAIL_PROVIDER=OUTLOOK` 时才使用兼容链路（Graph → broker → Outlook 浏览器）。
+默认 `EMAIL_PROVIDER=NINEMALL` 时，邮箱轮询会按 Anthropic/Claude 发件信息和发码时间严格匹配新邮件，并从同一套消息扫描中提取两类验证产物：`https://platform.claude.com/magic-link` 与数字验证码。拿到任一当前页面可用的产物即可继续；超时会失败，严格不回退 OUTLOOK。显式设置 `EMAIL_PROVIDER=OUTLOOK`，或混合编排在启动前直接选择 OUTLOOK 时，才使用兼容链路（Graph → broker → Outlook 浏览器）。
 
 Claude 网页号与 Claude Platform 使用独立台账，互不占用成功/失败状态：
 
@@ -311,7 +311,7 @@ python register_three_platforms.py --from-pool --platforms claude claude_api
 
 ## 4. 运行
 
-### 端到端（注册邮箱 → 三平台注册）
+### 端到端（注册邮箱 → 四平台任选）
 ```bash
 python run_full_flow.py                       # 注册 1 个 outlook 号后在 claude 上注册
 python run_full_flow.py --platforms claude chatgpt grok
@@ -357,7 +357,7 @@ IPMart 的粘性时长由控制台/套餐决定，常见范围为 5-30 分钟；
 
 这项迁移只覆盖默认 Outlook → Claude 边界：启用 IPMart 后该链路不需要 Clash，也不会使用继承的 HTTP 代理。ChatGPT 和 Grok 不在这次迁移内，继续保持原有代理行为。
 
-### 仅三平台注册（已有邮箱池 emails.txt）
+### 平台注册（已有邮箱或所选邮箱渠道的账号池）
 ```bash
 python register_three_platforms.py --from-pool
 python register_three_platforms.py --email a@outlook.com --password xxx --token <refresh>
@@ -683,8 +683,8 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 
 | 脚本 | 职责 |
 |---|---|
-| `run_full_flow.py` | 端到端编排：注册邮箱 → 三平台注册 |
-| `register_three_platforms.py` | 三平台（Claude/ChatGPT/Grok）注册编排 |
+| `run_full_flow.py` | 端到端编排：注册邮箱 → 四平台任选 |
+| `register_three_platforms.py` | 四平台（Claude/Claude Platform/ChatGPT/Grok）注册编排 |
 | `register_claude_api.py` | Claude Platform 个人账户注册（不创建组织、API Key 或充值） |
 | `register.py` / `register_chatgpt.py` | Claude / ChatGPT 注册主流程 |
 | `register_grok_http.py` | Grok 注册主流程（纯 HTTP；支持 SSO → SUB2API Grok OAuth 即时导入） |
