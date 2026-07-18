@@ -18,6 +18,7 @@ from .gmail_auth import load_valid_credentials
 
 EXPECTED_SENDER = "jushihui@mail.jushipay.com"
 EXPECTED_SUBJECT = "NexaCard Verification Code"
+LOGIN_MESSAGE_QUERY = f'from:({EXPECTED_SENDER}) subject:"{EXPECTED_SUBJECT}" newer_than:1d'
 CODE_PATTERN = re.compile(r"(?<!\d)(\d{9})(?!\d)")
 
 
@@ -67,7 +68,17 @@ def parse_login_code(raw_message: str, internal_date_ms: int, sent_after: dateti
 
 
 class GmailCodeReader:
-    def _fetch_once(self, sent_after: datetime) -> str | None:
+    @staticmethod
+    def _matching_message_items(service) -> list[dict]:
+        return (
+            service.users()
+            .messages()
+            .list(userId="me", q=LOGIN_MESSAGE_QUERY, maxResults=10)
+            .execute()
+            .get("messages", [])
+        )
+
+    def _snapshot_login_message_ids_once(self) -> frozenset[str]:
         try:
             service = build(
                 "gmail",
@@ -75,19 +86,34 @@ class GmailCodeReader:
                 credentials=load_valid_credentials(),
                 cache_discovery=False,
             )
-            query = f'from:({EXPECTED_SENDER}) subject:"{EXPECTED_SUBJECT}" newer_than:1d'
-            items = (
-                service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=10)
-                .execute()
-                .get("messages", [])
+            return frozenset(
+                item["id"] for item in self._matching_message_items(service) if isinstance(item["id"], str)
             )
-            for item in items:
+        except (HttpError, OSError, TransportError, KeyError, TypeError, ValueError) as exc:
+            raise GmailTemporarilyUnavailable("Gmail API is temporarily unavailable") from exc
+
+    async def snapshot_login_message_ids(self) -> frozenset[str]:
+        """Return the bounded matching-message ID baseline before requesting a new code."""
+        return await asyncio.to_thread(self._snapshot_login_message_ids_once)
+
+    def _fetch_once(
+        self, sent_after: datetime, *, excluded_message_ids: frozenset[str] = frozenset()
+    ) -> str | None:
+        try:
+            service = build(
+                "gmail",
+                "v1",
+                credentials=load_valid_credentials(),
+                cache_discovery=False,
+            )
+            for item in self._matching_message_items(service):
+                message_id = item["id"]
+                if message_id in excluded_message_ids:
+                    continue
                 data = (
                     service.users()
                     .messages()
-                    .get(userId="me", id=item["id"], format="raw")
+                    .get(userId="me", id=message_id, format="raw")
                     .execute()
                 )
                 code = parse_login_code(data["raw"], int(data["internalDate"]), sent_after)
@@ -102,11 +128,21 @@ class GmailCodeReader:
         sent_after: datetime,
         interval_seconds: float = 3.0,
         max_attempts: int = 60,
+        *,
+        excluded_message_ids: frozenset[str] = frozenset(),
     ) -> str:
+        """Wait for a fresh code, excluding IDs present before the send request.
+
+        Gmail timestamps are millisecond-granular, so timestamp comparison alone
+        cannot distinguish a fast new email from an old email in that millisecond.
+        Callers snapshot matching IDs before sending and pass them here.
+        """
         last_temporary_error: GmailTemporarilyUnavailable | None = None
         for attempt in range(max_attempts):
             try:
-                code = await asyncio.to_thread(self._fetch_once, sent_after)
+                code = await asyncio.to_thread(
+                    self._fetch_once, sent_after, excluded_message_ids=excluded_message_ids
+                )
                 last_temporary_error = None
             except GmailTemporarilyUnavailable as exc:
                 last_temporary_error = exc

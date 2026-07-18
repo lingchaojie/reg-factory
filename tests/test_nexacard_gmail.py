@@ -51,6 +51,48 @@ class NexaCardGmailTests(unittest.TestCase):
             "123456789",
         )
 
+    def test_baseline_message_ids_skip_old_same_millisecond_code_but_accept_new_one(self):
+        raw = _encoded(Path("tests/fixtures/nexacard_verification_code.eml").read_bytes())
+        sent_after = datetime(2026, 7, 19, 4, 54, 0, 123456, tzinfo=timezone.utc)
+        message_id = int(sent_after.timestamp() * 1000)
+        messages = Mock()
+        messages.list.return_value.execute.return_value = {
+            "messages": [{"id": "old"}, {"id": "new"}]
+        }
+        messages.get.return_value.execute.return_value = {"raw": raw, "internalDate": str(message_id)}
+        service = Mock()
+        service.users.return_value.messages.return_value = messages
+        reader = GmailCodeReader()
+
+        with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+            "nexacard_otp.gmail_reader.load_valid_credentials"
+        ):
+            code = reader._fetch_once(sent_after, excluded_message_ids=frozenset({"old"}))
+
+        self.assertEqual(code, "123456789")
+        messages.get.assert_called_once_with(userId="me", id="new", format="raw")
+
+    def test_message_id_snapshot_uses_the_same_bounded_matching_query(self):
+        messages = Mock()
+        messages.list.return_value.execute.return_value = {
+            "messages": [{"id": "old"}, {"id": "new"}]
+        }
+        service = Mock()
+        service.users.return_value.messages.return_value = messages
+        reader = GmailCodeReader()
+
+        with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+            "nexacard_otp.gmail_reader.load_valid_credentials"
+        ):
+            snapshot = asyncio.run(reader.snapshot_login_message_ids())
+
+        self.assertEqual(snapshot, frozenset({"old", "new"}))
+        messages.list.assert_called_once_with(
+            userId="me",
+            q='from:(jushihui@mail.jushipay.com) subject:"NexaCard Verification Code" newer_than:1d',
+            maxResults=10,
+        )
+
     def test_sender_and_subject_must_match_exactly(self):
         messages = (
             b"From: attacker <jushihui@mail.jushipay.com.attacker.test>\n"
