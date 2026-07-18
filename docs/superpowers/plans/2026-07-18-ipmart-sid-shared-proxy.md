@@ -15,7 +15,7 @@
 - The configured username template must contain exactly one literal `{sid}` placeholder.
 - Outlook BitBrowser, Microsoft OAuth token extraction, Graph mailbox reads, and Claude BitBrowser must use one identical lease.
 - Perform one initial exit-IP check and one pre-Claude recheck; a normal successful round performs exactly two dedicated IP-check requests.
-- Retry initial SID validation at most three times, using a new SID for each attempt.
+- Retry initial SID validation up to `IPMART_MAX_ATTEMPTS` (default `3`), using a new SID for each attempt; the configured positive value is the limit and is not hard-capped at three.
 - If the pre-Claude exit differs, preserve Outlook and stop; never continue with a new SID.
 - Do not fall back to Clash, direct access, or an existing BitBrowser profile while IPMart is enabled for Outlook/Claude.
 - Preserve current behavior when IPMart is disabled.

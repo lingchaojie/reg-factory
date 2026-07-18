@@ -31,8 +31,8 @@ enabled.
 - Verify the real exit IP once before Outlook and once immediately before
   Claude.
 - A normal successful round therefore performs exactly two IP-check requests.
-- Retry initial SID creation/validation at most three times. Each retry uses a
-  new SID.
+- Retry initial SID creation/validation up to the configured
+  `IPMART_MAX_ATTEMPTS` value (default `3`). Each retry uses a new SID.
 - Use the real exit IP as the uniqueness key and keep the existing persistent
   JSONL usage ledger.
 - If the exit changes before Claude, stop the round and preserve the registered
@@ -259,7 +259,7 @@ changing unrelated platforms.
 - Missing or malformed SID configuration: fail before a browser profile is
   created.
 - Proxy authentication failure, timeout, invalid IP-check response, or duplicate
-  exit: retry with a new SID within the three-attempt initial budget.
+  exit: retry with a new SID within the configured initial-attempt budget.
 - Initial attempts exhausted: stop the account round without Clash or direct
   fallback.
 - BitBrowser rejects credentialed proxy fields: fail the account and execute
@@ -283,8 +283,9 @@ A normal account round performs exactly two dedicated IP-check requests:
 
 The responses are only an IP address plus normal HTTP/TLS overhead. Browser and
 Graph business traffic is not counted as probing. Failed initial candidates can
-add at most one check per attempt; if the third candidate succeeds, the maximum
-for a completed round is four checks including the pre-Claude recheck.
+add at most one check per configured attempt. If the final configured candidate
+succeeds, the maximum for a completed round is `IPMART_MAX_ATTEMPTS + 1` checks
+including the pre-Claude recheck (four checks with the default value of `3`).
 
 ## Testing Strategy
 
