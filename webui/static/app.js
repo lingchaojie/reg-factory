@@ -255,10 +255,6 @@ $('#btn-stop').onclick = async ()=>{
 };
 
 // ---------------------------------------------------------------- 配置页
-function envControlValue(i){
-  return i.type === 'checkbox' ? (i.checked ? 'true' : 'false') : i.value;
-}
-
 async function loadEnv(){
   const data = await (await fetch('/api/env')).json();
   const wrap = $('#env-groups'); wrap.innerHTML='';
@@ -274,13 +270,10 @@ async function loadEnv(){
       const row = document.createElement('div'); row.className='env-item';
       const type = it.secret ? 'password':'text';
       const value = it.value || it.default || '';
-      const boolChecked = ['1','true','yes','on'].includes(
-        String(value).trim().toLowerCase()
-      );
       const control = it.type === 'choice'
         ? `<select data-env="${it.key}">${(it.choices||[]).map(c=>`<option value="${c}" ${c===value?'selected':''}>${c}</option>`).join('')}</select>`
         : it.type === 'bool'
-          ? `<input type="checkbox" data-env="${it.key}" ${boolChecked?'checked':''}>`
+          ? EnvControls.renderBooleanControl(it.key, value)
           : `<input type="${type}" data-env="${it.key}" value="${(it.value||'').replace(/"/g,'&quot;')}"
                    placeholder="${it.default? '默认 '+it.default : ''}">`;
       row.innerHTML = `
@@ -301,11 +294,9 @@ async function loadEnv(){
 
 // 连通测试：把当前页面所有 .env 输入(含未保存的)一起发过去，用最新值测
 async function runTest(target, btn){
-  const env = {};
-  $$('input[data-env],select[data-env]').forEach(i=>{
-    const value = envControlValue(i);
-    if(value!=='') env[i.dataset.env]=value;
-  });
+  const env = EnvControls.collectForConnectionTest(
+    $$('input[data-env],select[data-env]')
+  );
   const old = btn.textContent;
   btn.disabled = true; btn.textContent = '测试中…';
   const res = btn.closest('.env-group').querySelector('.test-result');
@@ -323,10 +314,9 @@ async function runTest(target, btn){
 }
 
 $('#btn-save-env').onclick = async ()=>{
-  const env = {};
-  $$('input[data-env],select[data-env]').forEach(i=>{
-    env[i.dataset.env] = envControlValue(i);
-  });
+  const env = EnvControls.collectForSave(
+    $$('input[data-env],select[data-env]')
+  );
   const r = await (await fetch('/api/env',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({env})})).json();
   const msg = $('#env-msg');

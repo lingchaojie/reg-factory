@@ -267,13 +267,20 @@ class OctoProviderIntegrationTests(unittest.TestCase):
         )
         self.assertIn("octo: 'Octo Browser'", source)
 
-    def test_frontend_renders_and_serializes_boolean_env_items(self):
+    def test_frontend_loads_and_uses_boolean_env_controls(self):
         source = Path(server.WEBUI, "static", "app.js").read_text(
             encoding="utf-8"
         )
-        self.assertIn("it.type === 'bool'", source)
-        self.assertIn('type="checkbox"', source)
-        self.assertIn("i.checked ? 'true' : 'false'", source)
+        index = Path(server.WEBUI, "static", "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            index.index("/static/env-controls.js"),
+            index.index("/static/app.js"),
+        )
+        self.assertIn("EnvControls.renderBooleanControl(it.key, value)", source)
+        self.assertIn("EnvControls.collectForConnectionTest(", source)
+        self.assertIn("EnvControls.collectForSave(", source)
 
     def test_webui_masks_saved_octo_token(self):
         with tempfile.TemporaryDirectory() as tmp:
