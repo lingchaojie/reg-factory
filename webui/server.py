@@ -41,7 +41,10 @@ sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 import scripts as schema  # noqa: E402
 from common.ipmart_proxy import settings_from_env  # noqa: E402
-from common.network_route import prepare_clash_or_direct  # noqa: E402
+from common.network_route import (  # noqa: E402
+    RESOLVED_ROUTE_ENV_KEY,
+    prepare_clash_or_direct,
+)
 
 
 def _ensure_proxy_env():
@@ -49,7 +52,11 @@ def _ensure_proxy_env():
     merged.update(BOOT_ENV)
     merged.update(os.environ)
     os.environ.update(merged)
-    prepare_clash_or_direct(os.environ)
+    os.environ.pop(RESOLVED_ROUTE_ENV_KEY, None)
+    try:
+        prepare_clash_or_direct(os.environ)
+    finally:
+        os.environ.pop(RESOLVED_ROUTE_ENV_KEY, None)
 
 
 app = FastAPI(title="reg-factory WebUI")
@@ -834,6 +841,7 @@ def _child_env():
     for key, value in _parse_env_file(ENV_PATH).items():
         if key not in BOOT_ENV:
             env[key] = value
+    env.pop(RESOLVED_ROUTE_ENV_KEY, None)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     if not settings_from_env(env).enabled:

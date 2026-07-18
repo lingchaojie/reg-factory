@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from common.network_route import RESOLVED_ROUTE_ENV_KEY
 from webui import server
 
 
@@ -46,6 +47,7 @@ class WebUIEnvReloadTests(unittest.TestCase):
             self.assertEqual(
                 os.environ["HTTPS_PROXY"], "http://dotenv.example:7897"
             )
+            self.assertNotIn(RESOLVED_ROUTE_ENV_KEY, os.environ)
 
     def test_startup_route_keeps_process_proxy_over_dotenv(self):
         tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
@@ -64,6 +66,54 @@ class WebUIEnvReloadTests(unittest.TestCase):
         ):
             server._ensure_proxy_env()
             self.assertEqual(os.environ["HTTPS_PROXY"], process_proxy)
+
+    def test_separate_tasks_refresh_direct_to_clash(self):
+        proxy = "http://127.0.0.1:7897"
+        connector = Mock(
+            side_effect=[ConnectionRefusedError("listener down"), Mock()]
+        )
+        with patch.object(server, "ENV_PATH", self._env_file("unused")), patch.object(
+            server, "BOOT_ENV", {}
+        ), patch.dict(
+            os.environ,
+            {"CLASH_PROXY": proxy, RESOLVED_ROUTE_ENV_KEY: "direct"},
+            clear=True,
+        ), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            first_task = server._child_env()
+            second_task = server._child_env()
+
+        self.assertEqual(connector.call_count, 2)
+        self.assertEqual(first_task[RESOLVED_ROUTE_ENV_KEY], "direct")
+        self.assertEqual(second_task[RESOLVED_ROUTE_ENV_KEY], "clash")
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertNotIn(key, first_task)
+            self.assertEqual(second_task[key], proxy)
+
+    def test_separate_tasks_refresh_clash_to_direct(self):
+        proxy = "http://127.0.0.1:7897"
+        connector = Mock(
+            side_effect=[Mock(), ConnectionRefusedError("listener down")]
+        )
+        with patch.object(server, "ENV_PATH", self._env_file("unused")), patch.object(
+            server, "BOOT_ENV", {}
+        ), patch.dict(
+            os.environ,
+            {"CLASH_PROXY": proxy, RESOLVED_ROUTE_ENV_KEY: "clash"},
+            clear=True,
+        ), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            first_task = server._child_env()
+            second_task = server._child_env()
+
+        self.assertEqual(connector.call_count, 2)
+        self.assertEqual(first_task[RESOLVED_ROUTE_ENV_KEY], "clash")
+        self.assertEqual(second_task[RESOLVED_ROUTE_ENV_KEY], "direct")
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertEqual(first_task[key], proxy)
+            self.assertNotIn(key, second_task)
 
     def test_saved_octo_bases_are_visible_to_new_children(self):
         tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)

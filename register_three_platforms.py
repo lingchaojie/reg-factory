@@ -30,7 +30,10 @@ from common.claude_email_accounts import (
     ClaudeEmailAccountStore,
     normalize_email_provider,
 )
-from common.network_route import prepare_clash_or_direct
+from common.network_route import (
+    RESOLVED_ROUTE_ENV_KEY,
+    prepare_clash_or_direct,
+)
 from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_async_process,
@@ -249,10 +252,12 @@ def broker_release(broker_url, email):
         print(f"  [broker] release failed: {e}")
 
 
-def child_env_for(args):
+def child_env_for(args, *, fresh_route=False):
     """子进程环境：注入 MAILBOX_BROKER 让三脚本走共享取码（不再各自开 Outlook）。"""
     _load_dotenv(os.path.join(ROOT, ".env"))
     env = dict(os.environ)
+    if fresh_route:
+        env.pop(RESOLVED_ROUTE_ENV_KEY, None)
     if args.broker:
         env["MAILBOX_BROKER"] = args.broker
         env["GROK_BROKER_TIMEOUT"] = str(args.grok_timeout)
@@ -260,6 +265,11 @@ def child_env_for(args):
     if env.get("ACCOUNT_PROXY_SOURCE") != "ipmart":
         prepare_clash_or_direct(env)
     return env
+
+
+async def process_loop_account(account, args):
+    child_env = child_env_for(args, fresh_route=True)
+    return await process_account(account, args, child_env)
 
 
 def platform_child_env(platform, base_env, platforms=None):
@@ -376,15 +386,13 @@ async def main():
     parser.add_argument("--max-inflight", type=int, default=1, help="同时在处理的邮箱数（每号峰值≈3注册窗口+1broker窗口）")
     parser.add_argument("--poll-wait", type=int, default=20, help="池空时等待产号的轮询秒数")
     args = parser.parse_args()
-    child_env = child_env_for(args)
-
     if args.loop:
         print(f"  [loop] consumer started  max_inflight={args.max_inflight}  broker={args.broker or 'OFF'}  platforms={','.join(args.platforms)}")
         tasks = set()
 
         async def guarded(acc):
             try:
-                await process_account(acc, args, child_env)
+                await process_loop_account(acc, args)
             except Exception as e:
                 print(f"  [loop] account {acc[0]} error: {e}")
 
@@ -401,6 +409,7 @@ async def main():
             tasks.add(t)
             t.add_done_callback(tasks.discard)
     else:
+        child_env = child_env_for(args)
         account = parse_account(args)
         results = await process_account(account, args, child_env)
         provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))

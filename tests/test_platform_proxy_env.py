@@ -1,10 +1,12 @@
 import argparse
+import asyncio
 import os
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 import register_three_platforms
+from common.network_route import RESOLVED_ROUTE_ENV_KEY
 
 
 ACCOUNT_PROXY_KEYS = (
@@ -135,6 +137,108 @@ class PlatformProxyEnvTests(unittest.TestCase):
             self.assertEqual(
                 child["HTTPS_PROXY"], "http://dotenv.example:7897"
             )
+
+
+class _StopLoop(BaseException):
+    pass
+
+
+class LoopAccountRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def capture_account_envs(self, connector_effects, stale_mode):
+        args = argparse.Namespace(
+            broker="",
+            grok_timeout=40,
+            loop=True,
+            max_inflight=1,
+            poll_wait=20,
+            platforms=["chatgpt", "grok"],
+        )
+        accounts = [
+            ("first@example.com", "Pass1!", "", ""),
+            ("second@example.com", "Pass2!", "", ""),
+        ]
+        captured = []
+        original_sleep = asyncio.sleep
+
+        async def yielding_sleep(_delay):
+            await original_sleep(0)
+
+        async def capture_process(_account, _args, child_env):
+            descendants = [
+                register_three_platforms.platform_child_env(
+                    platform, child_env, _args.platforms
+                )
+                for platform in _args.platforms
+            ]
+            captured.append((dict(child_env), descendants))
+            return []
+
+        connector = Mock(side_effect=connector_effects)
+        with patch.object(
+            register_three_platforms.argparse.ArgumentParser,
+            "parse_args",
+            return_value=args,
+        ), patch.object(
+            register_three_platforms,
+            "next_pool_account",
+            side_effect=[*accounts, _StopLoop()],
+        ), patch.object(
+            register_three_platforms,
+            "process_account",
+            side_effect=capture_process,
+        ), patch.object(
+            register_three_platforms.asyncio,
+            "sleep",
+            side_effect=yielding_sleep,
+        ), patch.object(
+            register_three_platforms, "_load_dotenv"
+        ), patch.dict(
+            os.environ,
+            {
+                "CLASH_PROXY": "http://127.0.0.1:7897",
+                RESOLVED_ROUTE_ENV_KEY: stale_mode,
+            },
+            clear=True,
+        ), patch(
+            "common.network_route.socket.create_connection", connector
+        ):
+            with self.assertRaises(_StopLoop):
+                await register_three_platforms.main()
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(connector.call_count, 2)
+        return captured
+
+    def assert_account_route(self, captured, index, expected_mode):
+        account_env, descendants = captured[index]
+        self.assertEqual(account_env[RESOLVED_ROUTE_ENV_KEY], expected_mode)
+        for descendant in descendants:
+            self.assertEqual(
+                descendant[RESOLVED_ROUTE_ENV_KEY], expected_mode
+            )
+        for key in HTTP_PROXY_KEYS:
+            if expected_mode == "clash":
+                self.assertEqual(account_env[key], account_env["CLASH_PROXY"])
+                for descendant in descendants:
+                    self.assertEqual(descendant[key], account_env["CLASH_PROXY"])
+            else:
+                self.assertNotIn(key, account_env)
+                for descendant in descendants:
+                    self.assertNotIn(key, descendant)
+
+    async def test_separate_loop_accounts_refresh_direct_to_clash(self):
+        captured = await self.capture_account_envs(
+            [ConnectionRefusedError("listener down"), Mock()], "direct"
+        )
+        self.assert_account_route(captured, 0, "direct")
+        self.assert_account_route(captured, 1, "clash")
+
+    async def test_separate_loop_accounts_refresh_clash_to_direct(self):
+        captured = await self.capture_account_envs(
+            [Mock(), ConnectionRefusedError("listener down")], "clash"
+        )
+        self.assert_account_route(captured, 0, "clash")
+        self.assert_account_route(captured, 1, "direct")
 
 
 class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
