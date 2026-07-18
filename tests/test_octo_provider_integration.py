@@ -167,6 +167,9 @@ class OctoProviderIntegrationTests(unittest.TestCase):
         items = {item["key"]: item for item in group["items"]}
         self.assertIn("octo", items["FINGERPRINT_BROWSER"]["choices"])
         self.assertIn("OCTO_API_TOKEN", items)
+        self.assertIn("OCTO_HEADLESS", items)
+        self.assertEqual(items["OCTO_HEADLESS"]["type"], "bool")
+        self.assertIs(items["OCTO_HEADLESS"]["default"], False)
         self.assertIn("OCTO_PUBLIC_API_BASE", items)
         self.assertIn("OCTO_LOCAL_API_BASE", items)
         self.assertTrue(items["OCTO_API_TOKEN"]["secret"])
@@ -263,6 +266,14 @@ class OctoProviderIntegrationTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("octo: 'Octo Browser'", source)
+
+    def test_frontend_renders_and_serializes_boolean_env_items(self):
+        source = Path(server.WEBUI, "static", "app.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("it.type === 'bool'", source)
+        self.assertIn('type="checkbox"', source)
+        self.assertIn("i.checked ? 'true' : 'false'", source)
 
     def test_webui_masks_saved_octo_token(self):
         with tempfile.TemporaryDirectory() as tmp:
