@@ -40,20 +40,12 @@ K12_LOG_PATH = os.path.join(K12_DIR, "server.log")
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 import scripts as schema  # noqa: E402
+from common.ipmart_proxy import settings_from_env  # noqa: E402
+from common.network_route import prepare_clash_or_direct  # noqa: E402
 
 
 def _ensure_proxy_env():
-    """接码等公网服务直连不通(sms-man 直连超时)，必须经 Clash。把 CLASH_PROXY 注进本进程
-    环境，让 common.sms 的 requests(trust_env) 自动走代理；localhost API 直连(NO_PROXY)。"""
-    proxy = ""
-    try:
-        proxy = _read_config_val("CLASH_PROXY", "http://127.0.0.1:7897")
-    except Exception:
-        proxy = "http://127.0.0.1:7897"
-    if proxy and not os.environ.get("HTTPS_PROXY"):
-        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
-        os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
-        os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost,::1"
+    prepare_clash_or_direct(os.environ)
 
 
 app = FastAPI(title="reg-factory WebUI")
@@ -805,11 +797,8 @@ def _child_env():
             env[key] = value
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    proxy = env.get("CLASH_PROXY", "http://127.0.0.1:7897").strip()
-    if proxy:
-        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = proxy
-        env["http_proxy"] = env["https_proxy"] = proxy
-        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
+    if not settings_from_env(env).enabled:
+        prepare_clash_or_direct(env)
     return env
 
 

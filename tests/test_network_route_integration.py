@@ -1,0 +1,84 @@
+import argparse
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import outlook_reg_loop
+import register
+import register_three_platforms
+import run_full_flow
+from common.network_route import NetworkRoute
+
+
+class NetworkRouteIntegrationTests(unittest.TestCase):
+    def test_full_flow_strips_dead_clash_when_ipmart_is_disabled(self):
+        args = argparse.Namespace(
+            proxy="http://127.0.0.1:7897",
+            clash_api="http://127.0.0.1:9097",
+            clash_secret="",
+            clash_group="GLOBAL",
+        )
+        base = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+        }
+        with patch.object(run_full_flow.os, "environ", base), patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            env = run_full_flow.build_child_env(args)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertNotIn(key, env)
+
+    def test_outlook_uses_direct_when_clash_is_unreachable(self):
+        env = {
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+        }
+        with patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            selected = outlook_reg_loop.prepare_outlook_network(env)
+        self.assertEqual(selected, "")
+        self.assertNotIn("HTTP_PROXY", env)
+
+    def test_claude_skips_node_selection_in_direct_mode(self):
+        with patch.object(register, "_pick_claude_node") as pick:
+            register.configure_claude_proxy(
+                "auto",
+                account_lease=None,
+                ipmart_enabled=False,
+                clash_available=False,
+            )
+        pick.assert_not_called()
+        self.assertIsNone(register.CLAUDE_PROXY_NODE)
+
+    def test_platform_child_env_does_not_rebuild_dead_clash(self):
+        env = {
+            "IPMART_ENABLED": "0",
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+        }
+        with patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            child = register_three_platforms.platform_child_env(
+                "grok", env, ["grok"]
+            )
+        self.assertNotIn("HTTP_PROXY", child)
+
+    def test_ipmart_branch_does_not_probe_or_change_coverage(self):
+        env = {"IPMART_ENABLED": "1", "HTTP_PROXY": "http://legacy"}
+        lease = SimpleNamespace(host="gateway", port=8000, exit_ip="203.0.113.8")
+        with patch("common.network_route.resolve_clash_route") as resolve:
+            register.prepare_claude_network(
+                env, account_lease=lease, ipmart_enabled=True
+            )
+        resolve.assert_not_called()
+        self.assertNotIn("HTTP_PROXY", env)
+
+
+if __name__ == "__main__":
+    unittest.main()

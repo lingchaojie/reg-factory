@@ -30,6 +30,7 @@ from common.claude_email_accounts import (
     ClaudeEmailAccountStore,
     normalize_email_provider,
 )
+from common.network_route import prepare_clash_or_direct
 from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_async_process,
@@ -262,6 +263,8 @@ def platform_child_env(platform, base_env, platforms=None):
     if platform == "claude":
         if env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
             strip_http_proxy_env(env)
+        else:
+            prepare_clash_or_direct(env)
         if (
             platforms is not None
             and set(platforms) != {"claude"}
@@ -280,6 +283,8 @@ def platform_child_env(platform, base_env, platforms=None):
             if clash_proxy:
                 env["HTTP_PROXY"] = env["HTTPS_PROXY"] = clash_proxy
                 env["http_proxy"] = env["https_proxy"] = clash_proxy
+        return env
+    prepare_clash_or_direct(env)
     return env
 
 

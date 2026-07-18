@@ -1,6 +1,6 @@
 import argparse
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import register_three_platforms
 
@@ -67,7 +67,7 @@ class PlatformProxyEnvTests(unittest.TestCase):
                 for key in ACCOUNT_PROXY_KEYS:
                     self.assertNotIn(key, env)
 
-    def test_chatgpt_and_grok_preserve_proxies_without_ipmart_lease(self):
+    def test_chatgpt_and_grok_use_reachable_clash_without_ipmart_lease(self):
         base_env = {
             "CLASH_PROXY": "http://127.0.0.1:7897",
             "HTTP_PROXY": "http://upper-http.example",
@@ -77,11 +77,35 @@ class PlatformProxyEnvTests(unittest.TestCase):
         }
         for platform in ("chatgpt", "grok"):
             with self.subTest(platform=platform):
+                with patch(
+                    "common.network_route.socket.create_connection",
+                    return_value=Mock(),
+                ):
+                    env = register_three_platforms.platform_child_env(
+                        platform, base_env
+                    )
+                for key in HTTP_PROXY_KEYS:
+                    self.assertEqual(env[key], base_env["CLASH_PROXY"])
+                self.assertIsNot(env, base_env)
+
+    def test_chatgpt_and_grok_strip_dead_clash_without_ipmart_lease(self):
+        base_env = {
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+            "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "http_proxy": "http://127.0.0.1:7897",
+            "https_proxy": "http://127.0.0.1:7897",
+        }
+        for platform in ("chatgpt", "grok"):
+            with self.subTest(platform=platform), patch(
+                "common.network_route.socket.create_connection",
+                side_effect=ConnectionRefusedError,
+            ):
                 env = register_three_platforms.platform_child_env(
                     platform, base_env
                 )
-                self.assertEqual(env, base_env)
-                self.assertIsNot(env, base_env)
+            for key in HTTP_PROXY_KEYS:
+                self.assertNotIn(key, env)
 
 
 class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
@@ -201,9 +225,13 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
             if key not in ACCOUNT_PROXY_KEYS
         }
         requested = ["chatgpt", "grok", "claude"]
-        order, _captured = await self.capture_launch_order(
-            requested, False, env
-        )
+        with patch(
+            "common.network_route.socket.create_connection",
+            return_value=Mock(),
+        ):
+            order, _captured = await self.capture_launch_order(
+                requested, False, env
+            )
         self.assertEqual(order, requested)
 
 

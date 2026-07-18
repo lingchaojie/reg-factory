@@ -40,6 +40,7 @@ import requests
 from xconsole_client import XConsoleAuthClient, config as C
 
 from common import proxy_switch
+from common.network_route import prepare_clash_or_direct
 from common.temp_email import create_mailbox, _scan_once
 from common.session_export import save_grok_token
 from common.token_upload_state import mark_uploaded
@@ -373,32 +374,48 @@ def main():
     print(f"  Grok Auto Register (HTTP)  count={args.count} node={args.node}")
     print("=" * 50)
 
+    global CLASH_PROXY
+    route = prepare_clash_or_direct(os.environ)
+    CLASH_PROXY = route.proxy_url if route.mode == "clash" else None
+    clash_available = route.mode == "clash"
+    if not clash_available:
+        print(
+            "  [proxy] Clash unavailable; "
+            "Grok HTTP is using direct connection"
+        )
+
     # 选节点过 grok CF（curl_cffi 走 Clash mixed-port 出口）
-    try:
-        if args.node and args.node.lower() != "auto":
-            target = _resolve_node(args.node)
-            if target != args.node:
-                print(f"  节点名解析: '{args.node}' -> '{target}'")
-            proxy_switch.set_node(target)
-            time.sleep(2)
-            print(f"  使用指定节点 -> {proxy_switch.current_node()}")
-        else:
-            print("  自动探测能完整加载 xAI 注册页的节点...")
-            node = _find_signup_node()
-            if not node:
-                print("  没找到能过 grok CF 的节点(稍后重试)")
-                return 1
-            print(f"  选用节点: {node}")
-    except Exception as e:
-        print(f"  切节点失败(确认 Clash 在跑): {e}")
-        return 1
+    if clash_available:
+        try:
+            if args.node and args.node.lower() not in {"auto", "none"}:
+                target = _resolve_node(args.node)
+                if target != args.node:
+                    print(
+                        f"  node resolved: '{args.node}' -> '{target}'"
+                    )
+                proxy_switch.set_node(target)
+                time.sleep(2)
+                print(
+                    f"  selected node -> {proxy_switch.current_node()}"
+                )
+            elif args.node.lower() == "auto":
+                print("  probing xAI-compatible Clash nodes...")
+                node = _find_signup_node()
+                if not node:
+                    print("  no working Grok Clash node found")
+                    return 1
+                print(f"  selected node: {node}")
+        except Exception as exc:
+            print(f"  Clash node selection failed: {exc}")
+            return 1
 
     results = []
     last_attempt_failed = False
     for i in range(1, args.count + 1):
         try:
             if (
-                i > 1
+                clash_available
+                and i > 1
                 and args.node.lower() == "auto"
                 and args.rotate_every > 0
                 and (i - 1) % args.rotate_every == 0
@@ -417,7 +434,12 @@ def main():
             )
             results.append(result)
             last_attempt_failed = not bool(result)
-            if last_attempt_failed and args.node.lower() == "auto" and i < args.count:
+            if (
+                clash_available
+                and last_attempt_failed
+                and args.node.lower() == "auto"
+                and i < args.count
+            ):
                 print(f"\n  #{i} 失败，立即更换注册节点...")
                 rotated = _find_signup_node()
                 print(f"  新节点: {rotated or proxy_switch.current_node()}")

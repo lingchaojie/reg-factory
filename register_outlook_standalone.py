@@ -52,31 +52,15 @@ except Exception:
 # importlib 从任意路径加载时也能找到 common 包。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import human_mouse as _hm
+from common.network_route import prepare_clash_or_direct
 
 # BitBrowser local API
 BITBROWSER_API = os.environ.get("BITBROWSER_API", "http://127.0.0.1:54345")
 
 
 def ensure_clash_proxy_env():
-    """Use .env CLASH_PROXY for direct standalone runs, while local APIs stay direct."""
-    existing = (
-        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        or ""
-    ).strip()
-    proxy = existing or os.environ.get("CLASH_PROXY", "").strip()
-    if not proxy:
-        return ""
-    if not existing:
-        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
-        os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
-    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-    parts = [p.strip() for p in no_proxy.split(",") if p.strip()]
-    for item in ("127.0.0.1", "localhost", "::1"):
-        if item not in parts:
-            parts.append(item)
-    os.environ["NO_PROXY"] = os.environ["no_proxy"] = ",".join(parts)
-    return proxy
+    route = prepare_clash_or_direct(os.environ)
+    return route.proxy_url if route.mode == "clash" else ""
 
 
 def _fingerprint_provider():

@@ -45,6 +45,7 @@ from common.ipmart_proxy import (
     acquire_proxy,
     settings_from_env,
 )
+from common.network_route import NetworkRoute, prepare_clash_or_direct
 from common.claude_email_accounts import (
     ClaudeEmailAccount,
     ClaudeEmailAccountStore,
@@ -134,11 +135,12 @@ def _pick_claude_node():
 
 def prepare_claude_network(
     env=None, *, account_lease=None, ipmart_enabled=False
-):
+) -> NetworkRoute | None:
     env = os.environ if env is None else env
     if account_lease is not None or ipmart_enabled:
         strip_http_proxy_env(env)
-    return env
+        return None
+    return prepare_clash_or_direct(env)
 
 
 def log_claude_flow_error(message, error=None, *, account=None, provider=None):
@@ -152,7 +154,11 @@ def log_claude_flow_error(message, error=None, *, account=None, provider=None):
 
 
 def configure_claude_proxy(
-    node_arg, account_lease=None, *, ipmart_enabled=False
+    node_arg,
+    account_lease=None,
+    *,
+    ipmart_enabled=False,
+    clash_available=True,
 ):
     global CLAUDE_PROXY_NODE
     CLAUDE_PROXY_NODE = None
@@ -165,6 +171,9 @@ def configure_claude_proxy(
         return
     if ipmart_enabled:
         print("  [proxy] IPMart enabled; skipping Clash node selection")
+        return
+    if not clash_available:
+        print("  [proxy] Clash unavailable; using direct connection")
         return
     if not node_arg or node_arg.lower() == "none":
         return
@@ -4228,7 +4237,7 @@ async def main():
 
     inherited_lease = lease_from_env()
     ipmart_settings = settings_from_env()
-    prepare_claude_network(
+    legacy_route = prepare_claude_network(
         os.environ,
         account_lease=inherited_lease,
         ipmart_enabled=ipmart_settings.enabled,
@@ -4237,6 +4246,9 @@ async def main():
         args.node,
         inherited_lease,
         ipmart_enabled=ipmart_settings.enabled,
+        clash_available=(
+            legacy_route is None or legacy_route.mode == "clash"
+        ),
     )
 
     print("=" * 50)

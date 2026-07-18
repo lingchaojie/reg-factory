@@ -61,6 +61,7 @@ from common.ipmart_proxy import (
     settings_from_env,
     verify_proxy,
 )
+from common.network_route import prepare_clash_or_direct
 from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_sync_process,
@@ -152,6 +153,14 @@ def build_child_env(args):
     env.setdefault("CLASH_API", args.clash_api)
     env.setdefault("CLASH_SECRET", args.clash_secret)
     env.setdefault("CLASH_GROUP", args.clash_group)
+    ipmart_enabled = settings_from_env(env).enabled
+    if not ipmart_enabled:
+        route = prepare_clash_or_direct(env)
+        log(
+            "network route: Clash"
+            if route.mode == "clash"
+            else f"network route: direct ({route.reason})"
+        )
     return env
 
 

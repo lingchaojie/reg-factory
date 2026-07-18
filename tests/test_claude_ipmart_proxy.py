@@ -74,13 +74,20 @@ class ClaudeIPMartProxyTests(unittest.TestCase):
         )
         self.assertEqual(env, {})
 
-    def test_disabled_ipmart_without_lease_preserves_http_proxy(self):
-        env = {"HTTP_PROXY": "http://127.0.0.1:7897"}
-        result = register.prepare_claude_network(
-            env, account_lease=None, ipmart_enabled=False
-        )
-        self.assertIs(result, env)
-        self.assertEqual(env, {"HTTP_PROXY": "http://127.0.0.1:7897"})
+    def test_disabled_ipmart_without_clash_listener_strips_http_proxy(self):
+        env = {
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+        }
+        with patch(
+            "common.network_route.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            route = register.prepare_claude_network(
+                env, account_lease=None, ipmart_enabled=False
+            )
+        self.assertEqual(route.mode, "direct")
+        self.assertNotIn("HTTP_PROXY", env)
 
     def test_profile_failure_hides_credentialed_client_text(self):
         bb = Mock()

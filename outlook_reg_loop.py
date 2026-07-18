@@ -43,6 +43,7 @@ from common.ipmart_proxy import (
     requests_proxy_url,
     settings_from_env,
 )
+from common.network_route import prepare_clash_or_direct
 
 if sys.platform == "win32":
     try:
@@ -88,27 +89,9 @@ def should_skip_clash_rotation(env=None):
 
 
 def ensure_clash_proxy_env(env=None):
-    """Use .env CLASH_PROXY for direct loop runs, while keeping local APIs direct."""
     env = os.environ if env is None else env
-    existing = (
-        env.get("HTTPS_PROXY") or env.get("https_proxy")
-        or env.get("HTTP_PROXY") or env.get("http_proxy")
-        or ""
-    ).strip()
-    proxy = existing or env.get("CLASH_PROXY", "").strip()
-    if not proxy:
-        return ""
-    if not existing:
-        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = proxy
-        env["http_proxy"] = env["https_proxy"] = proxy
-    no_proxy = env.get("NO_PROXY") or env.get("no_proxy") or ""
-    required = ["127.0.0.1", "localhost", "::1"]
-    parts = [p.strip() for p in no_proxy.split(",") if p.strip()]
-    for item in required:
-        if item not in parts:
-            parts.append(item)
-    env["NO_PROXY"] = env["no_proxy"] = ",".join(parts)
-    return proxy
+    route = prepare_clash_or_direct(env)
+    return route.proxy_url if route.mode == "clash" else ""
 
 
 def prepare_outlook_network(env=None, *, lease=None, ipmart_enabled=False):
