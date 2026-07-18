@@ -35,16 +35,28 @@ SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
 OUTPUT_DIR = "outlook_accounts"
 
 
-def get_graph_token(email, password, idx=0):
+def _oauth_session(proxy_url=None, session_factory=requests.Session):
+    session = session_factory()
+    if proxy_url:
+        session.trust_env = False
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+    else:
+        session.trust_env = True
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+    })
+    return session
+
+
+def get_graph_token(email, password, idx=0, proxy_url=None):
     """Get refresh_token via pure HTTP OAuth flow (no browser)."""
     tag = f"[#{idx}]"
-    session = requests.Session()
-    session.trust_env = True  # Use system proxy (Clash) — avoids rate-limiting on account.live.com
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    })
-
     try:
+        session = _oauth_session(proxy_url)
         # Step 1: GET authorize URL
         auth_url = (
             f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
@@ -262,8 +274,8 @@ def get_graph_token(email, password, idx=0):
             print(f"  {tag} token error: {err[:150]}")
             return None
 
-    except Exception as e:
-        print(f"  {tag} error: {e}")
+    except Exception as exc:
+        print(f"  {tag} error: {type(exc).__name__}")
         return None
 
 

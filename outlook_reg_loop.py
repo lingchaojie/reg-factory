@@ -30,8 +30,17 @@ import urllib.request
 from datetime import datetime
 
 import config  # noqa: F401 - load .env before reading proxy settings
-from common.account_proxy import bitbrowser_proxy_fields, lease_from_env
-from common.ipmart_proxy import IPMartProxyError, acquire_proxy, settings_from_env
+from common.account_proxy import (
+    bitbrowser_proxy_fields,
+    lease_from_env,
+    strip_http_proxy_env,
+)
+from common.ipmart_proxy import (
+    IPMartProxyError,
+    acquire_proxy,
+    requests_proxy_url,
+    settings_from_env,
+)
 
 if sys.platform == "win32":
     try:
@@ -76,27 +85,36 @@ def should_skip_clash_rotation(env=None):
     return lease_from_env(os.environ if env is None else env) is not None
 
 
-def ensure_clash_proxy_env():
+def ensure_clash_proxy_env(env=None):
     """Use .env CLASH_PROXY for direct loop runs, while keeping local APIs direct."""
+    env = os.environ if env is None else env
     existing = (
-        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        env.get("HTTPS_PROXY") or env.get("https_proxy")
+        or env.get("HTTP_PROXY") or env.get("http_proxy")
         or ""
     ).strip()
-    proxy = existing or os.environ.get("CLASH_PROXY", "").strip()
+    proxy = existing or env.get("CLASH_PROXY", "").strip()
     if not proxy:
         return ""
     if not existing:
-        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
-        os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
-    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = proxy
+        env["http_proxy"] = env["https_proxy"] = proxy
+    no_proxy = env.get("NO_PROXY") or env.get("no_proxy") or ""
     required = ["127.0.0.1", "localhost", "::1"]
     parts = [p.strip() for p in no_proxy.split(",") if p.strip()]
     for item in required:
         if item not in parts:
             parts.append(item)
-    os.environ["NO_PROXY"] = os.environ["no_proxy"] = ",".join(parts)
+    env["NO_PROXY"] = env["no_proxy"] = ",".join(parts)
     return proxy
+
+
+def prepare_outlook_network(env=None, *, lease=None, ipmart_enabled=False):
+    env = os.environ if env is None else env
+    if lease is not None or ipmart_enabled:
+        strip_http_proxy_env(env)
+        return ""
+    return ensure_clash_proxy_env(env)
 
 
 def load_standalone():
@@ -431,12 +449,13 @@ def count_pool():
         return 0
 
 
-def extract_graph_for_account(email, password, attempts=3):
+def extract_graph_for_account(email, password, attempts=3, lease=None):
     """Return Graph token data for a freshly registered Outlook account."""
     try:
         from extract_graph_tokens import get_graph_token
+        proxy_url = requests_proxy_url(lease) if lease is not None else None
         for attempt in range(attempts):
-            res = get_graph_token(email, password)
+            res = get_graph_token(email, password, proxy_url=proxy_url)
             if res and res.get("refresh_token"):
                 graph = {
                     "refresh_token": res["refresh_token"],
@@ -445,20 +464,31 @@ def extract_graph_for_account(email, password, attempts=3):
                 log(f"graph token extracted for {email}", "OK")
                 return graph
             if attempt < attempts - 1:
-                log(f"graph token attempt {attempt + 1}/{attempts} failed, rotate and retry: {email}", "WARN")
-                try:
-                    from common import proxy_switch as _ps
-                    import random as _rnd
-                    cur = _ps.current_node()
-                    candidates = [n for n in _ps.concrete_nodes() if n != cur]
-                    if candidates:
-                        _ps.set_node(_rnd.choice(candidates))
-                except Exception as exc:
-                    log(f"graph retry node switch failed: {str(exc)[:50]}", "WARN")
+                log(
+                    f"graph token attempt {attempt + 1}/{attempts} failed, "
+                    f"retry: {email}",
+                    "WARN",
+                )
+                if lease is None:
+                    try:
+                        from common import proxy_switch as proxy_switch_module
+                        import random
+                        current = proxy_switch_module.current_node()
+                        candidates = [
+                            node
+                            for node in proxy_switch_module.concrete_nodes()
+                            if node != current
+                        ]
+                        if candidates:
+                            proxy_switch_module.set_node(
+                                random.choice(candidates)
+                            )
+                    except Exception:
+                        log("graph retry node switch failed", "WARN")
                 time.sleep(3 * (attempt + 1))
         log(f"graph token missing after {attempts} attempts: {email}", "WARN")
     except Exception as exc:
-        log(f"graph token extraction error: {type(exc).__name__}: {exc}", "WARN")
+        log(f"graph token extraction error: {type(exc).__name__}", "WARN")
     return None
 
 
@@ -723,7 +753,11 @@ def main():
             pass
 
     mod = load_standalone()
-    injected_proxy = ensure_clash_proxy_env()
+    injected_proxy = prepare_outlook_network(
+        os.environ,
+        lease=inherited_lease,
+        ipmart_enabled=ipmart_settings.enabled,
+    )
     if injected_proxy:
         log(f"proxy env ready: {injected_proxy}")
     proxy = clash_proxy_from_env()
@@ -805,7 +839,11 @@ def main():
             log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
         elapsed = time.time() - t0
         if email and password:
-            graph = extract_graph_for_account(email, password)
+            graph = extract_graph_for_account(
+                email,
+                password,
+                lease=attempt_lease,
+            )
             if not graph or not graph.get("refresh_token"):
                 failed += 1
                 append_no_graph_account(email, password)  # 号有效但没抽到 RT：单独存待补
