@@ -44,8 +44,12 @@ from common.ipmart_proxy import (
     acquire_proxy,
     settings_from_env,
 )
-from common.claude_email_accounts import ClaudeEmailAccount
-from common.ninemail_mailbox import NineMallMailboxClient
+from common.claude_email_accounts import (
+    ClaudeEmailAccount,
+    ClaudeEmailAccountStore,
+    normalize_email_provider,
+)
+from common.ninemail_mailbox import NineMallMailboxClient, NineMallMailboxError
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -67,8 +71,10 @@ from config import (
     EZCAPTCHA_API_BASE,
     NINEMALL_API_BASE,
     NINEMALL_API_PASSWORD,
+    NINEMALL_EMAIL_FILE,
     NINEMALL_HTTP_TIMEOUT,
     NINEMALL_POLL_INTERVAL,
+    EMAIL_PROVIDER,
 )
 
 # single registration timeout (seconds)
@@ -403,6 +409,60 @@ def mark_email_error(email, password="", reason=""):
     """记录异常邮箱"""
     with open(EMAILS_ERROR_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email}----{password}----{reason}\n")
+
+
+def prepare_email_accounts(
+    args, provider=None, store_factory=ClaudeEmailAccountStore
+):
+    provider = normalize_email_provider(provider or EMAIL_PROVIDER)
+    source = args.emails or (
+        NINEMALL_EMAIL_FILE if provider == "NINEMALL" else EMAILS_FILE
+    )
+    store = store_factory(provider=provider, source_file=source)
+    if args.email:
+        if provider == "NINEMALL" and (
+            not args.token or not args.client_id
+        ):
+            raise SystemExit(
+                "NINEMALL --email requires --token and --client-id"
+            )
+        account = ClaudeEmailAccount(
+            provider=provider,
+            email=args.email.strip(),
+            password=(args.password or "").strip(),
+            client_id=(args.client_id or "").strip(),
+            refresh_token=(args.token or "").strip(),
+        )
+        return [account], store
+    if args.emails:
+        return store.reserve_many(limit=None), store
+    if provider == "NINEMALL":
+        return store.reserve_many(limit=args.count), store
+    return [None] * args.count, store
+
+
+def mark_claude_account_used(account, account_store):
+    if (
+        account is not None
+        and account.provider == "NINEMALL"
+        and account_store is not None
+    ):
+        account_store.mark_used(account)
+        return
+    if account is not None:
+        mark_email_used(account.email, account.password)
+
+
+def mark_claude_account_error(account, account_store, reason):
+    if (
+        account is not None
+        and account.provider == "NINEMALL"
+        and account_store is not None
+    ):
+        account_store.mark_error(account, reason)
+        return
+    if account is not None:
+        mark_email_error(account.email, account.password, reason)
 
 
 # Arkose Labs public key for Microsoft signup
@@ -3205,7 +3265,6 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
         with open(filename, "w", encoding="utf-8") as f:
             f.write(session_key)
         print(f"  sessionKey saved: {filename}")
-        print(f"  {session_key[:60]}...")
         full_filename = os.path.join(COOKIE_OUTPUT_DIR, f"full_{profile_id}_{ts}.json")
         with open(full_filename, "w", encoding="utf-8") as f:
             json.dump(cookies, f, indent=2, ensure_ascii=False)
@@ -3221,8 +3280,8 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
         try:
             from common.session_export import save_claude_token
             save_claude_token(session_key, email)
-        except Exception as e:
-            print(f"  [WARN] 保存 claude 标准 token 失败: {e}")
+        except Exception:
+            print("  [WARN] failed to save Claude token")
         return session_key
     else:
         filename = os.path.join(COOKIE_OUTPUT_DIR, f"cookies_{profile_id}_{ts}.json")
@@ -3309,14 +3368,15 @@ async def _get_and_verify_phone(page, max_attempts=2):
 
 async def register(
     profile_id,
-    email="",
-    email_password="",
-    email_token="",
+    account=None,
+    account_store=None,
     account_lease=None,
 ):
     """Run one registration. Returns sessionKey on success, None on failure."""
     bb = BitBrowser()
     start_time = time.time()
+    email = ""
+    email_password = ""
 
     def check_timeout():
         elapsed = time.time() - start_time
@@ -3458,19 +3518,28 @@ async def register(
                     pass
 
             # 如果没有邮箱，先尝试自注册，失败则从 emails.txt 读取
-            if not email:
+            if account is None:
                 print("\n[3/6] get outlook email...")
                 # 尝试自注册
                 print("  [outlook] trying self-register...")
-                email, email_password = await register_outlook(page)
-                if not email:
+                registered_email, registered_password = await register_outlook(page)
+                if registered_email:
+                    account = ClaudeEmailAccount(
+                        provider="OUTLOOK",
+                        email=registered_email,
+                        password=registered_password,
+                        client_id="9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+                        refresh_token="",
+                    )
+                else:
                     # 自注册失败，从 emails.txt 读取
                     print("  [outlook] self-register failed, trying emails.txt...")
-                    result = read_next_email_from_file()
-                    if result:
-                        email, email_password, email_token = result
-                    else:
-                        raise Exception("no email available")
+                    account = account_store.reserve_one()
+                    if account is None:
+                        raise RuntimeError("no email available")
+
+            email = account.email
+            email_password = account.password
 
             check_timeout()
 
@@ -3519,13 +3588,6 @@ async def register(
             # poll magic link from outlook inbox
             print("\n[4/6] get magic link...")
             # 优先用 OAuth token 方式（快，不需要浏览器）
-            account = ClaudeEmailAccount(
-                provider="OUTLOOK",
-                email=email,
-                password=email_password,
-                client_id="",
-                refresh_token=email_token,
-            )
             magic_link = await fetch_claude_magic_link(
                 context,
                 account,
@@ -3560,7 +3622,9 @@ async def register(
                 )
 
             if not magic_link:
-                raise Exception("magic link timeout, no email received")
+                if account.provider == "NINEMALL":
+                    raise NineMallMailboxError("magic_link_timeout")
+                raise RuntimeError("magic link timeout, no email received")
 
             print("  magic link found")
             # open magic link
@@ -3850,7 +3914,9 @@ async def register(
 
                 if not phone_verified:
                     print(f"\n  {MAX_PHONE_ATTEMPTS} attempts failed, aborting.")
-                    mark_email_error(email, email_password, "phone_verify_failed")
+                    mark_claude_account_error(
+                        account, account_store, "phone_verify_failed"
+                    )
                     return None
 
                 await asyncio.sleep(3)
@@ -3937,37 +4003,52 @@ async def register(
                     cookies = await context.cookies()
                     sk_cookie = next((c["value"] for c in cookies if c["name"] == "sessionKey"), None)
                     if sk_cookie:
-                        print(f"  found sessionKey in cookies: {sk_cookie[:60]}...")
+                        print("  found sessionKey in cookies")
                         session_key = sk_cookie
                         await save_cookies(context, profile_id, email=email, email_password=email_password)
-                        mark_email_used(email, email_password)
+                        mark_claude_account_used(account, account_store)
                         return session_key
                 except Exception as e:
                     print(f"  cookie read error: {e}")
 
                 print("  ERROR: not on chat page, not saving cookies")
-                mark_email_error(email, email_password, "onboarding_stuck")
+                mark_claude_account_error(
+                    account, account_store, "onboarding_stuck"
+                )
                 return None
 
             # 直接保存 cookie
             await asyncio.sleep(2)
             session_key = await save_cookies(context, profile_id, email=email, email_password=email_password)
             if session_key:
-                mark_email_used(email, email_password)
+                mark_claude_account_used(account, account_store)
             else:
                 print("  no sessionKey in cookies")
-                mark_email_error(email, email_password, "no_session_key")
+                mark_claude_account_error(
+                    account, account_store, "no_session_key"
+                )
 
     except TimeoutError as e:
         print(f"\n  TIMEOUT: {e}")
-        if email:
-            mark_email_error(email, email_password, f"timeout")
+        if account is not None:
+            mark_claude_account_error(account, account_store, "timeout")
     except Exception as e:
-        print(f"\n  ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        if email:
-            mark_email_error(email, email_password, str(e)[:100])
+        if account is not None and account.provider == "NINEMALL":
+            reason = (
+                e.code
+                if isinstance(e, NineMallMailboxError)
+                else "registration_error"
+            )
+            print(f"\n  ERROR: {reason}")
+            mark_claude_account_error(account, account_store, reason)
+        else:
+            print(f"\n  ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            if account is not None:
+                mark_claude_account_error(
+                    account, account_store, str(e)[:100]
+                )
     finally:
         try:
             bb.close_browser(profile_id)
@@ -3988,10 +4069,11 @@ async def main():
     parser.add_argument("--count", "-n", type=int, default=1, help="number of accounts to register")
     parser.add_argument("--timeout", "-t", type=int, default=480, help="timeout per registration (seconds)")
     parser.add_argument("--concurrency", "-c", type=int, default=1, help="number of concurrent registrations")
-    parser.add_argument("--emails", "-e", type=str, help="file with outlook emails (one per line: account----password----token----ClientID)")
-    parser.add_argument("--email", type=str, help="single fixed outlook email for debug")
+    parser.add_argument("--emails", "-e", type=str, help="provider account file override")
+    parser.add_argument("--email", type=str, help="single fixed email for debug")
     parser.add_argument("--password", type=str, default="", help="password for --email")
     parser.add_argument("--token", type=str, default="", help="refresh token for --email")
+    parser.add_argument("--client-id", type=str, default="", help="client ID for --email")
     parser.add_argument("--node", type=str, default="none",
                         help="Clash 出口节点绕 claude 区域封锁：none=不走代理 / auto=自动探测 / 具体节点名")
     parser.add_argument("--proxy-port", type=str, default="7897", help="Clash mixed-port 代理端口")
@@ -4020,26 +4102,19 @@ async def main():
     print("=" * 50)
 
     # 读取邮箱文件
-    email_list = []
+    accounts, account_store = prepare_email_accounts(args)
+    if EMAIL_PROVIDER == "NINEMALL" and len(accounts) < args.count:
+        print(
+            f"  NINEMALL accounts available: {len(accounts)}/{args.count}; "
+            "running available accounts only"
+        )
+    if EMAIL_PROVIDER == "NINEMALL" and not accounts:
+        print("  no NINEMALL accounts available")
+        return
     if args.email:
-        email_list.append((args.email.strip(), args.password.strip(), args.token.strip()))
-        print(f"  using fixed email: {args.email.strip()}")
-    if args.emails:
-        try:
-            with open(args.emails, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split("----")
-                    if len(parts) >= 3:
-                        email_list.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
-                    elif len(parts) >= 2:
-                        email_list.append((parts[0].strip(), parts[1].strip(), ""))
-            print(f"  loaded {len(email_list)} emails from {args.emails}")
-        except Exception as e:
-            print(f"  failed to load emails: {e}")
-            return
+        print(f"  using fixed email: {accounts[0].email}")
+    elif args.emails:
+        print(f"  loaded {len(accounts)} emails from {args.emails}")
 
     bb = BitBrowser()
     results = []
@@ -4047,7 +4122,7 @@ async def main():
     sem = asyncio.Semaphore(args.concurrency)
 
     # 确定总数：有邮箱文件用文件数量，否则用 --count
-    total = len(email_list) if email_list else args.count
+    total = len(accounts)
 
     async def run_one(i):
         async with sem:
@@ -4058,10 +4133,9 @@ async def main():
             print(f"  #{i}/{total}")
             print(f"{'#' * 50}")
 
-            email, email_password, email_token = "", "", ""
-            if email_list:
-                email, email_password, email_token = email_list[i - 1]
-                print(f"\n  email from file: {email}")
+            account = accounts[i - 1]
+            if account is not None:
+                print(f"\n  email from file: {account.email}")
 
             account_lease = inherited_lease
             if account_lease is None and ipmart_settings.enabled:
@@ -4073,7 +4147,13 @@ async def main():
                         f"exit={account_lease.exit_ip}"
                     )
                 except IPMartProxyError as exc:
-                    print(f"  FATAL: IPMart proxy unavailable: {exc}")
+                    if account is not None and account.provider == "NINEMALL":
+                        print("  FATAL: IPMart proxy unavailable")
+                        mark_claude_account_error(
+                            account, account_store, "registration_error"
+                        )
+                    else:
+                        print(f"  FATAL: IPMart proxy unavailable: {exc}")
                     async with results_lock:
                         results.append({
                             "index": i,
@@ -4128,9 +4208,26 @@ async def main():
                         await asyncio.sleep(5)
                         continue
                     else:
+                        if account is not None and account.provider == "NINEMALL":
+                            print("  FATAL: create browser failed")
+                            mark_claude_account_error(
+                                account, account_store, "registration_error"
+                            )
+                            async with results_lock:
+                                results.append({
+                                    "index": i,
+                                    "profile": name,
+                                    "status": "ERROR",
+                                    "sk": None,
+                                })
+                            return
                         raise
             if not profile_id:
                 print(f"  FATAL: create browser failed after 3 retries")
+                if account is not None and account.provider == "NINEMALL":
+                    mark_claude_account_error(
+                        account, account_store, "registration_error"
+                    )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
                 return
@@ -4148,15 +4245,20 @@ async def main():
             try:
                 sk = await register(
                     profile_id,
-                    email,
-                    email_password,
-                    email_token,
+                    account=account,
+                    account_store=account_store,
                     account_lease=account_lease,
                 )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "OK" if sk else "FAIL", "sk": sk})
             except Exception as e:
-                print(f"  FATAL: {e}")
+                if account is not None and account.provider == "NINEMALL":
+                    print("  FATAL: registration_error")
+                    mark_claude_account_error(
+                        account, account_store, "registration_error"
+                    )
+                else:
+                    print(f"  FATAL: {e}")
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
 
@@ -4169,8 +4271,7 @@ async def main():
     ok = 0
     for r in results:
         tag = "OK" if r["sk"] else "FAIL"
-        sk_preview = r["sk"][:40] + "..." if r["sk"] else "-"
-        print(f"  #{r['index']} [{tag}] {r['profile']}  {sk_preview}")
+        print(f"  #{r['index']} [{tag}] {r['profile']}")
         if r["sk"]:
             ok += 1
     print(f"\n  success: {ok}/{len(results)}")

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from unittest.mock import AsyncMock
 
 import register
+from common.claude_email_accounts import ClaudeEmailAccountStore
 from common.ipmart_proxy import ProxyLease
 
 
@@ -136,6 +137,8 @@ class ClaudeProfileRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "Pass1!",
                 "--token",
                 "rt-a",
+                "--client-id",
+                "client-a",
                 "--node",
                 "none",
             ],
@@ -219,6 +222,17 @@ class StandaloneClaudeLeaseTests(unittest.IsolatedAsyncioTestCase):
                 stream.write("a@outlook.com----Pass1!----rt-a\n")
                 stream.write("b@outlook.com----Pass2!----rt-b\n")
 
+            original_prepare = register.prepare_email_accounts
+
+            def prepare_in_temp(args):
+                return original_prepare(
+                    args,
+                    provider="OUTLOOK",
+                    store_factory=lambda **kwargs: ClaudeEmailAccountStore(
+                        root_dir=tmp, **kwargs
+                    ),
+                )
+
             registration = AsyncMock(return_value=None)
             with patch.object(
                 sys,
@@ -234,6 +248,12 @@ class StandaloneClaudeLeaseTests(unittest.IsolatedAsyncioTestCase):
                     "--node",
                     "none",
                 ],
+            ), patch.object(
+                register, "EMAIL_PROVIDER", "OUTLOOK"
+            ), patch.object(
+                register,
+                "prepare_email_accounts",
+                side_effect=prepare_in_temp,
             ), patch.object(
                 register, "lease_from_env", return_value=None
             ), patch.object(
@@ -260,7 +280,8 @@ class StandaloneClaudeLeaseTests(unittest.IsolatedAsyncioTestCase):
                 await register.main()
 
         calls_by_email = {
-            call.args[1]: call for call in registration.await_args_list
+            call.kwargs["account"].email: call
+            for call in registration.await_args_list
         }
         self.assertIs(calls_by_email["a@outlook.com"].kwargs["account_lease"], leases[0])
         self.assertIs(calls_by_email["b@outlook.com"].kwargs["account_lease"], leases[1])
