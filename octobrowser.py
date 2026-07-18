@@ -177,7 +177,9 @@ class OctoBrowser:
             payload["fingerprint"]["webrtc"] = {"type": "ip"}
         return payload
 
-    def create_browser(self, name="claude_register", proxy_str=None, **kwargs):
+    def create_browser(
+        self, name="claude_register", proxy_str=None, _retries=5, **kwargs
+    ):
         data = dict(kwargs)
         if proxy_str:
             parsed = self._parse_proxy(proxy_str)
@@ -196,6 +198,7 @@ class OctoBrowser:
             self.public_api + "/api/v2/automation/profiles",
             public=True,
             json_body=payload,
+            retries=_retries,
             secrets=(proxy.get("login"), proxy.get("password")),
         )
         profile_id = (result.get("data") or {}).get("uuid")
@@ -203,7 +206,7 @@ class OctoBrowser:
             raise RuntimeError("Octo create returned no profile UUID")
         return str(profile_id)
 
-    def update_browser(self, profile_id, name=None, **kwargs):
+    def update_browser(self, profile_id, name=None, _retries=5, **kwargs):
         payload = self._profile_payload(
             name or kwargs.pop("title", "reg_factory"), kwargs
         )
@@ -213,11 +216,12 @@ class OctoBrowser:
             self.public_api + "/api/v2/automation/profiles/" + str(profile_id),
             public=True,
             json_body=payload,
+            retries=_retries,
             secrets=(proxy.get("login"), proxy.get("password")),
         )
         return {"id": str(profile_id)}
 
-    def open_browser(self, profile_id):
+    def open_browser(self, profile_id, _retries=5):
         data = self._request(
             "POST",
             self.local_api + "/api/profiles/start",
@@ -230,6 +234,7 @@ class OctoBrowser:
                 "timeout": 120,
                 "password": "",
             },
+            retries=_retries,
         )
         ws = data.get("ws_endpoint") or ""
         if not ws:
@@ -244,22 +249,24 @@ class OctoBrowser:
             "raw": data,
         }
 
-    def close_browser(self, profile_id):
+    def close_browser(self, profile_id, _retries=5):
         return self._request(
             "POST",
             self.local_api + "/api/profiles/stop",
             json_body={"uuid": str(profile_id)},
+            retries=_retries,
         )
 
-    def delete_browser(self, profile_id):
+    def delete_browser(self, profile_id, _retries=5):
         return self._request(
             "DELETE",
             self.public_api + "/api/v2/automation/profiles",
             public=True,
             json_body={"uuids": [str(profile_id)], "skip_trash_bin": True},
+            retries=_retries,
         )
 
-    def list_browsers(self, page=0, page_size=100):
+    def list_browsers(self, page=0, page_size=100, _retries=5):
         result = self._request(
             "GET",
             self.public_api + "/api/v2/automation/profiles",
@@ -270,6 +277,7 @@ class OctoBrowser:
                 "fields": "title,status",
             },
             timeout=30,
+            retries=_retries,
         )
         raw_items = result.get("data") or []
         items = []
@@ -312,14 +320,24 @@ class OctoBrowser:
             return self.list_browsers(
                 page=int(data.get("page", 0) or 0),
                 page_size=int(data.get("pageSize", 100) or 100),
+                _retries=_retries,
             )
         profile_id = data.get("id") or data.get("browserId")
         if path == "/browser/open":
-            return {"success": True, "data": self.open_browser(profile_id)}
+            return {
+                "success": True,
+                "data": self.open_browser(profile_id, _retries=_retries),
+            }
         if path == "/browser/close":
-            return {"success": True, "data": self.close_browser(profile_id)}
+            return {
+                "success": True,
+                "data": self.close_browser(profile_id, _retries=_retries),
+            }
         if path == "/browser/delete":
-            return {"success": True, "data": self.delete_browser(profile_id)}
+            return {
+                "success": True,
+                "data": self.delete_browser(profile_id, _retries=_retries),
+            }
         if path == "/browser/update":
             body = dict(data)
             name = body.pop("name", "reg_factory")
@@ -329,12 +347,14 @@ class OctoBrowser:
                 or body.pop("user_id", None)
             )
             if existing:
-                self.update_browser(existing, name=name, **body)
+                self.update_browser(
+                    existing, name=name, _retries=_retries, **body
+                )
                 return {
                     "success": True,
                     "data": {"id": str(existing), "browserId": str(existing)},
                 }
-            created = self.create_browser(name=name, **body)
+            created = self.create_browser(name=name, _retries=_retries, **body)
             return {
                 "success": True,
                 "data": {"id": created, "browserId": created},

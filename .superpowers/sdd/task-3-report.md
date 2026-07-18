@@ -47,3 +47,32 @@
 - The repository has no `tests.test_bitbrowser` or `tests.test_adspower`
   modules. Full discovery regression, including the existing IPMart coverage,
   passed instead.
+
+## Review Fix — Legacy Retry Budget
+
+### RED
+
+- Added a fake-session transport-failure test for
+  `_post("/browser/delete", ..., _retries=1)`.
+- Before the fix, the adapter made five requests (the default) rather than the
+  requested single attempt.
+
+### GREEN
+
+- `_post` now forwards `_retries` through every compatibility dispatch:
+  list, open, close, delete, update, and create.
+- The corresponding profile and lifecycle methods pass the budget directly to
+  `_request`, so Public and Local calls cannot exceed the caller's limit.
+
+### Verification
+
+- `python -m unittest tests.test_octobrowser -v` — 11 passed.
+- `python -m unittest discover -s tests -p 'test_*.py' -v` — 226 passed.
+- `python -m py_compile octobrowser.py tests/test_octobrowser.py` — passed.
+- `git diff --check` — passed before commit.
+
+### Concerns
+
+- The focused regression asserts a delete transport-failure retry count;
+  code review confirms the identical budget is explicitly forwarded through
+  every other `_post` compatibility route.

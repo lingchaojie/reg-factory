@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import requests
 
 from octobrowser import OctoBrowser
 
@@ -21,7 +24,10 @@ class FakeSession:
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
-        return next(self.responses)
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 class OctoBrowserTests(unittest.TestCase):
@@ -166,6 +172,21 @@ class OctoBrowserTests(unittest.TestCase):
         self.assertTrue(session.calls[0][1].endswith(
             "/api/v2/automation/profiles/existing"
         ))
+
+    def test_legacy_post_honors_requested_retry_budget(self):
+        browser, session = self.make_browser([
+            requests.RequestException("unavailable"),
+            requests.RequestException("unavailable"),
+            requests.RequestException("unavailable"),
+            requests.RequestException("unavailable"),
+            requests.RequestException("unavailable"),
+        ])
+        with patch("octobrowser.time.sleep"):
+            with self.assertRaises(RuntimeError):
+                browser._post(
+                    "/browser/delete", {"id": "p1"}, _retries=1
+                )
+        self.assertEqual(len(session.calls), 1)
 
     def test_missing_token_fails_before_public_request(self):
         browser, session = self.make_browser([], token="")
