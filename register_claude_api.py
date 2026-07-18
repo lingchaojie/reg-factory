@@ -127,13 +127,12 @@ async def _verification_rejected(page):
 
 async def _wait_for_post_verification_state(page, method, timeout):
     deadline = time.monotonic() + max(0.0, float(timeout))
+    personal_selected = False
     while True:
         if await is_console_ready(page):
             return
         if await _verification_rejected(page):
             raise ClaudeApiRegistrationError("verification_rejected")
-        if await select_personal_account(page):
-            continue
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -145,6 +144,13 @@ async def _wait_for_post_verification_state(page, method, timeout):
             )
             if code_still_visible:
                 raise ClaudeApiRegistrationError("verification_rejected")
+            raise ClaudeApiRegistrationError("console_not_reached")
+
+        if not personal_selected:
+            personal_selected = await select_personal_account(page)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise ClaudeApiRegistrationError("console_not_reached")
         await asyncio.sleep(min(0.05, remaining))
 

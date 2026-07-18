@@ -1,7 +1,9 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import traceback
 import unittest
 from unittest.mock import patch
@@ -49,6 +51,7 @@ class FakePlatformPage:
         personal_label="Personal account",
         magic_link_target_state="authenticated",
         code_submit_target_state="authenticated",
+        personal_click_target_state="authenticated",
         fail_navigation="",
         fail_locator="",
     ):
@@ -56,6 +59,7 @@ class FakePlatformPage:
         self.personal_label = personal_label
         self.magic_link_target_state = magic_link_target_state
         self.code_submit_target_state = code_submit_target_state
+        self.personal_click_target_state = personal_click_target_state
         self.fail_navigation = fail_navigation
         self.fail_locator = fail_locator
         self.url = self._url_for_state(state)
@@ -64,6 +68,7 @@ class FakePlatformPage:
         self.goto_calls = []
         self.submissions = []
         self.resend_count = 0
+        self.personal_clicks = 0
         self.load_waits = []
 
     @staticmethod
@@ -173,8 +178,13 @@ class FakePlatformPage:
             self.resend_count += 1
             return
         if kind == ("button", self.personal_label, True):
-            self.state = "authenticated"
-            self.url = "https://platform.claude.com/workbench"
+            self.personal_clicks += 1
+            self.state = self.personal_click_target_state
+            self.url = (
+                "https://platform.claude.com/workbench"
+                if self.state == "authenticated"
+                else "https://platform.claude.com/onboarding"
+            )
             return
         raise AssertionError(f"cannot click {kind} in state {self.state}")
 
@@ -610,6 +620,104 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.state, "authenticated")
         self.assertGreaterEqual(page.state_probes, 3)
 
+    async def test_expired_deadline_does_not_click_visible_personal_option(self):
+        page = FakePlatformPage(magic_link_target_state="personal")
+
+        async def fetch_verification(*_args):
+            return ClaudePlatformVerification(
+                magic_link="https://platform.claude.com/magic-link?code=abc"
+            )
+
+        with self.assertRaisesRegex(
+            register_claude_api.ClaudeApiRegistrationError,
+            "^console_not_reached$",
+        ):
+            await register_claude_api.run_claude_platform_flow(
+                page,
+                FakeBrowserContext([]),
+                self.account,
+                fetch_verification,
+                0,
+            )
+
+        self.assertEqual(page.personal_clicks, 0)
+
+    async def test_stuck_personal_option_is_clicked_once_and_waits_until_deadline(self):
+        page = FakePlatformPage(
+            magic_link_target_state="personal",
+            personal_click_target_state="personal",
+        )
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def counted_sleep(delay):
+            sleeps.append(delay)
+            await real_sleep(delay)
+
+        async def fetch_verification(*_args):
+            return ClaudePlatformVerification(
+                magic_link="https://platform.claude.com/magic-link?code=abc"
+            )
+
+        with patch("register_claude_api.asyncio.sleep", side_effect=counted_sleep):
+            with self.assertRaisesRegex(
+                register_claude_api.ClaudeApiRegistrationError,
+                "^console_not_reached$",
+            ):
+                await asyncio.wait_for(
+                    register_claude_api.run_claude_platform_flow(
+                        page,
+                        FakeBrowserContext([]),
+                        self.account,
+                        fetch_verification,
+                        0.08,
+                    ),
+                    timeout=0.3,
+                )
+
+        self.assertEqual(page.personal_clicks, 1)
+        self.assertGreaterEqual(len(sleeps), 1)
+        self.assertTrue(all(0 < delay <= 0.08 for delay in sleeps))
+
+    async def test_delayed_transition_after_personal_click_waits_without_reclicking(self):
+        page = DelayedPlatformPage(
+            magic_link_target_state="personal",
+            personal_click_target_state="pending",
+            transition_after=3,
+            transition_to="authenticated",
+        )
+        sleeps = []
+        real_sleep = asyncio.sleep
+
+        async def counted_sleep(delay):
+            sleeps.append(delay)
+            await real_sleep(delay)
+
+        async def fetch_verification(*_args):
+            return ClaudePlatformVerification(
+                magic_link="https://platform.claude.com/magic-link?code=abc"
+            )
+
+        with TemporaryDirectory() as temp_dir:
+            with patch(
+                "register_claude_api.asyncio.sleep",
+                side_effect=counted_sleep,
+            ):
+                await register_claude_api.run_claude_platform_flow(
+                    page,
+                    FakeBrowserContext([
+                        {"name": "session", "value": "cookie", "domain": ".claude.com"},
+                    ]),
+                    self.account,
+                    fetch_verification,
+                    0.3,
+                    temp_dir,
+                )
+
+        self.assertEqual(page.personal_clicks, 1)
+        self.assertGreaterEqual(len(sleeps), 1)
+        self.assertTrue(all(0 < delay <= 0.3 for delay in sleeps))
+
     async def test_unknown_post_verification_state_times_out_as_console_not_reached(self):
         page = FakePlatformPage(magic_link_target_state="pending")
 
@@ -684,17 +792,30 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         context = FakeBrowserContext([
             {"name": "session", "value": "cookie", "domain": ".claude.com"},
         ])
+        worker_count = 4
+        write_barrier = threading.Barrier(worker_count)
+        writer_threads = set()
+        writer_threads_lock = threading.Lock()
+        real_write_text = Path.write_text
+
+        def synchronized_cookie_write(path, *args, **kwargs):
+            if path.name.startswith(".full_") and path.name.endswith(".tmp"):
+                with writer_threads_lock:
+                    writer_threads.add(threading.get_ident())
+                write_barrier.wait(timeout=0.5)
+            return real_write_text(path, *args, **kwargs)
 
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "cookies" / "claude_api"
-            paths = await asyncio.gather(*(
-                register_claude_api.save_claude_platform_session(
-                    context,
-                    self.account.email,
-                    output_dir,
-                )
-                for _ in range(8)
-            ))
+            with patch.object(Path, "write_text", synchronized_cookie_write):
+                paths = await asyncio.gather(*(
+                    register_claude_api.save_claude_platform_session(
+                        context,
+                        self.account.email,
+                        output_dir,
+                    )
+                    for _ in range(worker_count)
+                ))
             records = [
                 json.loads(line)
                 for line in (output_dir / "accounts.jsonl").read_text(
@@ -702,13 +823,22 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 ).splitlines()
             ]
 
-            self.assertEqual(len({path.name for path in paths}), 8)
+            self.assertGreater(len(writer_threads), 1)
+            self.assertEqual(len({path.name for path in paths}), worker_count)
             self.assertTrue(all(path.exists() for path in paths))
-            self.assertEqual(len(records), 8)
+            self.assertEqual(len(records), worker_count)
+            self.assertEqual(
+                len({json.dumps(record, sort_keys=True) for record in records}),
+                worker_count,
+            )
             self.assertEqual(
                 {record["cookie_file"] for record in records},
                 {path.name for path in paths},
             )
+            self.assertTrue(all(
+                (output_dir / record["cookie_file"]).exists()
+                for record in records
+            ))
 
     async def test_interrupted_cookie_write_removes_partial_temp_and_final_files(self):
         context = FakeBrowserContext([
@@ -750,6 +880,158 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(list(output_dir.glob("full_*.json")), [])
             self.assertEqual(list(output_dir.glob(".*.tmp")), [])
+
+    def seed_valid_session_index(self, output_dir):
+        output_dir.mkdir(parents=True)
+        existing_cookie = output_dir / "existing-cookie.json"
+        existing_cookie.write_text("[]", encoding="utf-8")
+        prior_record = {
+            "email_key": "existing-email-key",
+            "cookie_file": existing_cookie.name,
+        }
+        prior_bytes = (json.dumps(prior_record) + "\n").encode("utf-8")
+        index = output_dir / "accounts.jsonl"
+        index.write_bytes(prior_bytes)
+        return index, prior_bytes, existing_cookie
+
+    def assert_failed_index_update_is_clean(
+        self,
+        output_dir,
+        index,
+        prior_bytes,
+        existing_cookie,
+    ):
+        self.assertEqual(index.read_bytes(), prior_bytes)
+        self.assertTrue(existing_cookie.exists())
+        self.assertEqual(list(output_dir.glob("full_*.json")), [])
+        self.assertEqual(list(output_dir.glob(".*.tmp")), [])
+        for line in index.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            self.assertTrue((output_dir / record["cookie_file"]).exists())
+
+    async def test_short_index_write_preserves_prior_index_and_cleans_failed_save(self):
+        context = FakeBrowserContext([
+            {"name": "session", "value": "cookie", "domain": ".claude.com"},
+        ])
+        real_write = os.write
+        write_calls = 0
+
+        def partial_then_fail(descriptor, data):
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1:
+                return real_write(descriptor, data[:7])
+            raise OSError("index write interrupted")
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            index, prior_bytes, existing_cookie = self.seed_valid_session_index(
+                output_dir
+            )
+            with patch(
+                "common.claude_platform_session.os.write",
+                side_effect=partial_then_fail,
+            ):
+                with self.assertRaises(OSError):
+                    await register_claude_api.save_claude_platform_session(
+                        context,
+                        self.account.email,
+                        output_dir,
+                    )
+
+            self.assert_failed_index_update_is_clean(
+                output_dir, index, prior_bytes, existing_cookie
+            )
+
+    async def test_index_fsync_failure_preserves_prior_index_and_cleans_failed_save(self):
+        context = FakeBrowserContext([
+            {"name": "session", "value": "cookie", "domain": ".claude.com"},
+        ])
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            index, prior_bytes, existing_cookie = self.seed_valid_session_index(
+                output_dir
+            )
+            with patch(
+                "common.claude_platform_session.os.fsync",
+                side_effect=OSError("index fsync interrupted"),
+            ):
+                with self.assertRaises(OSError):
+                    await register_claude_api.save_claude_platform_session(
+                        context,
+                        self.account.email,
+                        output_dir,
+                    )
+
+            self.assert_failed_index_update_is_clean(
+                output_dir, index, prior_bytes, existing_cookie
+            )
+
+    async def test_index_replace_failure_preserves_prior_index_and_cleans_failed_save(self):
+        context = FakeBrowserContext([
+            {"name": "session", "value": "cookie", "domain": ".claude.com"},
+        ])
+        real_replace = os.replace
+
+        def fail_index_replace(source, destination):
+            if Path(destination).name == "accounts.jsonl":
+                raise OSError("index replace interrupted")
+            return real_replace(source, destination)
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            index, prior_bytes, existing_cookie = self.seed_valid_session_index(
+                output_dir
+            )
+            with patch(
+                "common.claude_platform_session.os.replace",
+                side_effect=fail_index_replace,
+            ):
+                with self.assertRaises(OSError):
+                    await register_claude_api.save_claude_platform_session(
+                        context,
+                        self.account.email,
+                        output_dir,
+                    )
+
+            self.assert_failed_index_update_is_clean(
+                output_dir, index, prior_bytes, existing_cookie
+            )
+
+    async def test_successful_index_replace_never_deletes_its_committed_cookie(self):
+        context = FakeBrowserContext([
+            {"name": "session", "value": "cookie", "domain": ".claude.com"},
+        ])
+        real_unlink = Path.unlink
+
+        def reject_redundant_index_temp_cleanup(path, *args, **kwargs):
+            if path.name.startswith(".accounts.jsonl."):
+                raise OSError("cleanup attempted after committed index replace")
+            return real_unlink(path, *args, **kwargs)
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            with patch.object(
+                Path,
+                "unlink",
+                reject_redundant_index_temp_cleanup,
+            ):
+                cookie_path = await register_claude_api.save_claude_platform_session(
+                    context,
+                    self.account.email,
+                    output_dir,
+                )
+
+            records = [
+                json.loads(line)
+                for line in (output_dir / "accounts.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertTrue(cookie_path.exists())
+            self.assertEqual(records[-1]["cookie_file"], cookie_path.name)
+            self.assertTrue((output_dir / records[-1]["cookie_file"]).exists())
 
 
 if __name__ == "__main__":

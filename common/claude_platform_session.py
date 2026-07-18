@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import asyncio
 import hashlib
 import json
 import os
@@ -20,34 +21,41 @@ def _is_claude_domain(value):
     return domain == "claude.com" or domain.endswith(".claude.com")
 
 
-def _append_index_record(index, record):
-    encoded = (json.dumps(record) + "\n").encode("utf-8")
-    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+def _write_fsynced(path, payload):
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
-    with _INDEX_LOCK:
-        descriptor = os.open(index, flags, 0o600)
-        try:
-            written = os.write(descriptor, encoded)
-            if written != len(encoded):
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
                 raise OSError("incomplete index write")
-            os.fsync(descriptor)
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_index(index, record):
+    encoded_record = (json.dumps(record) + "\n").encode("utf-8")
+    temporary = index.parent / f".{index.name}.{uuid.uuid4().hex}.tmp"
+    with _INDEX_LOCK:
+        existing = index.read_bytes() if index.exists() else b""
+        separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+        payload = existing + separator + encoded_record
+        committed = False
+        try:
+            _write_fsynced(temporary, payload)
+            os.replace(temporary, index)
+            committed = True
         finally:
-            os.close(descriptor)
+            if not committed:
+                temporary.unlink(missing_ok=True)
 
 
-async def save_claude_platform_session(
-    context,
-    email,
-    output_dir="cookies/claude_api",
-):
-    cookies = await context.cookies()
-    platform_cookies = [
-        cookie for cookie in cookies if _is_claude_domain(cookie.get("domain"))
-    ]
-    if not platform_cookies:
-        raise RuntimeError("console_not_reached")
-
+def _persist_claude_platform_session(platform_cookies, email, output_dir):
     target = Path(output_dir)
     target.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -64,7 +72,7 @@ async def save_claude_platform_session(
         )
         temporary.replace(path)
         final_created = True
-        _append_index_record(index, {
+        _replace_index(index, {
             "email_key": email_key,
             "cookie_file": path.name,
         })
@@ -76,3 +84,23 @@ async def save_claude_platform_session(
     finally:
         temporary.unlink(missing_ok=True)
     return path
+
+
+async def save_claude_platform_session(
+    context,
+    email,
+    output_dir="cookies/claude_api",
+):
+    cookies = await context.cookies()
+    platform_cookies = [
+        cookie for cookie in cookies if _is_claude_domain(cookie.get("domain"))
+    ]
+    if not platform_cookies:
+        raise RuntimeError("console_not_reached")
+
+    return await asyncio.to_thread(
+        _persist_claude_platform_session,
+        platform_cookies,
+        email,
+        output_dir,
+    )
