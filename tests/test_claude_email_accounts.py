@@ -8,6 +8,7 @@ from common.claude_email_accounts import (
     AccountFormatError,
     ClaudeEmailAccountStore,
     normalize_email_provider,
+    reserve_shared_claude_account,
 )
 
 
@@ -32,6 +33,59 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         self.assertEqual(normalize_email_provider("outlook"), "OUTLOOK")
         with self.assertRaisesRegex(ValueError, "unsupported email provider"):
             normalize_email_provider("unknown")
+
+    def test_claude_and_claude_api_ledgers_are_independent(self):
+        source = self.write("mail.txt", NINEMALL_ROW + "\n")
+        claude = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root, purpose="claude"
+        )
+        account = claude.reserve_one()
+        claude.mark_used(account)
+
+        api = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root, purpose="claude_api"
+        )
+        selected = api.reserve_one()
+
+        self.assertEqual(selected.email, account.email)
+        self.assertTrue((self.root / "mail_used_claude.txt").exists())
+        self.assertTrue((self.root / "mail_used_claude_api.txt").exists())
+
+    def test_shared_reservation_skips_address_blocked_for_one_purpose(self):
+        source = self.write(
+            "mail.txt",
+            NINEMALL_ROW + "\n"
+            "second@example.com----pass----client-2----refresh-2\n",
+        )
+        blocked = ClaudeEmailAccountStore(
+            "NINEMALL", source, self.root, purpose="claude"
+        )
+        first = blocked.reserve_one()
+        blocked.mark_used(first)
+
+        result = reserve_shared_claude_account(
+            "NINEMALL", ("claude", "claude_api"), source, self.root
+        )
+
+        account, stores = result
+        self.assertEqual(account.email, "second@example.com")
+        self.assertEqual(set(stores), {"claude", "claude_api"})
+
+    def test_outlook_claude_api_uses_separate_state_files(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        store = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        )
+        account = store.reserve_one()
+        store.mark_error(account, "mail_timeout")
+
+        self.assertTrue((self.root / "emails_used_claude_api.txt").exists())
+        self.assertTrue((self.root / "emails_error_claude_api.txt").exists())
+        self.assertFalse((self.root / "emails_used.txt").exists())
+        state = (self.root / "emails_error_claude_api.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("legacy@example.com----MailboxPass2!----mail_timeout", state)
 
     def test_ninemail_column_order(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")

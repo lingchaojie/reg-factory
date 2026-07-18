@@ -30,6 +30,10 @@ emails_*.txt
 mail.txt
 mail_used_claude.txt
 mail_error_claude.txt
+mail_used_claude_api.txt
+mail_error_claude_api.txt
+emails_used_claude_api.txt
+emails_error_claude_api.txt
 outlook_no_graph.txt
 proxies.txt
 outlook_accounts/

@@ -9,6 +9,7 @@ import config
 _POOL_LOCK = threading.Lock()
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _ROOT = Path(__file__).resolve().parent.parent
+_PURPOSES = {"claude", "claude_api"}
 _SAFE_REASONS = {
     "http_400",
     "http_401",
@@ -25,6 +26,14 @@ _SAFE_REASONS = {
     "transient_http",
     "unexpected_http",
 }
+_SAFE_REASONS.update({
+    "mail_timeout",
+    "verification_artifact_not_found",
+    "magic_link_invalid",
+    "verification_rejected",
+    "personal_account_not_available",
+    "console_not_reached",
+})
 
 
 class AccountFormatError(ValueError):
@@ -36,6 +45,13 @@ def normalize_email_provider(value):
     if provider not in {"NINEMALL", "OUTLOOK"}:
         raise ValueError(f"unsupported email provider: {provider}")
     return provider
+
+
+def normalize_purpose(value):
+    purpose = str(value or "claude").strip().lower() or "claude"
+    if purpose not in _PURPOSES:
+        raise ValueError(f"unsupported Claude email purpose: {purpose}")
+    return purpose
 
 
 @dataclass(frozen=True)
@@ -50,15 +66,26 @@ class ClaudeEmailAccount:
 
 
 class ClaudeEmailAccountStore:
-    def __init__(self, provider=None, source_file=None, root_dir=None):
+    def __init__(self, provider=None, source_file=None, root_dir=None, purpose="claude"):
         self.provider = normalize_email_provider(provider or config.EMAIL_PROVIDER)
+        self.purpose = normalize_purpose(purpose)
         self.root_dir = Path(root_dir or _ROOT).resolve()
-        default_name = config.NINEMALL_EMAIL_FILE if self.provider == "NINEMALL" else "emails.txt"
+        default_name = (
+            config.NINEMALL_EMAIL_FILE
+            if self.provider == "NINEMALL"
+            else "emails.txt"
+        )
         raw_source = Path(source_file or default_name)
-        self.source_file = raw_source if raw_source.is_absolute() else self.root_dir / raw_source
+        self.source_file = (
+            raw_source if raw_source.is_absolute() else self.root_dir / raw_source
+        )
         if self.provider == "NINEMALL":
-            self.used_file = self.root_dir / "mail_used_claude.txt"
-            self.error_file = self.root_dir / "mail_error_claude.txt"
+            suffix = "claude" if self.purpose == "claude" else "claude_api"
+            self.used_file = self.root_dir / f"mail_used_{suffix}.txt"
+            self.error_file = self.root_dir / f"mail_error_{suffix}.txt"
+        elif self.purpose == "claude_api":
+            self.used_file = self.root_dir / "emails_used_claude_api.txt"
+            self.error_file = self.root_dir / "emails_error_claude_api.txt"
         else:
             self.used_file = self.root_dir / "emails_used.txt"
             self.error_file = self.root_dir / "emails_error.txt"
@@ -238,3 +265,35 @@ class ClaudeEmailAccountStore:
             self._append_state(self.used_file, account, "released")
             self._active_reservations.discard(email)
             return True
+
+
+def reserve_shared_claude_account(
+    provider,
+    purposes,
+    source_file=None,
+    root_dir=None,
+):
+    requested = tuple(dict.fromkeys(normalize_purpose(purpose) for purpose in purposes))
+    if not requested:
+        raise ValueError("at least one Claude email purpose is required")
+    stores = {
+        purpose: ClaudeEmailAccountStore(
+            provider=provider,
+            source_file=source_file,
+            root_dir=root_dir,
+            purpose=purpose,
+        )
+        for purpose in requested
+    }
+    base = stores[requested[0]]
+    with _POOL_LOCK:
+        blocked = {purpose: store._blocked() for purpose, store in stores.items()}
+        for account in base._load_accounts():
+            email = account.email.lower()
+            if any(email in blocked[purpose] for purpose in requested):
+                continue
+            for purpose, store in stores.items():
+                store._append_state(store.used_file, account, "reserved")
+                store._active_reservations.add(email)
+            return account, stores
+    return None
