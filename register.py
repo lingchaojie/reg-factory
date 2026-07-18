@@ -1602,58 +1602,25 @@ async def register_replit(context, email, email_password, email_token="", tag=""
             pass
 
 
-def get_magic_link_by_token(email, refresh_token, client_id="9e5f94bc-e8a4-4e73-b8be-63364c29d753", max_wait=90):
-    """用 Outlook OAuth refresh token 通过 Graph API 读取 magic link"""
-    # Step 1: 用 refresh_token 获取 access_token
-    try:
-        token_resp = requests.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token", data={
-            "client_id": client_id,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": "https://graph.microsoft.com/Mail.Read",
-        }, timeout=30)
-        if token_resp.status_code != 200:
-            print(f"  [token-mail] token refresh failed: {token_resp.status_code} {token_resp.text[:100]}")
-            return None
-        access_token = token_resp.json().get("access_token")
-        if not access_token:
-            print(f"  [token-mail] no access_token in response")
-            return None
-    except Exception as e:
-        print(f"  [token-mail] token error: {e}")
-        return None
+def get_magic_link_by_token(
+    email,
+    refresh_token,
+    client_id="9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    max_wait=90,
+):
+    from common.mailbox import get_link_by_token
 
-    # Step 2: 轮询收件箱 + 垃圾箱找 Claude magic link
-    # magic link 邮件经常被 Outlook 判进垃圾箱(junkemail)，两个文件夹都要扫
-    import re
-    headers = {"Authorization": f"Bearer {access_token}"}
-    folders = ["inbox", "junkemail"]
-    start = time.time()
-    while time.time() - start < max_wait:
-        for folder in folders:
-            try:
-                mail_resp = requests.get(
-                    f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages?$top=5&$orderby=receivedDateTime desc&$select=subject,body,receivedDateTime",
-                    headers=headers, timeout=15
-                )
-                if mail_resp.status_code == 200:
-                    messages = mail_resp.json().get("value", [])
-                    for msg in messages:
-                        body = msg.get("body", {}).get("content", "")
-                        # 找 magic link
-                        match = re.search(r'https://claude\.ai/magic-link#[A-Za-z0-9_\-:=+/]+', body)
-                        if match:
-                            link = match.group(0)
-                            print(f"  [token-mail] magic link found in {folder}: {link[:80]}...")
-                            return link
-            except Exception as e:
-                print(f"  [token-mail] read error ({folder}): {e}")
-        elapsed = int(time.time() - start)
-        print(f"  [token-mail] waiting for email (inbox+junk)... ({elapsed}s/{max_wait}s)")
-        time.sleep(5)
-
-    print(f"  [token-mail] timeout, no magic link found")
-    return None
+    return get_link_by_token(
+        email,
+        refresh_token,
+        client_id=client_id,
+        link_regex=r"https://claude\.ai/magic-link#[A-Za-z0-9_\-:=+/]+",
+        sender_contains=("anthropic", "claude"),
+        subject_contains=("magic", "verify", "sign in", "login"),
+        must_contain="claude.ai/magic-link#",
+        max_wait=max_wait,
+        poll=5,
+    )
 
 
 # ---- 多语言按钮匹配（BitBrowser 节点地区不同，Claude 登录界面语言可能是 英/日/中/繁/韩/西/法/德）----

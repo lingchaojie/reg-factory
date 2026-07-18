@@ -20,6 +20,9 @@ if sys.platform == "win32":
 
 import requests
 
+from common.account_proxy import lease_from_env
+from common.ipmart_proxy import requests_proxy_url
+
 DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GRAPH_FOLDERS = ["inbox", "junkemail"]
 
@@ -30,11 +33,20 @@ GRAPH_FOLDERS = ["inbox", "junkemail"]
 _MS_NO_PROXY = {"http": None, "https": None}
 
 
-def _ms_session():
-    s = requests.Session()
-    s.trust_env = False  # 忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量，强制直连
-    s.proxies = _MS_NO_PROXY
-    return s
+def _ms_session(env=None, session_factory=requests.Session):
+    session = session_factory()
+    session.trust_env = False
+    lease = lease_from_env(os.environ if env is None else env)
+    if lease is None:
+        session.proxies = _MS_NO_PROXY
+    else:
+        proxy_url = requests_proxy_url(lease)
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+    return session
+
+
+def _safe_error(exc):
+    return type(exc).__name__ if exc is not None else "unknown error"
 
 
 def _get_access_token(refresh_token, client_id=DEFAULT_CLIENT_ID, scope="https://graph.microsoft.com/Mail.Read"):
@@ -62,10 +74,10 @@ def _get_access_token(refresh_token, client_id=DEFAULT_CLIENT_ID, scope="https:/
             if attempt < 2:
                 time.sleep(1.5)
                 continue
-        except Exception as e:
-            print(f"  [mail] token error: {e}")
+        except Exception as exc:
+            print(f"  [mail] token error: {_safe_error(exc)}")
             return None
-    print(f"  [mail] token 直连重试用尽(3 次): {str(last_err)[:80] if last_err else ''}")
+    print(f"  [mail] token request retries exhausted: {_safe_error(last_err)}")
     return None
 
 
@@ -84,14 +96,17 @@ def fetch_messages(access_token, folder, top=10):
         try:
             r = sess.get(url, headers=headers, timeout=15)
             break
-        except (requests.ConnectionError, requests.Timeout) as e:
+        except (requests.ConnectionError, requests.Timeout) as exc:
             if attempt < 2:
                 time.sleep(1.5)
                 continue
-            print(f"  [mail] fetch {folder} 连接抖动(重试用尽): {str(e)[:70]}")
+            print(
+                f"  [mail] fetch {folder} retries exhausted: "
+                f"{_safe_error(exc)}"
+            )
             return []
-        except Exception as e:
-            print(f"  [mail] fetch {folder} error: {e}")
+        except Exception as exc:
+            print(f"  [mail] fetch {folder} error: {_safe_error(exc)}")
             return []
     try:
         if r is None or r.status_code != 200:
@@ -105,8 +120,8 @@ def fetch_messages(access_token, folder, top=10):
                 "received": m.get("receivedDateTime", ""),
             })
         return out
-    except Exception as e:
-        print(f"  [mail] fetch {folder} parse error: {e}")
+    except Exception as exc:
+        print(f"  [mail] fetch {folder} parse error: {_safe_error(exc)}")
         return []
 
 
