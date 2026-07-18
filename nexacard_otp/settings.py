@@ -2,6 +2,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -56,7 +57,7 @@ def _read_env(path: Path) -> dict[str, str]:
 
 def _positive_float(value: str, name: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
+    if not isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{name} must be positive")
     return parsed
 

@@ -71,6 +71,16 @@ class NexaCardSettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive"):
                 load_settings(env_path)
 
+    def test_non_finite_polling_intervals_are_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                env_path = Path(directory) / ".env"
+                env_path.write_text(
+                    f"NEXACARD_OTP_POLL_INTERVAL_SECONDS={value}\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    load_settings(env_path)
+
     def test_legacy_oauth_files_copy_only_when_private_files_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
