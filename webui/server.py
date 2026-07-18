@@ -327,7 +327,7 @@ def _test_clash():
 
 def _fingerprint_provider():
     return (
-        _read_config_val("FINGERPRINT_BROWSER", "bitbrowser")
+        _read_config_val("FINGERPRINT_BROWSER", "")
         or os.environ.get("BROWSER_PROVIDER")
         or "bitbrowser"
     ).strip().lower()

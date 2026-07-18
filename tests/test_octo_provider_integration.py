@@ -232,6 +232,29 @@ class OctoProviderIntegrationTests(unittest.TestCase):
         self.assertEqual(status["browser_provider"], "octo")
         self.assertTrue(status["bitbrowser"])
 
+    def test_browser_provider_fallback_drives_real_webui_health_and_label(self):
+        env = {
+            "BROWSER_PROVIDER": "octo",
+            "OCTO_LOCAL_API_BASE": "http://fallback-octo.test:58888",
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server, "ENV_PATH", os.path.join(tmp, "missing.env")
+        ), patch.dict(os.environ, env, clear=True), patch.object(
+            server, "_direct_get", return_value=(200, "{}")
+        ) as direct_get, patch.object(
+            server, "_http_alive", return_value=True
+        ):
+            ok, message = server._test_bitbrowser()
+            status = server.api_status()
+
+        self.assertTrue(ok)
+        self.assertIn("Octo Browser", message)
+        self.assertEqual(
+            direct_get.call_args.args[0],
+            "http://fallback-octo.test:58888/api/update",
+        )
+        self.assertEqual(status["browser_provider"], "octo")
+
     def test_frontend_maps_octo_status_label(self):
         source = Path(server.WEBUI, "static", "app.js").read_text(
             encoding="utf-8"
