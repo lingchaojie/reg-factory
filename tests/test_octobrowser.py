@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -136,6 +137,30 @@ class OctoBrowserTests(unittest.TestCase):
             session.calls[0][1],
             "http://127.0.0.1:58888/api/profiles/start",
         )
+
+    def test_start_defaults_to_visible_octo_window(self):
+        browser, session = self.make_browser([
+            FakeResponse({
+                "uuid": "profile-1",
+                "ws_endpoint": "ws://127.0.0.1:55000/devtools/browser/id",
+                "debug_port": "55000",
+            })
+        ])
+        with patch.dict(os.environ, {}, clear=True):
+            browser.open_browser("profile-1")
+        self.assertIs(session.calls[0][2]["json"]["headless"], False)
+
+    def test_start_reads_enabled_headless_value_at_call_time(self):
+        browser, session = self.make_browser([
+            FakeResponse({
+                "uuid": "profile-1",
+                "ws_endpoint": "ws://127.0.0.1:55000/devtools/browser/id",
+                "debug_port": "55000",
+            })
+        ])
+        with patch.dict(os.environ, {"OCTO_HEADLESS": "  YeS  "}, clear=True):
+            browser.open_browser("profile-1")
+        self.assertIs(session.calls[0][2]["json"]["headless"], True)
 
     def test_list_and_delete_use_public_api(self):
         browser, session = self.make_browser([

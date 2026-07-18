@@ -4,6 +4,17 @@ import time
 
 import requests
 
+
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUE_ENV_VALUES
+
+
 try:
     from config import (
         OCTO_API_TOKEN,
@@ -249,7 +260,7 @@ class OctoBrowser:
             self.local_api + "/api/profiles/start",
             json_body={
                 "uuid": str(profile_id),
-                "headless": False,
+                "headless": _env_bool("OCTO_HEADLESS"),
                 "debug_port": True,
                 "only_local": True,
                 "flags": [],
