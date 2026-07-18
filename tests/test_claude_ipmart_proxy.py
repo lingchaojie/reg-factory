@@ -97,6 +97,13 @@ class ClaudeIPMartProxyTests(unittest.TestCase):
             rendered,
             "BitBrowser profile creation failed with IPMart account proxy",
         )
+        self.assertEqual(
+            getattr(caught.exception, "category", None), "configuration"
+        )
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(caught.exception.__dict__, {"category": "configuration"})
         for secret in (
             "account-res-US-sid-00000042",
             "proxy-secret",
@@ -110,6 +117,86 @@ class ClaudeIPMartProxyTests(unittest.TestCase):
         bb.create_browser.side_effect = RuntimeError("window quota exceeded")
         with self.assertRaisesRegex(RuntimeError, "window quota exceeded"):
             register.create_claude_profile(bb, "claude-1", None)
+
+
+class ClaudeProfileRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_recovery(self, raw_message):
+        bb = Mock()
+        bb.create_browser.side_effect = [RuntimeError(raw_message), "profile-1"]
+        registration = AsyncMock(return_value=None)
+        error = None
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "register.py",
+                "--email",
+                "a@outlook.com",
+                "--password",
+                "Pass1!",
+                "--token",
+                "rt-a",
+                "--node",
+                "none",
+            ],
+        ), patch.object(
+            register, "lease_from_env", return_value=make_lease()
+        ), patch.object(
+            register,
+            "settings_from_env",
+            return_value=SimpleNamespace(enabled=True),
+        ), patch.object(
+            register, "prepare_claude_network"
+        ), patch.object(
+            register, "configure_claude_proxy"
+        ), patch.object(
+            register, "BitBrowser", return_value=bb
+        ), patch.object(
+            register, "register", registration
+        ), patch.object(
+            register.asyncio, "sleep", new=AsyncMock()
+        ), patch("builtins.print") as printer:
+            try:
+                await register.main()
+            except Exception as exc:
+                error = exc
+        self.assertIsNone(error, f"credentialed recovery escaped: {error}")
+        return bb, registration, printer
+
+    async def test_credentialed_quota_failure_cleans_up_and_retries_secretly(self):
+        leaked = (
+            "maximum quota exceeded for "
+            "http://account-res-US-sid-00000042:proxy-secret@"
+            "gateway.example:8080"
+        )
+        bb, registration, printer = await self._run_recovery(leaked)
+
+        self.assertEqual(bb.create_browser.call_count, 2)
+        bb.cleanup_browsers.assert_called_once_with(keep=0)
+        registration.assert_awaited_once()
+        self._assert_output_is_secret_free(printer, leaked)
+
+    async def test_credentialed_transient_failure_retries_secretly(self):
+        leaked = (
+            "TLS socket disconnected via "
+            "http://account-res-US-sid-00000042:proxy-secret@"
+            "gateway.example:8080"
+        )
+        bb, registration, printer = await self._run_recovery(leaked)
+
+        self.assertEqual(bb.create_browser.call_count, 2)
+        bb.cleanup_browsers.assert_not_called()
+        registration.assert_awaited_once()
+        self._assert_output_is_secret_free(printer, leaked)
+
+    def _assert_output_is_secret_free(self, printer, leaked):
+        rendered = " ".join(str(call) for call in printer.call_args_list)
+        for secret in (
+            "account-res-US-sid-00000042",
+            "proxy-secret",
+            leaked,
+        ):
+            self.assertNotIn(secret, rendered)
 
 
 class StandaloneClaudeLeaseTests(unittest.IsolatedAsyncioTestCase):

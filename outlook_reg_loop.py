@@ -31,9 +31,10 @@ from datetime import datetime
 
 import config  # noqa: F401 - load .env before reading proxy settings
 from common.account_proxy import (
-    IPMART_BITBROWSER_ERROR,
+    IPMartBitBrowserError,
     bitbrowser_proxy_fields,
     lease_from_env,
+    sanitized_bitbrowser_error,
     strip_http_proxy_env,
 )
 from common.ipmart_proxy import (
@@ -386,12 +387,14 @@ def _bb_call(path, body):
 
 
 def bb_create_for_outlook_reg(name, lease=None):
+    safe_error = None
     try:
         return _bb_create_for_outlook_reg(name, lease)
-    except Exception:
-        if lease is not None:
-            raise RuntimeError(IPMART_BITBROWSER_ERROR) from None
-        raise
+    except Exception as exc:
+        if lease is None:
+            raise
+        safe_error = sanitized_bitbrowser_error(exc)
+    raise safe_error from None
 
 
 def _bb_create_for_outlook_reg(name, lease=None):
@@ -689,12 +692,26 @@ async def one_attempt(mod, proxy_str, idx, lease=None):
                 break
             except Exception as e:
                 m = str(e)
-                if "最大" in m or "超过" in m:
-                    log("BitBrowser quota — cleanup_browsers(keep=2)", "WARN")
+                safe_category = (
+                    e.category if isinstance(e, IPMartBitBrowserError) else None
+                )
+                if safe_category == "quota" or (
+                    safe_category is None and ("最大" in m or "超过" in m)
+                ):
+                    if safe_category is None:
+                        quota_message = "BitBrowser quota"
+                    else:
+                        quota_message = f"{e}; quota"
+                    log(
+                        f"{quota_message} — cleanup_browsers(keep=2)",
+                        "WARN",
+                    )
                     try: bb.cleanup_browsers(keep=2)
                     except Exception: pass
                     await asyncio.sleep(3)
                     continue
+                if safe_category not in {None, "transient"}:
+                    raise
                 if _r >= 4:
                     raise
                 log(f"create_browser err (try {_r+1}/5): {m[:200]}", "WARN")

@@ -31,9 +31,10 @@ except Exception:
     proxy_switch = None
 from common import human_mouse as _hm
 from common.account_proxy import (
-    IPMART_BITBROWSER_ERROR,
+    IPMartBitBrowserError,
     bitbrowser_proxy_fields,
     lease_from_env,
+    sanitized_bitbrowser_error,
     strip_http_proxy_env,
 )
 from common.ipmart_proxy import (
@@ -172,12 +173,14 @@ def create_claude_profile(bb, name, account_lease=None):
     proxy_fields = (
         bitbrowser_proxy_fields(account_lease) if account_lease else {}
     )
+    safe_error = None
     try:
         return bb.create_browser(name=name, **proxy_fields)
-    except Exception:
-        if account_lease is not None:
-            raise RuntimeError(IPMART_BITBROWSER_ERROR) from None
-        raise
+    except Exception as exc:
+        if account_lease is None:
+            raise
+        safe_error = sanitized_bitbrowser_error(exc)
+    raise safe_error from None
 
 # web2api 验证服务地址
 WEB2API_BASE = "http://127.0.0.1:9000"
@@ -3998,11 +4001,35 @@ async def main():
                     break
                 except Exception as e:
                     err_msg = str(e)
-                    if '最大创建窗口数' in err_msg or '超过' in err_msg:
-                        print(f"\n  窗口数量已满，自动清理...")
+                    safe_category = (
+                        e.category
+                        if isinstance(e, IPMartBitBrowserError)
+                        else None
+                    )
+                    if safe_category == "quota" or (
+                        safe_category is None
+                        and (
+                            '最大创建窗口数' in err_msg
+                            or '超过' in err_msg
+                        )
+                    ):
+                        if safe_category is None:
+                            print(f"\n  窗口数量已满，自动清理...")
+                        else:
+                            print(f"\n  {e}; window quota, cleaning up...")
                         bb.cleanup_browsers(keep=0)
                         continue
-                    elif 'TLS' in err_msg or 'socket' in err_msg or 'ECONNRESET' in err_msg or 'network' in err_msg.lower() or 'Timeout' in err_msg or 'timeout' in err_msg:
+                    elif safe_category == "transient" or (
+                        safe_category is None
+                        and (
+                            'TLS' in err_msg
+                            or 'socket' in err_msg
+                            or 'ECONNRESET' in err_msg
+                            or 'network' in err_msg.lower()
+                            or 'Timeout' in err_msg
+                            or 'timeout' in err_msg
+                        )
+                    ):
                         print(f"  create browser network error (retry {_retry+1}/3): {err_msg[:80]}")
                         await asyncio.sleep(5)
                         continue

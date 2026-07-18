@@ -131,6 +131,37 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
             )
         return captured
 
+    async def capture_launch_order(self, platforms, parallel, env):
+        args = argparse.Namespace(
+            platforms=platforms,
+            parallel=parallel,
+            timeout=600,
+            node="auto",
+            keep_on_fail=False,
+            import_c2a=False,
+            codex=False,
+            codex_group=None,
+            codex_manual_phone=False,
+            grok_sub2api=False,
+            grok_sub2api_group=None,
+            broker="",
+        )
+        order = []
+        captured = {}
+
+        async def fake_run(platform, _cmd, _run_id, child_env):
+            order.append(platform)
+            captured[platform] = child_env
+            return platform, True, 0, "test.log"
+
+        with patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ):
+            await register_three_platforms.process_account(
+                ("a@outlook.com", "Pass1!", "", ""), args, env
+            )
+        return order, captured
+
     def assert_platform_envs(self, captured):
         for key in HTTP_PROXY_KEYS:
             self.assertNotIn(key, captured["claude"])
@@ -149,6 +180,31 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_parallel_launches_use_platform_environments(self):
         self.assert_platform_envs(await self.capture_launch_envs(parallel=True))
+
+    async def test_reversed_sequential_order_runs_claude_first_with_lease(self):
+        order, captured = await self.capture_launch_order(
+            ["chatgpt", "grok", "claude"], False, self.env
+        )
+        self.assertEqual(order, ["claude", "chatgpt", "grok"])
+        self.assert_platform_envs(captured)
+
+    async def test_reversed_parallel_order_prioritizes_claude_and_keeps_envs(self):
+        order, captured = await self.capture_launch_order(
+            ["chatgpt", "grok", "claude"], True, self.env
+        )
+        self.assertEqual(order, ["claude", "chatgpt", "grok"])
+        self.assert_platform_envs(captured)
+
+    async def test_no_lease_sequential_order_stays_exactly_as_requested(self):
+        env = {
+            key: value for key, value in self.env.items()
+            if key not in ACCOUNT_PROXY_KEYS
+        }
+        requested = ["chatgpt", "grok", "claude"]
+        order, _captured = await self.capture_launch_order(
+            requested, False, env
+        )
+        self.assertEqual(order, requested)
 
 
 if __name__ == "__main__":

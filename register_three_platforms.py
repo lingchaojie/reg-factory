@@ -194,7 +194,10 @@ async def process_account(account, args, child_env):
     print(f"  account: {email}  platforms={','.join(args.platforms)}  mode={'parallel' if args.parallel else 'sequential'}")
     print("=" * 60)
 
-    jobs = [(p, build_command(p, args, account)) for p in args.platforms]
+    platforms = list(args.platforms)
+    if child_env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
+        platforms.sort(key=lambda platform: platform != "claude")
+    jobs = [(p, build_command(p, args, account)) for p in platforms]
     if args.parallel:
         results = await asyncio.gather(*(
             run_platform(p, cmd, run_id, platform_child_env(p, child_env))

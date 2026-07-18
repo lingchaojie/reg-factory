@@ -12,11 +12,37 @@ HTTP_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 IPMART_BITBROWSER_ERROR = (
     "BitBrowser profile creation failed with IPMart account proxy"
 )
+_BITBROWSER_QUOTA_MARKERS = (
+    "maximum quota", "quota exceeded", "too many", "最大创建窗口数", "超过",
+)
+_BITBROWSER_TRANSIENT_MARKERS = (
+    "tls", "socket", "econnreset", "connection", "network", "timed out",
+    "timeout", "max retries", "remotedisconnected",
+)
 ACCOUNT_PROXY_ENV_KEYS = (
     "ACCOUNT_PROXY_SOURCE", "ACCOUNT_PROXY_TYPE", "ACCOUNT_PROXY_HOST",
     "ACCOUNT_PROXY_PORT", "ACCOUNT_PROXY_USERNAME", "ACCOUNT_PROXY_PASSWORD",
     "ACCOUNT_PROXY_SID", "ACCOUNT_PROXY_EXIT_IP",
 )
+
+
+class IPMartBitBrowserError(RuntimeError):
+    def __init__(self, category: str):
+        if category not in {"quota", "transient", "configuration"}:
+            category = "configuration"
+        super().__init__(IPMART_BITBROWSER_ERROR)
+        self.category = category
+
+
+def sanitized_bitbrowser_error(exc: Exception) -> IPMartBitBrowserError:
+    message = str(exc).lower()
+    if any(marker in message for marker in _BITBROWSER_QUOTA_MARKERS):
+        category = "quota"
+    elif any(marker in message for marker in _BITBROWSER_TRANSIENT_MARKERS):
+        category = "transient"
+    else:
+        category = "configuration"
+    return IPMartBitBrowserError(category)
 
 
 def lease_to_env(lease: ProxyLease) -> dict[str, str]:

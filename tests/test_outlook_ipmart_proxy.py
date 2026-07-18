@@ -178,6 +178,13 @@ class OutlookIPMartProxyTests(unittest.TestCase):
             rendered,
             "BitBrowser profile creation failed with IPMart account proxy",
         )
+        self.assertEqual(
+            getattr(caught.exception, "category", None), "configuration"
+        )
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(caught.exception.__dict__, {"category": "configuration"})
         for secret in (
             "account-res-US-sid-00000042",
             "proxy-secret",
@@ -195,6 +202,80 @@ class OutlookIPMartProxyTests(unittest.TestCase):
             return_value={"success": False, "msg": "window quota exceeded"},
         ), self.assertRaisesRegex(RuntimeError, "window quota exceeded"):
             outlook_reg_loop.bb_create_for_outlook_reg("outlook-1", None)
+
+
+class OutlookProfileRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.lease = ProxyLease(
+            "http",
+            "gateway.example",
+            8080,
+            "account-res-US-sid-00000042",
+            "proxy-secret",
+            "00000042",
+            "203.0.113.8",
+        )
+
+    async def _run_recovery(self, raw_message):
+        bb = unittest.mock.Mock()
+        bb.open_browser.return_value = {}
+        mod = SimpleNamespace(
+            BitBrowserClient=unittest.mock.Mock(return_value=bb)
+        )
+        responses = [
+            {"success": False, "msg": raw_message},
+            {"success": True, "data": {"id": "profile-1"}},
+        ]
+        with patch.object(
+            outlook_reg_loop, "_fingerprint_provider", return_value="bitbrowser"
+        ), patch.object(
+            outlook_reg_loop, "_bb_call", side_effect=responses
+        ) as api_call, patch.object(
+            outlook_reg_loop.asyncio, "sleep", new=AsyncMock()
+        ), patch.object(outlook_reg_loop, "log") as logger:
+            result = await outlook_reg_loop.one_attempt(
+                mod, "", 1, self.lease
+            )
+        return result, bb, api_call, logger
+
+    async def test_credentialed_quota_failure_cleans_up_and_retries_secretly(self):
+        leaked = (
+            "maximum quota exceeded for "
+            "http://account-res-US-sid-00000042:proxy-secret@"
+            "gateway.example:8080"
+        )
+        result, bb, api_call, logger = await self._run_recovery(leaked)
+
+        self.assertEqual(result, (None, None, []))
+        self.assertEqual(api_call.call_count, 2)
+        bb.cleanup_browsers.assert_called_once_with(keep=2)
+        self._assert_logs_are_secret_free(logger, leaked)
+
+    async def test_credentialed_transient_failure_retries_secretly(self):
+        leaked = (
+            "TLS socket disconnected via "
+            "http://account-res-US-sid-00000042:proxy-secret@"
+            "gateway.example:8080"
+        )
+        result, bb, api_call, logger = await self._run_recovery(leaked)
+
+        self.assertEqual(result, (None, None, []))
+        self.assertEqual(api_call.call_count, 2)
+        bb.cleanup_browsers.assert_not_called()
+        self._assert_logs_are_secret_free(logger, leaked)
+
+    def _assert_logs_are_secret_free(self, logger, leaked):
+        rendered = " ".join(str(call) for call in logger.call_args_list)
+        self.assertIn(
+            "BitBrowser profile creation failed with IPMart account proxy",
+            rendered,
+        )
+        for secret in (
+            "account-res-US-sid-00000042",
+            "proxy-secret",
+            leaked,
+        ):
+            self.assertNotIn(secret, rendered)
 
 
 if __name__ == "__main__":
