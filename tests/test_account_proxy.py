@@ -67,9 +67,29 @@ class AccountProxyTests(unittest.TestCase):
         account_proxy.strip_account_proxy_env(env)
         self.assertEqual(env, {"CLASH_PROXY": "http://127.0.0.1:7897"})
 
-    def test_old_ipmart_configuration_keys_remain_until_task_7(self):
-        keys = set(scripts.env_keys())
-        self.assertIn("IPMART_ACCESS_KEY", keys)
+    def test_ipmart_sid_configuration_is_exposed_in_webui(self):
+        groups = scripts.ENV_SCHEMA
+        items = {
+            item["key"]: item
+            for group in groups
+            for item in group.get("items", [])
+        }
+        expected = {
+            "IPMART_ENABLED",
+            "IPMART_PROXY_HOST",
+            "IPMART_PROXY_PORT",
+            "IPMART_PROXY_USERNAME_TEMPLATE",
+            "IPMART_PROXY_PASSWORD",
+            "IPMART_MAX_ATTEMPTS",
+            "IPMART_IP_CHECK_URL",
+        }
+        self.assertTrue(expected.issubset(items))
+        self.assertTrue(items["IPMART_PROXY_USERNAME_TEMPLATE"]["secret"])
+        self.assertTrue(items["IPMART_PROXY_PASSWORD"]["secret"])
+        for obsolete_suffix in (
+            "ACCESS_KEY", "API_BASE", "COUNTRY", "STICKY_MINUTES",
+        ):
+            self.assertNotIn(f"IPMART_{obsolete_suffix}", items)
 
 
 if __name__ == "__main__":

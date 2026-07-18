@@ -52,16 +52,14 @@ ADSPOWER_API = _env("ADSPOWER_API", "http://127.0.0.1:50325")
 ADSPOWER_API_KEY = _env("ADSPOWER_API_KEY", "")
 ADSPOWER_GROUP_ID = _env("ADSPOWER_GROUP_ID", "0")
 
-# IPMart per-account HTTP proxy.  The provider validates numeric ranges when used.
+# IPMart per-account SID proxy. The provider validates values when used.
 IPMART_ENABLED = _env("IPMART_ENABLED", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
-IPMART_ACCESS_KEY = _env("IPMART_ACCESS_KEY", "")
-IPMART_API_BASE = _env(
-    "IPMART_API_BASE", "https://api.ipmart.io/ipmart/common/getIps"
-)
-IPMART_COUNTRY = _env("IPMART_COUNTRY", "US")
-IPMART_STICKY_MINUTES = int(_env("IPMART_STICKY_MINUTES", "30") or "30")
+IPMART_PROXY_HOST = _env("IPMART_PROXY_HOST", "")
+IPMART_PROXY_PORT = _env("IPMART_PROXY_PORT", "")
+IPMART_PROXY_USERNAME_TEMPLATE = _env("IPMART_PROXY_USERNAME_TEMPLATE", "")
+IPMART_PROXY_PASSWORD = _env("IPMART_PROXY_PASSWORD", "")
 IPMART_MAX_ATTEMPTS = int(_env("IPMART_MAX_ATTEMPTS", "3") or "3")
 IPMART_IP_CHECK_URL = _env(
     "IPMART_IP_CHECK_URL", "https://api.ipify.org?format=json"

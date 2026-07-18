@@ -75,6 +75,8 @@
   - 记下混合代理端口（mixed-port，默认 `7897`）。
 - 把 secret 填进 `.env` 的 `CLASH_SECRET`（见下）。
 
+> 只跑启用 IPMart 的默认 Outlook → Claude 流程时不需要 Clash；ChatGPT、Grok 和未启用 IPMart 的流程仍按各自原有代理规则运行。
+
 ### ③ Python
 - Python 3.10+。
 
@@ -210,12 +212,12 @@ cp .env.example .env
 | `CLASH_API` | Clash 控制面地址（默认 `http://127.0.0.1:9097`） | 否 |
 | `CLASH_PROXY` | Clash 混合端口代理（默认 `http://127.0.0.1:7897`） | 否 |
 | `CLASH_GROUP` | 切换出口的代理组名（默认 `GLOBAL`） | 否 |
-| `IPMART_ENABLED` | 每账号使用一个 IPMart HTTP 代理；`1` 启用，默认 `0` | 否 |
-| `IPMART_ACCESS_KEY` | IPMart API accessKey（仅启用时读取，不写入日志） | 启用 IPMart 时 |
-| `IPMART_API_BASE` | IPMart 获取代理接口（默认 `https://api.ipmart.io/ipmart/common/getIps`） | 否 |
-| `IPMART_COUNTRY` | 代理国家代码（默认 `US`） | 否 |
-| `IPMART_STICKY_MINUTES` | 代理粘性分钟数（默认 `30`，允许 `5-30`） | 否 |
-| `IPMART_MAX_ATTEMPTS` | 获取、验活或出口重复时的最大尝试次数（默认 `3`） | 否 |
+| `IPMART_ENABLED` | 每账号使用一个 IPMart 固定网关 SID 租约；`1` 启用，默认 `0` | 否 |
+| `IPMART_PROXY_HOST` | IPMart 控制台显示的固定网关主机名 | 启用 IPMart 时 |
+| `IPMART_PROXY_PORT` | IPMart 控制台显示的固定网关端口 | 启用 IPMart 时 |
+| `IPMART_PROXY_USERNAME_TEMPLATE` | 控制台代理用户名，只把其中的 SID 数字替换为 `{sid}`；WebUI 按密钥遮挡 | 启用 IPMart 时 |
+| `IPMART_PROXY_PASSWORD` | IPMart 控制台显示的代理密码；WebUI 按密钥遮挡 | 启用 IPMart 时 |
+| `IPMART_MAX_ATTEMPTS` | 获取或验证失败时的正整数尝试上限（默认 `3`，不硬性限制为 3） | 否 |
 | `IPMART_IP_CHECK_URL` | 真实出口 IP 校验地址（默认 ipify JSON API） | 否 |
 | `FINGERPRINT_BROWSER` | 指纹浏览器 provider：`bitbrowser` / `adspower`（默认 `bitbrowser`） | 否 |
 | `BITBROWSER_API` | 比特浏览器本地 API（默认 `http://127.0.0.1:54345`） | 否 |
@@ -263,28 +265,37 @@ python run_full_flow.py --dry-run             # 只打印将执行的命令
 > `--import-c2a` 逐层透传到 `register_chatgpt.py`，只对 chatgpt 平台生效，需先配 `CHATGPT2API_URL/KEY`。
 > `--email-confirm-before-register` 会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
 
-#### 每个账号使用独立 IPMart 代理
+#### 每个账号使用一个 IPMart 固定网关 SID 租约
 
-先在 IPMart 后台把运行本项目的电脑公网 IP 加入白名单，再在 `.env` 填写：
+在 IPMart 控制台打开固定网关/代理凭据页面，把显示的主机、端口、代理用户名和代理密码复制到 `.env`。代理用户名中必须已有控制台给出的 SID 段；**只把该 SID 的数字替换为 `{sid}`**，不要把 `{sid}` 追加到一个无关用户名后面。下面全部是占位符：
 
 ```dotenv
 IPMART_ENABLED=1
-IPMART_ACCESS_KEY=你的_access_key
-IPMART_COUNTRY=US
-IPMART_STICKY_MINUTES=30
+IPMART_PROXY_HOST=your-fixed-gateway-host
+IPMART_PROXY_PORT=your-fixed-gateway-port
+IPMART_PROXY_USERNAME_TEMPLATE=your-console-username-with-sid-{sid}
+IPMART_PROXY_PASSWORD=your-proxy-password
 IPMART_MAX_ATTEMPTS=3
+IPMART_IP_CHECK_URL=https://api.ipify.org?format=json
 ```
 
-本地无消耗检查与真实单轮运行：
+`IPMART_MAX_ATTEMPTS` 是可配置的正整数尝试上限，默认值为 `3`，程序没有“三次”的硬上限。旧版 access-key/API/国家/粘性分钟环境变量模式已不受支持。WebUI 的用户名模板和密码都使用密码框，并且 IPMart 分组不提供连接测试按钮，避免仅保存配置就消耗 SID 或代理流量。
+
+本地无消耗检查与真实单账号运行：
 
 ```bash
+# Dry-run：不生成 SID、不执行 IP 校验、不创建浏览器 profile 或外部账号
 python run_full_flow.py --platforms claude --dry-run
+
+# 真实单账号：消耗 IPMart 代理流量，并创建外部 Outlook 和 Claude 账号
 python run_full_flow.py --platforms claude --rounds 1
 ```
 
-启用后，每轮会直接调用 IPMart 获取一个 `num=1`、`format=1` 的美国 HTTP 代理，先通过代理检查真实出口 IP，再把同一代理写入本轮 Outlook 和 Claude 的临时 BitBrowser profile。进入 Claude 阶段前会再次检查出口；代理失效或出口改变时终止本轮，最多获取 3 次，**不会回退到 Clash、直连或已有 BitBrowser profile**。临时 profile 在流程结束后照常删除，不依赖 IPMart 后台继续保留该条代理配置。
+启用后，每个候选 SID 都在本地生成并渲染进控制台用户名模板。同一个已验证的 SID 租约贯穿本轮 **Outlook BitBrowser、OAuth token 提取、Microsoft Graph 邮箱读取和 Claude BitBrowser**。正常首候选成功时恰好发起两次专用 IP 校验请求：获取租约时一次，进入 Claude 前再一次；失败或出口重复才会按 `IPMART_MAX_ATTEMPTS` 更换 SID 重试。出口变化会终止本轮。
 
-默认粘性时间是 30 分钟，单轮应在有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。`--dry-run` 只打印流程，不调用 IPMart，也不占用代理分配。
+IPMart 的粘性时长由控制台/套餐决定，常见范围为 5-30 分钟；一轮 Outlook → Claude 必须在同一 SID 的有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。
+
+这项迁移只覆盖默认 Outlook → Claude 边界：启用 IPMart 后该链路不需要 Clash，也不会使用继承的 HTTP 代理。ChatGPT 和 Grok 不在这次迁移内，继续保持原有代理行为。
 
 ### 仅三平台注册（已有邮箱池 emails.txt）
 ```bash

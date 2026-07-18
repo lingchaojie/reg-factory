@@ -1,5 +1,20 @@
 ﻿# 更新日志
 
+## 2026-07-18 — IPMart 固定网关 SID 租约迁移
+
+> 本条取代并修正下方同日的 access-key 获取代理方案；历史条目保留用于追溯，旧模式不再受支持。
+
+**迁移**
+- IPMart 配置改为控制台固定网关的主机、端口、用户名模板和密码；用户名模板只把控制台所示 SID 数字替换为 `{sid}`，WebUI 对模板和密码均作密钥遮挡且不提供 IPMart 连接测试按钮。
+- `IPMART_MAX_ATTEMPTS` 是默认 `3` 的正整数尝试上限，不存在硬编码三次上限；同一个 SID 租约贯穿 Outlook BitBrowser、OAuth/Graph、Graph 邮箱读取与 Claude BitBrowser。
+- 正常首候选成功恰好执行两次专用出口检查：租约获取时一次、进入 Claude 前一次。`--dry-run` 不生成 SID、不检查出口，也不创建 profile 或账号。
+
+**网络边界**
+- 启用 IPMart 的默认 Outlook → Claude 流程不需要 Clash，也不使用继承的 HTTP 代理；ChatGPT/Grok 不在本次迁移内，保留原行为。
+- IPMart 粘性时长由控制台/套餐决定，常见范围为 5-30 分钟，整轮必须在同一 SID 有效期内完成。
+
+---
+
 ## 2026-07-18 — IPMart 每账号独立代理接入 BitBrowser
 
 **新增**
