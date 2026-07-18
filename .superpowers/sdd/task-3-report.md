@@ -76,3 +76,38 @@
 - The focused regression asserts a delete transport-failure retry count;
   code review confirms the identical budget is explicitly forwarded through
   every other `_post` compatibility route.
+
+## Final Review Fix — Canonical Public Automation Base
+
+### RED
+
+- Added URL-contract tests for the exact canonical default
+  `https://app.octobrowser.net/api/v2/automation` and for a legacy Public API
+  host-root value.
+- Before the fix, the canonical value generated a duplicated
+  `/api/v2/automation/api/v2/automation/profiles` URL, while the legacy value
+  remained an unnormalized host root internally.
+
+### GREEN
+
+- `OCTO_PUBLIC_API_BASE` now means the complete automation base, and its exact
+  default is `https://app.octobrowser.net/api/v2/automation`.
+- The adapter normalizes legacy host roots once and recognizes already-complete
+  automation bases, then appends only `/profiles` or `/profiles/{uuid}`.
+- Canonical configuration remains preferred over legacy `OCTO_PUBLIC_API`.
+- Updated config, WebUI metadata, `.env.example`, README, CHANGELOG, and related
+  integration tests. No route files were changed.
+
+### Verification
+
+- `python -m unittest tests.test_octobrowser tests.test_octo_provider_integration -v`
+  — 32 passed.
+- `python -m unittest discover -s tests -p 'test_*.py' -v` — 248 passed.
+- Public API behavior was verified only with fake sessions; no remote profile
+  mutation was performed.
+
+### Concerns
+
+- Arbitrary custom Public API values that do not already end in
+  `/api/v2/automation` are treated as host roots and receive that suffix. This
+  preserves the documented legacy host-root compatibility.

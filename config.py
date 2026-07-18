@@ -49,7 +49,10 @@ FINGERPRINT_BROWSER = _env("FINGERPRINT_BROWSER", "bitbrowser").strip().lower()
 OCTO_API_TOKEN = _env("OCTO_API_TOKEN", "")
 OCTO_PUBLIC_API_BASE = _env(
     "OCTO_PUBLIC_API_BASE",
-    _env("OCTO_PUBLIC_API", "https://app.octobrowser.net"),
+    _env(
+        "OCTO_PUBLIC_API",
+        "https://app.octobrowser.net/api/v2/automation",
+    ),
 )
 OCTO_LOCAL_API_BASE = _env(
     "OCTO_LOCAL_API_BASE",

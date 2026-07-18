@@ -53,7 +53,9 @@ class OctoProviderIntegrationTests(unittest.TestCase):
     def test_canonical_octo_base_settings_reach_adapter(self):
         env = {
             "OCTO_API_TOKEN": "canonical-token",
-            "OCTO_PUBLIC_API_BASE": "https://public.example.test/",
+            "OCTO_PUBLIC_API_BASE": (
+                "https://public.example.test/api/v2/automation/"
+            ),
             "OCTO_LOCAL_API_BASE": "http://local.example.test:58888/",
         }
         try:
@@ -63,7 +65,8 @@ class OctoProviderIntegrationTests(unittest.TestCase):
                 browser = octobrowser.OctoBrowser()
                 self.assertEqual(browser.api_token, "canonical-token")
                 self.assertEqual(
-                    browser.public_api, "https://public.example.test"
+                    browser.public_api,
+                    "https://public.example.test/api/v2/automation",
                 )
                 self.assertEqual(
                     browser.local_api, "http://local.example.test:58888"
@@ -84,7 +87,7 @@ class OctoProviderIntegrationTests(unittest.TestCase):
                 browser = octobrowser.OctoBrowser(api_token="token")
                 self.assertEqual(
                     browser.public_api,
-                    "https://legacy-public.example.test",
+                    "https://legacy-public.example.test/api/v2/automation",
                 )
                 self.assertEqual(
                     browser.local_api,
@@ -169,7 +172,7 @@ class OctoProviderIntegrationTests(unittest.TestCase):
         self.assertTrue(items["OCTO_API_TOKEN"]["secret"])
         self.assertEqual(
             items["OCTO_PUBLIC_API_BASE"]["default"],
-            "https://app.octobrowser.net",
+            "https://app.octobrowser.net/api/v2/automation",
         )
         self.assertEqual(
             items["OCTO_LOCAL_API_BASE"]["default"],

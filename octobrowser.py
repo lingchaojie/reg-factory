@@ -15,7 +15,8 @@ except Exception:
     OCTO_PUBLIC_API_BASE = os.environ.get(
         "OCTO_PUBLIC_API_BASE"
     ) or os.environ.get(
-        "OCTO_PUBLIC_API", "https://app.octobrowser.net"
+        "OCTO_PUBLIC_API",
+        "https://app.octobrowser.net/api/v2/automation",
     )
     OCTO_LOCAL_API_BASE = os.environ.get(
         "OCTO_LOCAL_API_BASE"
@@ -26,6 +27,7 @@ except Exception:
 
 class OctoBrowser:
     provider_name = "octo"
+    public_automation_path = "/api/v2/automation"
 
     def __init__(
         self,
@@ -35,11 +37,12 @@ class OctoBrowser:
         api_token=None,
         session=None,
     ):
-        self.public_api = (
+        public_base = (
             public_api
             or OCTO_PUBLIC_API_BASE
-            or "https://app.octobrowser.net"
+            or "https://app.octobrowser.net/api/v2/automation"
         ).rstrip("/")
+        self.public_api = self._normalize_public_api_base(public_base)
         self.local_api = (
             local_api
             or OCTO_LOCAL_API_BASE
@@ -48,6 +51,13 @@ class OctoBrowser:
         self.api_token = OCTO_API_TOKEN if api_token is None else api_token
         self.session = session or requests.Session()
         self.session.trust_env = False
+
+    @classmethod
+    def _normalize_public_api_base(cls, value):
+        base = str(value).rstrip("/")
+        if base.endswith(cls.public_automation_path):
+            return base
+        return base + cls.public_automation_path
 
     @staticmethod
     def _redact(message, secrets=()):
@@ -207,7 +217,7 @@ class OctoBrowser:
         proxy = payload.get("proxy") or {}
         result = self._request(
             "POST",
-            self.public_api + "/api/v2/automation/profiles",
+            self.public_api + "/profiles",
             public=True,
             json_body=payload,
             retries=_retries,
@@ -225,7 +235,7 @@ class OctoBrowser:
         proxy = payload.get("proxy") or {}
         self._request(
             "PATCH",
-            self.public_api + "/api/v2/automation/profiles/" + str(profile_id),
+            self.public_api + "/profiles/" + str(profile_id),
             public=True,
             json_body=payload,
             retries=_retries,
@@ -272,7 +282,7 @@ class OctoBrowser:
     def delete_browser(self, profile_id, _retries=5):
         return self._request(
             "DELETE",
-            self.public_api + "/api/v2/automation/profiles",
+            self.public_api + "/profiles",
             public=True,
             json_body={"uuids": [str(profile_id)], "skip_trash_bin": True},
             retries=_retries,
@@ -281,7 +291,7 @@ class OctoBrowser:
     def list_browsers(self, page=0, page_size=100, _retries=5):
         result = self._request(
             "GET",
-            self.public_api + "/api/v2/automation/profiles",
+            self.public_api + "/profiles",
             public=True,
             params={
                 "page_len": int(page_size),

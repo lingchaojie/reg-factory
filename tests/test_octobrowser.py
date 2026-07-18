@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import requests
 
+import octobrowser
 from octobrowser import OctoBrowser
 
 
@@ -57,6 +58,43 @@ class OctoBrowserTests(unittest.TestCase):
         self.assertEqual(body["title"], "direct")
         self.assertEqual(body["fingerprint"]["os"], "win")
         self.assertNotIn("proxy", body)
+
+    def test_canonical_default_uses_exact_automation_profiles_url(self):
+        session = FakeSession([
+            FakeResponse({
+                "success": True,
+                "data": {"uuid": "profile-1"},
+            }, 201)
+        ])
+        canonical = "https://app.octobrowser.net/api/v2/automation"
+        with patch.object(octobrowser, "OCTO_PUBLIC_API_BASE", canonical):
+            browser = OctoBrowser(api_token="token-value", session=session)
+        browser.create_browser(name="canonical")
+        self.assertEqual(browser.public_api, canonical)
+        self.assertEqual(
+            session.calls[0][1], canonical + "/profiles"
+        )
+
+    def test_legacy_host_root_normalizes_to_automation_profiles_url(self):
+        session = FakeSession([
+            FakeResponse({
+                "success": True,
+                "data": {"uuid": "profile-1"},
+            }, 201)
+        ])
+        browser = OctoBrowser(
+            public_api="https://legacy.example.test/",
+            api_token="token-value",
+            session=session,
+        )
+        browser.create_browser(name="legacy")
+        automation_base = (
+            "https://legacy.example.test/api/v2/automation"
+        )
+        self.assertEqual(browser.public_api, automation_base)
+        self.assertEqual(
+            session.calls[0][1], automation_base + "/profiles"
+        )
 
     def test_create_maps_ipmart_proxy(self):
         browser, session = self.make_browser([

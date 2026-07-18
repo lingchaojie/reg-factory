@@ -67,7 +67,10 @@ class WebUIEnvReloadTests(unittest.TestCase):
 
     def test_saved_octo_bases_are_visible_to_new_children(self):
         tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
-        tmp.write("OCTO_PUBLIC_API_BASE=https://public.example.test\n")
+        tmp.write(
+            "OCTO_PUBLIC_API_BASE="
+            "https://public.example.test/api/v2/automation\n"
+        )
         tmp.write("OCTO_LOCAL_API_BASE=http://local.example.test:58888\n")
         tmp.close()
         self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
@@ -77,7 +80,8 @@ class WebUIEnvReloadTests(unittest.TestCase):
         ), patch.dict(os.environ, {}, clear=True):
             child = server._child_env()
         self.assertEqual(
-            child["OCTO_PUBLIC_API_BASE"], "https://public.example.test"
+            child["OCTO_PUBLIC_API_BASE"],
+            "https://public.example.test/api/v2/automation",
         )
         self.assertEqual(
             child["OCTO_LOCAL_API_BASE"], "http://local.example.test:58888"

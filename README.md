@@ -67,8 +67,8 @@
 
 **选项 C：Octo Browser**
 - 需要 Octo Browser **Base 或更高套餐**的 API 访问权限，以及主账号（master-account）的 API token；将 token 填入 `OCTO_API_TOKEN`，不要提交到仓库。
-- 安装并保持 Octo 客户端运行。创建、更新、列出和删除 profile 走 `OCTO_PUBLIC_API_BASE` Public API（默认 `https://app.octobrowser.net`）；本机 `OCTO_LOCAL_API_BASE`（默认 `http://127.0.0.1:58888`）只负责启动和停止 profile。
-- 旧的无 `_BASE` 键 `OCTO_PUBLIC_API`、`OCTO_LOCAL_API` 只作为现有私有 `.env` 的只读兼容 fallback；新的配置和 WebUI 使用规范的 `_BASE` 键。
+- 安装并保持 Octo 客户端运行。创建、更新、列出和删除 profile 走 `OCTO_PUBLIC_API_BASE` Public API automation base（默认 `https://app.octobrowser.net/api/v2/automation`）；本机 `OCTO_LOCAL_API_BASE`（默认 `http://127.0.0.1:58888`）只负责启动和停止 profile。
+- 旧的无 `_BASE` 键 `OCTO_PUBLIC_API`、`OCTO_LOCAL_API` 只作为现有私有 `.env` 的只读兼容 fallback；旧 `OCTO_PUBLIC_API` host-root 值会自动规范化为完整 automation base，新的配置和 WebUI 使用规范的 `_BASE` 键。
 - 在 `.env` 设置 `FINGERPRINT_BROWSER=octo`。兼容 provider 别名 `octobrowser` 和 `octo_browser`；默认仍是 `bitbrowser`。
 - 本适配不实现 Octo one-time profile 模式；使用普通 profile，并沿用现有的创建、启动、关闭和清理生命周期。
 
@@ -232,7 +232,7 @@ cp .env.example .env
 | `ADSPOWER_API_KEY` | AdsPower Local API 鉴权 key（未启用鉴权可留空） | 否 |
 | `ADSPOWER_GROUP_ID` | AdsPower 新建 profile 的分组 ID（默认 `0`） | 否 |
 | `OCTO_API_TOKEN` | Octo Browser 主账号 API token；Public API 请求必填 | 使用 Octo 时 |
-| `OCTO_PUBLIC_API_BASE` | Octo Public API（默认 `https://app.octobrowser.net`），用于创建、更新、列出和删除 profile；WebUI 使用此规范键 | 否 |
+| `OCTO_PUBLIC_API_BASE` | Octo Public API automation base（默认 `https://app.octobrowser.net/api/v2/automation`），用于创建、更新、列出和删除 profile；WebUI 使用此规范键 | 否 |
 | `OCTO_LOCAL_API_BASE` | Octo Local API（默认 `http://127.0.0.1:58888`），仅用于启动和停止 profile；WebUI 使用此规范键 | 否 |
 | `OCTO_PUBLIC_API` / `OCTO_LOCAL_API` | 旧无 `_BASE` 配置名，只读兼容 fallback；不要在新的 `.env` 或 WebUI 配置中使用 | 否 |
 | `SMS_TOKEN` | 接码平台 firefox.fun 的 token | 需手机号时必填 |
