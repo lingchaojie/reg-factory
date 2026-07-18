@@ -81,6 +81,14 @@ MAIL_AUTH_TOKEN = _env("MAIL_AUTH_TOKEN", "")
 # 新建邮箱统一密码
 MAIL_NEW_PASS = _env("MAIL_NEW_PASS", "")
 
+# ---------------------------------------------------------------- Claude 邮箱渠道
+EMAIL_PROVIDER = (_env("EMAIL_PROVIDER", "NINEMALL").strip().upper() or "NINEMALL")
+NINEMALL_EMAIL_FILE = _env("NINEMALL_EMAIL_FILE", "mail.txt").strip() or "mail.txt"
+NINEMALL_API_BASE = _env("NINEMALL_API_BASE", "https://www.appleemail.top").strip()
+NINEMALL_API_PASSWORD = _env("NINEMALL_API_PASSWORD", "")
+NINEMALL_HTTP_TIMEOUT = int(_env("NINEMALL_HTTP_TIMEOUT", "30") or "30")
+NINEMALL_POLL_INTERVAL = int(_env("NINEMALL_POLL_INTERVAL", "5") or "5")
+
 # ---------------------------------------------------------------- 临时邮箱（纯 HTTP API 取码，Grok 注册用）
 # 参考 grokcli-2api：用临时邮箱 HTTP API 直接拉验证码，免去 Outlook 浏览器登录/轮询的重开销。
 # GROK_USE_TEMP_EMAIL=true 时 register_grok.py 走临时邮箱；创建失败自动回退 emails.txt Outlook。

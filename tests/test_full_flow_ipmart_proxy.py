@@ -66,6 +66,7 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
             "account-res-US-sid-00000042", "proxy-secret", "00000042", "203.0.113.8",
         )
         self.base_env = {
+            "EMAIL_PROVIDER": "OUTLOOK",
             "IPMART_ENABLED": "1",
             "IPMART_PROXY_HOST": "gateway.example",
             "IPMART_PROXY_PORT": "8080",

@@ -1,5 +1,12 @@
 ﻿# 更新日志
 
+## 2026-07-19 — Claude 专用 NINEMALL 邮箱渠道
+
+- Claude 默认使用 NINEMALL 四列账号顺序（`email----password----client_id----refresh_token`）；`EMAIL_PROVIDER=OUTLOOK` 保留旧 Outlook 顺序和兼容流程。
+- NINEMALL 通过 AppleEmail HTTPS `POST` 轮询邮件，严格无 Outlook 浏览器回退；纯 Claude 流程使用该渠道，非 Claude 行为保持不变。
+
+---
+
 ## 2026-07-18 — IPMart 固定网关 SID 租约迁移
 
 > 本条取代并修正下方同日的 access-key 获取代理方案；历史条目保留用于追溯，旧模式不再受支持。

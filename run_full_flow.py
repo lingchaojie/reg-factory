@@ -51,17 +51,65 @@ from common.account_proxy import (
     lease_to_env,
     strip_http_proxy_env,
 )
+from common.claude_email_accounts import (
+    ClaudeEmailAccountStore,
+    normalize_email_provider,
+)
 from common.ipmart_proxy import (
     IPMartProxyError,
     acquire_proxy,
     settings_from_env,
     verify_proxy,
 )
+from common.process_lifecycle import (
+    process_group_kwargs,
+    shutdown_sync_process,
+)
 
 # 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
 PROXY_DEFAULT = os.environ.get("CLASH_PROXY", "http://127.0.0.1:7897")
+
+
+class PlatformLaunchError(RuntimeError):
+    pass
+
+
+class _ReservedStageAccount(tuple):
+    def __new__(cls, account, store):
+        values = (
+            account.email,
+            account.password,
+            account.refresh_token,
+            account.client_id,
+        )
+        instance = super().__new__(cls, values)
+        instance.account = account
+        instance.store = store
+        instance.active = True
+        instance.owned_processes = set()
+        return instance
+
+    def track_process(self, process):
+        self.owned_processes.add(id(process))
+
+    def confirm_process_stopped(self, process, confirmed):
+        if confirmed:
+            self.owned_processes.discard(id(process))
+
+    def release(self):
+        if self.active:
+            self.active = False
+            if self.owned_processes:
+                return False
+            return self.store.release(self.account)
+        return False
+
+
+def _release_stage_account(account):
+    if isinstance(account, _ReservedStageAccount):
+        account.release()
 
 
 def log(msg, level="INFO"):
@@ -168,8 +216,39 @@ def stage_email(args, env):
     return new_email
 
 
+def is_ninemail_claude_only(args, env=None):
+    env = os.environ if env is None else env
+    return (
+        normalize_email_provider(env.get("EMAIL_PROVIDER")) == "NINEMALL"
+        and set(args.platforms) == {"claude"}
+    )
+
+
+def acquire_stage_account(
+    args,
+    env,
+    stage_email_fn=stage_email,
+    store_factory=ClaudeEmailAccountStore,
+):
+    if is_ninemail_claude_only(args, env):
+        store = store_factory(provider="NINEMALL")
+        account = store.reserve_one()
+        if account is None:
+            return None
+        return _ReservedStageAccount(account, store)
+    return stage_email_fn(args, env)
+
+
 # ---------------------------------------------------------------- Stage B
-def stage_platforms(args, env, email, password, token="", client_id=""):
+def stage_platforms(
+    args,
+    env,
+    email,
+    password,
+    token="",
+    client_id="",
+    process_owner=None,
+):
     log(f"Stage B 平台注册：{email}  platforms={','.join(args.platforms)}", "B")
     # token 由 Stage A 注册时抽 Graph 写入 emails.txt；有真 token 走 Graph API 直收码(免浏览器)，
     # 没有(抽取失败回退 fresh/空)则下游退化到浏览器/broker 取码。
@@ -199,11 +278,37 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
         cmd.append("--grok-sub2api")
         if args.grok_sub2api_group:
             cmd += ["--grok-sub2api-group", args.grok_sub2api_group]
-    log(f"Stage B cmd: {' '.join(cmd)}", "B")
+    log(
+        "Stage B cmd: register_three_platforms.py "
+        "[mailbox credentials redacted]",
+        "B",
+    )
     if args.dry_run:
         return 0
-    proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
-    return proc.wait()
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=ROOT, env=env, **process_group_kwargs()
+        )
+    except Exception as exc:
+        raise PlatformLaunchError(
+            "failed to launch platform orchestrator"
+        ) from exc
+    if process_owner is not None:
+        process_owner.track_process(proc)
+    try:
+        rc = proc.wait()
+        if process_owner is not None:
+            confirmed = shutdown_sync_process(proc)
+            process_owner.confirm_process_stopped(proc, confirmed)
+        return rc
+    except BaseException:
+        try:
+            confirmed = shutdown_sync_process(proc)
+        except BaseException:
+            confirmed = False
+        if process_owner is not None:
+            process_owner.confirm_process_stopped(proc, confirmed)
+        raise
 
 
 # ---------------------------------------------------------------- 单轮
@@ -233,47 +338,73 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
 
     # Stage A
     token = client_id = ""
+    reserved_account = None
     if args.skip_email:
         if not args.email:
             raise SystemExit("--skip-email 需要同时给 --email")
         email, password = args.email.strip(), args.password.strip()
+        token = (getattr(args, "token", "") or "").strip()
+        client_id = (getattr(args, "client_id", "") or "").strip()
         log(f"跳过邮箱注册，直接用 {email}", "A")
     else:
-        got = stage_email(args, round_env)
+        got = acquire_stage_account(
+            args,
+            round_env,
+            stage_email_fn=stage_email,
+            store_factory=ClaudeEmailAccountStore,
+        )
         if not got:
             log("Stage A 没拿到可用邮箱，本轮终止", "ERR")
             return 1, ""
+        reserved_account = got
         email, password, token, client_id = got
         # emails.txt 里可能没记密码，用快照里的
         password = password or args.password
 
-    if account_lease is not None and "claude" in args.platforms:
-        try:
-            verify(
-                account_lease,
-                expected_exit_ip=account_lease.exit_ip,
-                env=round_env,
-            )
-        except IPMartProxyError as exc:
-            log(f"IPMart proxy changed before Claude: {exc}", "ERR")
-            return 1, email
+    completed = False
+    try:
+        if account_lease is not None and "claude" in args.platforms:
+            try:
+                verify(
+                    account_lease,
+                    expected_exit_ip=account_lease.exit_ip,
+                    env=round_env,
+                )
+            except IPMartProxyError as exc:
+                log(f"IPMart proxy changed before Claude: {exc}", "ERR")
+                return 1, email
 
-    # Stage B
-    platform_env = round_env
-    if account_lease is not None and any(
-        platform != "claude" for platform in args.platforms
-    ):
-        platform_env = dict(round_env)
-        platform_env.update(original_http_proxy_env)
-    print("=" * 64)
-    rc = stage_platforms(
-        args, platform_env, email, password, token, client_id
-    )
-    print("=" * 64)
-    dt = time.time() - t0
-    log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
-        "OK" if rc == 0 else "WARN")
-    return rc, email
+        # Stage B
+        platform_env = round_env
+        if account_lease is not None and any(
+            platform != "claude" for platform in args.platforms
+        ):
+            platform_env = dict(round_env)
+            platform_env.update(original_http_proxy_env)
+        print("=" * 64)
+        stage_kwargs = {}
+        if isinstance(reserved_account, _ReservedStageAccount):
+            stage_kwargs["process_owner"] = reserved_account
+        rc = stage_platforms(
+            args,
+            platform_env,
+            email,
+            password,
+            token,
+            client_id,
+            **stage_kwargs,
+        )
+        if args.dry_run or rc != 0:
+            _release_stage_account(reserved_account)
+        print("=" * 64)
+        dt = time.time() - t0
+        log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
+            "OK" if rc == 0 else "WARN")
+        completed = True
+        return rc, email
+    finally:
+        if not completed:
+            _release_stage_account(reserved_account)
 
 
 # ---------------------------------------------------------------- main
@@ -283,6 +414,8 @@ def main():
     ap.add_argument("--skip-email", action="store_true", help="跳过邮箱注册，直接用 --email")
     ap.add_argument("--email", default="", help="跳过邮箱注册时指定现成邮箱")
     ap.add_argument("--password", default="", help="配合 --email")
+    ap.add_argument("--token", default="", help="配合 --skip-email 的 refresh token")
+    ap.add_argument("--client-id", default="", help="配合 --skip-email 的 OAuth client_id")
     ap.add_argument("--email-attempts", type=int, default=30, help="邮箱注册最多尝试次数")
     ap.add_argument("--email-timeout", type=int, default=180, help="单次邮箱注册硬超时(s)")
     ap.add_argument("--email-total-timeout", type=int, default=1800, help="Stage A 总超时(s)")

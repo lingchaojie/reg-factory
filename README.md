@@ -231,6 +231,42 @@ cp .env.example .env
 | `OUTLOOK_PROXIES` | Outlook 自注册住宅代理池，`user:pass@host:port`，换行/逗号分隔 | 否 |
 | `MAIL_*` | 备用域名邮箱（一般用不到） | 否 |
 
+### Claude 邮箱渠道：NINEMALL（默认）
+
+Claude 注册默认使用 `EMAIL_PROVIDER=NINEMALL`。这是 **仅限 Claude** 的邮箱渠道：纯 Claude 编排会直接从账号池取号并轮询验证码，绝不启动 Outlook 浏览器登录，也不会回退到 Outlook 登录。若需要旧的 Outlook 邮箱流程，请显式设置兼容开关 `EMAIL_PROVIDER=OUTLOOK`。
+
+将下列配置写入 `.env`（均为安全占位配置；`NINEMALL_API_PASSWORD` 仅在 AppleEmail 服务启用访问密码时填写，否则保持为空）：
+
+```dotenv
+EMAIL_PROVIDER=NINEMALL
+NINEMALL_EMAIL_FILE=mail.txt
+NINEMALL_API_BASE=https://www.appleemail.top
+NINEMALL_API_PASSWORD=
+NINEMALL_HTTP_TIMEOUT=30
+NINEMALL_POLL_INTERVAL=5
+```
+
+账号文件使用四列，以 `----` 分隔；两种 provider 的列顺序不同，不能混用：
+
+```text
+NINEMALL: email----password----client_id----refresh_token
+OUTLOOK:  email----password----refresh_token----client_id
+```
+
+NINEMALL 只接受精确的 HTTPS AppleEmail 源 `https://www.appleemail.top`，并向 `https://www.appleemail.top/api/mail-all` 发送 JSON `POST` 请求。每次轮询先检查 `INBOX`，再检查 `Junk`；超时和轮询间隔分别由 `NINEMALL_HTTP_TIMEOUT` 与 `NINEMALL_POLL_INTERVAL` 控制。接口响应中的 `new_refresh_token` 会被忽略：读取的 refresh token 只在本次进程内存中使用，程序不会更新、重写或追加 `mail.txt`。
+
+NINEMALL 的账号源是 `NINEMALL_EMAIL_FILE`（默认 `mail.txt`）；消费记录仅写入被忽略的旁路状态文件 `mail_used_claude.txt` 与 `mail_error_claude.txt`，不会写回源文件。预留只提供**进程内**保护，不提供跨进程锁；进程被强制终止后也不会自动恢复预留，必要时应审查这些旁路文件并保守地人工修复。
+
+只有平台列表恰好为 `claude` 时，`register_three_platforms.py` 和 `run_full_flow.py` 的纯 Claude 编排才从 NINEMALL 池预留账号。包含 ChatGPT 或 Grok 的混合流程保持既有 Outlook 兼容行为；即使环境变量为 NINEMALL，Claude 子流程也会使用 Outlook 路径。因此不要把 NINEMALL 当作跨平台邮箱 provider。
+
+常用的纯 Claude 命令：
+
+```powershell
+python register.py --count 1
+python register_three_platforms.py --from-pool --platforms claude
+python run_full_flow.py --platforms claude --rounds 1
+```
+
 **Codex / 标准 token 上传（按需启用，留空自动跳过）**
 
 | 环境变量 | 说明 | 必填 |

@@ -239,7 +239,7 @@ def get_link_by_token(
                 for link in pat.findall(m["body"] or ""):
                     if must_contain and must_contain not in link:
                         continue
-                    print(f"  [mail] link found in {folder}: {link[:80]}...")
+                    print(f"  [mail] link found in {folder}")
                     return link
         elapsed = int(time.time() - start)
         print(f"  [mail] waiting for link (inbox+junk)... ({elapsed}s/{max_wait}s)")

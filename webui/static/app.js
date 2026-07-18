@@ -193,7 +193,7 @@ function renderForm(s){
         <div class="multi">${a.choices.map(c=>`<label><input type="checkbox" value="${c}" ${def.includes(c)?'checked':''} data-multi="${label}">${c}</label>`).join('')}</div>
         ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;
     }else{
-      const t = a.type==='int' ? 'number' : 'text';
+      const t = a.type==='int' ? 'number' : (a.secret ? 'password' : 'text');
       f.innerHTML = `<label>${label}</label>
         <input type="${t}" id="f_${label}" value="${a.default!==undefined&&a.default!==''?a.default:''}" placeholder="${a.help||''}">
         ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;

@@ -27,6 +27,9 @@ tokens/**
 !tokens/.gitkeep
 emails.txt
 emails_*.txt
+mail.txt
+mail_used_claude.txt
+mail_error_claude.txt
 outlook_no_graph.txt
 proxies.txt
 outlook_accounts/

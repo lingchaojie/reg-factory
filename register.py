@@ -8,14 +8,17 @@ Usage: python register.py [--count N]
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import random
 import re
 import string
 import sys
+import threading
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -42,6 +45,12 @@ from common.ipmart_proxy import (
     acquire_proxy,
     settings_from_env,
 )
+from common.claude_email_accounts import (
+    ClaudeEmailAccount,
+    ClaudeEmailAccountStore,
+    normalize_email_provider,
+)
+from common.ninemail_mailbox import NineMallMailboxClient, NineMallMailboxError
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -61,6 +70,12 @@ from config import (
     CAPSOLVER_API_KEY,
     EZCAPTCHA_API_KEY,
     EZCAPTCHA_API_BASE,
+    NINEMALL_API_BASE,
+    NINEMALL_API_PASSWORD,
+    NINEMALL_EMAIL_FILE,
+    NINEMALL_HTTP_TIMEOUT,
+    NINEMALL_POLL_INTERVAL,
+    EMAIL_PROVIDER,
 )
 
 # single registration timeout (seconds)
@@ -101,7 +116,9 @@ def _pick_claude_node():
     try:
         alln = proxy_switch.concrete_nodes()
     except Exception as e:
-        print(f"  [proxy] 取节点列表失败: {e}")
+        log_claude_flow_error(
+            "[proxy] node_list_failed", e, provider=EMAIL_PROVIDER
+        )
         return None
     recent = set(_recent_claude_nodes())
     fresh = [n for n in alln if n not in recent] or alln
@@ -122,6 +139,16 @@ def prepare_claude_network(
     if account_lease is not None or ipmart_enabled:
         strip_http_proxy_env(env)
     return env
+
+
+def log_claude_flow_error(message, error=None, *, account=None, provider=None):
+    selected_provider = normalize_email_provider(
+        provider or (account.provider if account is not None else EMAIL_PROVIDER)
+    )
+    if selected_provider == "NINEMALL" or error is None:
+        print(f"  {message}")
+        return
+    print(f"  {message}: {error}")
 
 
 def configure_claude_proxy(
@@ -166,7 +193,11 @@ def configure_claude_proxy(
         CLAUDE_PROXY_NODE = node_arg
         print(f"  [proxy] selected node: {proxy_switch.current_node()}")
     except Exception as exc:
-        print(f"  [proxy] Clash node selection failed: {exc}")
+        log_claude_flow_error(
+            "[proxy] clash_node_selection_failed",
+            exc,
+            provider=EMAIL_PROVIDER,
+        )
 
 
 def create_claude_profile(bb, name, account_lease=None):
@@ -395,6 +426,70 @@ def mark_email_error(email, password="", reason=""):
     """记录异常邮箱"""
     with open(EMAILS_ERROR_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email}----{password}----{reason}\n")
+
+
+def prepare_email_accounts(
+    args, provider=None, store_factory=ClaudeEmailAccountStore
+):
+    provider = normalize_email_provider(provider or EMAIL_PROVIDER)
+    source = args.emails or (
+        NINEMALL_EMAIL_FILE if provider == "NINEMALL" else EMAILS_FILE
+    )
+    store = store_factory(provider=provider, source_file=source)
+    if args.email:
+        if provider == "NINEMALL" and (
+            not args.token or not args.client_id
+        ):
+            raise SystemExit(
+                "NINEMALL --email requires --token and --client-id"
+            )
+        account = ClaudeEmailAccount(
+            provider=provider,
+            email=args.email.strip(),
+            password=(args.password or "").strip(),
+            client_id=(args.client_id or "").strip(),
+            refresh_token=(args.token or "").strip(),
+        )
+        return [account], store
+    if args.emails:
+        if provider == "NINEMALL":
+            return store.reserve_many(limit=None), store
+        return store.load_many(limit=None), store
+    if provider == "NINEMALL":
+        return store.reserve_many(limit=args.count), store
+    return [None] * args.count, store
+
+
+def mark_claude_account_used(account, account_store):
+    if (
+        account is not None
+        and account.provider == "NINEMALL"
+        and account_store is not None
+    ):
+        account_store.mark_used(account)
+        return
+    if account is not None:
+        mark_email_used(account.email, account.password)
+
+
+def mark_claude_account_error(account, account_store, reason):
+    if (
+        account is not None
+        and account.provider == "NINEMALL"
+        and account_store is not None
+    ):
+        account_store.mark_error(account, reason)
+        return
+    if account is not None:
+        mark_email_error(account.email, account.password, reason)
+
+
+def release_claude_accounts(accounts, account_store):
+    if account_store is None:
+        return
+    for account in accounts:
+        if account is not None and account.provider == "NINEMALL":
+            account_store.release(account)
 
 
 # Arkose Labs public key for Microsoft signup
@@ -1647,6 +1742,104 @@ def get_magic_link_by_token(
     )
 
 
+def build_ninemail_client():
+    return NineMallMailboxClient(
+        base_url=NINEMALL_API_BASE,
+        api_password=NINEMALL_API_PASSWORD,
+        http_timeout=NINEMALL_HTTP_TIMEOUT,
+        poll_interval=NINEMALL_POLL_INTERVAL,
+    )
+
+
+async def fetch_claude_magic_link(
+    context,
+    account,
+    max_wait,
+    received_after=None,
+    account_lease=None,
+    ninemail_client=None,
+):
+    if account.provider == "NINEMALL":
+        client = ninemail_client or build_ninemail_client()
+        cancel_event = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                client.poll_magic_link,
+                account,
+                max_wait,
+                received_after,
+                cancel_event=cancel_event,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancel_event.set()
+                    continue
+                except BaseException:
+                    break
+            if worker.done():
+                try:
+                    worker.result()
+                except BaseException:
+                    pass
+            raise
+    link = None
+    if account.refresh_token:
+        fetch_token_link = functools.partial(
+            get_magic_link_by_token,
+            account.email,
+            account.refresh_token,
+            client_id=account.client_id or "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+            max_wait=max_wait,
+            account_lease=account_lease,
+        )
+        link = await asyncio.to_thread(fetch_token_link)
+    if link:
+        return link
+    outlook_page = await context.new_page()
+    try:
+        return await get_magic_link_outlook_pw(
+            outlook_page, account.email, account.password, max_wait=max_wait
+        )
+    finally:
+        await outlook_page.close()
+
+
+async def navigate_to_claude_magic_link(page, magic_link, timeout):
+    try:
+        await page.goto(magic_link, timeout=timeout)
+    except Exception:
+        try:
+            await page.evaluate(
+                "(url) => { window.location.href = url; }",
+                magic_link,
+            )
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        except Exception:
+            raise RuntimeError("magic_link_navigation_failed") from None
+
+
+def log_safe_page_origin(label, page_url):
+    try:
+        parsed = urlsplit(str(page_url or ""))
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        if scheme not in {"http", "https"} or not hostname:
+            raise ValueError
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        origin = f"{scheme}://{hostname}"
+    except (AttributeError, TypeError, ValueError):
+        origin = "[redacted]"
+    print(f"{label}{origin}")
+
+
 # ---- 多语言按钮匹配（BitBrowser 节点地区不同，Claude 登录界面语言可能是 英/日/中/繁/韩/西/法/德）----
 CONTINUE_EMAIL_LABELS = [
     # 具体"用邮箱继续"优先，避免误点 Continue with Google/Apple
@@ -1792,7 +1985,7 @@ async def get_magic_link_outlook_pw(page, email, password, max_wait=90):
                         continue
                 link = await _find_in_current_folder()
                 if link:
-                    print(f"  magic link ({fname}): {link[:80]}")
+                    print(f"  magic link found ({fname})")
                     return link
 
             elapsed = int(time.time() - start)
@@ -1911,7 +2104,11 @@ def hero_get_phone_number():
         countries = [c for _, _, c in ranked]
         print(f"  [hero-sms] {len(countries)} countries sorted by price (cheapest: ${ranked[0][0]} id={ranked[0][2]})")
     except Exception as e:
-        print(f"  [hero-sms] getPrices failed: {e}, using default order")
+        log_claude_flow_error(
+            "[hero-sms] price_lookup_failed_using_default_order",
+            e,
+            provider=EMAIL_PROVIDER,
+        )
         countries = HERO_SMS_COUNTRY_PREFER
 
     for country in countries:
@@ -1934,7 +2131,11 @@ def hero_get_phone_number():
                 return full_phone, pkey
             # NO_NUMBERS 等，继续试下一个国家
         except Exception as e:
-            print(f"  [hero-sms] error country={country}: {e}")
+            log_claude_flow_error(
+                f"[hero-sms] country_{country}_request_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
     return None
 
 
@@ -1978,7 +2179,11 @@ def hero_get_sms_code(pkey, max_wait=120, interval=5):
             else:
                 print(f"  [hero-sms] status: {text}")
         except Exception as e:
-            print(f"  [hero-sms] error: {e}")
+            log_claude_flow_error(
+                "[hero-sms] sms_poll_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
         time.sleep(interval)
     return None
 
@@ -2124,7 +2329,9 @@ async def solve_turnstile(page, max_wait=60):
                         print("  [cf] method1: clicked checkbox in iframe")
                         clicked = True
                 except Exception as e:
-                    print(f"  [cf] method1 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method1_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 2: click CF iframe body center
             if not clicked and cf_frame:
@@ -2138,7 +2345,9 @@ async def solve_turnstile(page, max_wait=60):
                         print(f"  [cf] method2: clicked iframe body ({cx:.0f},{cy:.0f})")
                         clicked = True
                 except Exception as e:
-                    print(f"  [cf] method2 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method2_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 3: click iframe element from parent page coords
             if not clicked:
@@ -2155,7 +2364,9 @@ async def solve_turnstile(page, max_wait=60):
                             print(f"  [cf] method3: clicked iframe coords ({box['x']+30:.0f},{box['y']+box['height']/2:.0f})")
                             clicked = True
                 except Exception as e:
-                    print(f"  [cf] method3 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method3_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 4: click .cf-turnstile or [data-sitekey] container
             if not clicked:
@@ -2168,7 +2379,9 @@ async def solve_turnstile(page, max_wait=60):
                             print(f"  [cf] method4: clicked turnstile container")
                             clicked = True
                 except Exception as e:
-                    print(f"  [cf] method4 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method4_failed", e, provider=EMAIL_PROVIDER
+                    )
 
             # method 5: find ANY iframe with cloudflare src
             if not clicked:
@@ -2186,7 +2399,9 @@ async def solve_turnstile(page, max_wait=60):
                                 clicked = True
                                 break
                 except Exception as e:
-                    print(f"  [cf] method5 failed: {e}")
+                    log_claude_flow_error(
+                        "[cf] method5_failed", e, provider=EMAIL_PROVIDER
+                    )
 
         if clicked:
             await asyncio.sleep(3)
@@ -2333,7 +2548,11 @@ async def handle_birthday_page(page, birth_year, birth_month, birth_day):
                 filled += 1
                 await asyncio.sleep(0.3)
             except Exception as e:
-                print(f"    select failed ({target_text}): {e}")
+                log_claude_flow_error(
+                    f"birthday_{target_text}_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
         if filled > 0:
             return True
 
@@ -2376,7 +2595,11 @@ async def handle_birthday_page(page, birth_year, birth_month, birth_day):
                         break
                 await asyncio.sleep(0.3)
             except Exception as e:
-                print(f"    select failed ({target_text}): {e}")
+                log_claude_flow_error(
+                    f"birthday_{target_text}_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
         return True
 
     # method 4: date input
@@ -2403,7 +2626,7 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
         # 检测是否被 logout（排除 returnTo=onboarding 的情况）
         current_url = page.url.lower()
         if '/logout' in current_url:
-            print(f"  [onboarding] detected logout: {page.url[:80]}")
+            log_safe_page_origin("  [onboarding] detected logout at origin: ", page.url)
             # 等一下看是否自动跳转回来
             await asyncio.sleep(5)
             if '/logout' in page.url.lower() or ('/login' in page.url.lower() and 'returnto' not in page.url.lower()):
@@ -2420,7 +2643,10 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                 body_text = ""
             body_lower = body_text.lower()
             if any(kw in body_lower for kw in ['contact sales', 'think fast', 'platform solutions', 'continue with']) or len(body_text.strip()) > 30:
-                print(f"  [onboarding] session lost — on login/marketing page: {page.url[:80]}")
+                log_safe_page_origin(
+                    "  [onboarding] session lost on login/marketing origin: ",
+                    page.url,
+                )
                 return "session_lost"
             # 空白页可能还在加载，继续等
             if len(body_text.strip()) < 30:
@@ -2470,10 +2696,14 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
             if any(k in url_path for k in ['/chat', '/new']):
                 print("  [onboarding] reached chat page during navigation!")
                 return True
-            print(f"  [onboarding] page navigating, URL: {page.url[:80]}")
+            log_safe_page_origin(
+                "  [onboarding] page navigating at origin: ", page.url
+            )
             continue
         page_lower = page_text.lower()
-        print(f"  [onboarding] round {round_i+1}, URL: {current_url}")
+        log_safe_page_origin(
+            f"  [onboarding] round {round_i+1}, origin: ", current_url
+        )
         print(f"  [onboarding] page text preview: {page_text[:150].replace(chr(10), ' ')}")
 
         clicked = False
@@ -2567,7 +2797,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         clicked = True
                         need_continue = True
                 except Exception as e:
-                    print(f"  [onboarding] personal JS-click failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] personal_js_click_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
 
             # after selecting personal use card, click Continue/Next to proceed
             if need_continue:
@@ -2630,7 +2864,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     print(f"  [onboarding] JS plan select: {clicked_js}")
                     clicked = True
             except Exception as e:
-                print(f"  [onboarding] JS plan select failed: {e}")
+                log_claude_flow_error(
+                    "[onboarding] plan_select_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
             # fallback: Playwright 点击（只用 button，不用 a 标签避免导航）
             if not clicked:
                 for label in ['Free', 'Meet Claude', 'Start for free', 'Continue with Free']:
@@ -2672,7 +2910,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         print(f"  [onboarding] JS-clicked plan: {clicked_js}")
                         clicked = True
                 except Exception as e:
-                    print(f"  [onboarding] plan click failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] plan_click_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
 
         # "Before your first chat" page — 直接点 Continue（不动 toggle）
         if not clicked and ('before your first' in page_lower or 'setting to review' in page_lower):
@@ -2740,7 +2982,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                             clicked = True
                             break
                         except Exception as e:
-                            print(f"  [onboarding] click {label} failed: {e}")
+                            log_claude_flow_error(
+                                "[onboarding] continue_click_failed",
+                                e,
+                                provider=EMAIL_PROVIDER,
+                            )
                 if clicked:
                     break
                 print(f"  [onboarding] Continue not found, retrying ({_attempt+1}/3)...")
@@ -2773,9 +3019,13 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         _json.dump(cookies, _f, indent=2, ensure_ascii=False)
                     with open(os.path.join(COOKIE_OUTPUT_DIR, f"sk_pre_skip_{ts}.txt"), "w", encoding="utf-8") as _f:
                         _f.write(sk)
-                    print(f"  [onboarding] pre-saved sessionKey: {sk[:60]}...")
+                    print("  [onboarding] pre-saved sessionKey")
             except Exception as e:
-                print(f"  [onboarding] pre-save error: {e}")
+                log_claude_flow_error(
+                    "[onboarding] pre_save_failed",
+                    e,
+                    provider=EMAIL_PROVIDER,
+                )
             # 点 Skip
             for label in ['Skip', 'Not now', 'Maybe later']:
                 btn = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
@@ -2838,7 +3088,9 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     cookies = await context.cookies()
                     cookie_names = [c['name'] for c in cookies if 'claude' in c.get('domain', '')]
                     print(f"  [onboarding] pre-submit cookies: {cookie_names}")
-                    print(f"  [onboarding] pre-submit URL: {page.url}")
+                    log_safe_page_origin(
+                        "  [onboarding] pre-submit origin: ", page.url
+                    )
                 except Exception:
                     pass
                 # 用 Enter 提交
@@ -2847,7 +3099,9 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                     print(f"  [onboarding] pressed Enter to submit name")
                     clicked = True
                     await asyncio.sleep(3)
-                    print(f"  [onboarding] post-submit URL: {page.url}")
+                    log_safe_page_origin(
+                        "  [onboarding] post-submit origin: ", page.url
+                    )
                 except Exception:
                     pass
 
@@ -2979,7 +3233,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                         dismissed = True
                         await asyncio.sleep(1)
                 except Exception as e:
-                    print(f"  [onboarding] dialog method1 failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] dialog_method1_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
                 # 方法2: 按文字找 Later 按钮
                 if not dismissed:
                     for label in ['Later', 'Maybe later', 'Not now', 'Skip for now', 'Skip']:
@@ -3036,7 +3294,11 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
                             print("  [onboarding] picked a role from dropdown")
                             await asyncio.sleep(1)
                 except Exception as e:
-                    print(f"  [onboarding] role dropdown pick failed: {e}")
+                    log_claude_flow_error(
+                        "[onboarding] role_dropdown_pick_failed",
+                        e,
+                        provider=EMAIL_PROVIDER,
+                    )
                 for label in ['Continue', 'Next', 'Submit', 'Get started', 'Set up later']:
                     btn = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
                     if await btn.count() > 0:
@@ -3090,7 +3352,13 @@ async def handle_onboarding(page, first_name, last_name, max_rounds=10):
     return False
 
 
-async def save_cookies(context, profile_id, email=None, email_password=None):
+async def save_cookies(
+    context,
+    profile_id,
+    email=None,
+    email_password=None,
+    account=None,
+):
     cookies = await context.cookies()
     os.makedirs(COOKIE_OUTPUT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3110,14 +3378,17 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
         with open(filename, "w", encoding="utf-8") as f:
             f.write(session_key)
         print(f"  sessionKey saved: {filename}")
-        print(f"  {session_key[:60]}...")
         full_filename = os.path.join(COOKIE_OUTPUT_DIR, f"full_{profile_id}_{ts}.json")
         with open(full_filename, "w", encoding="utf-8") as f:
             json.dump(cookies, f, indent=2, ensure_ascii=False)
         print(f"  full cookies saved: {full_filename}")
         # 追加到统一账号文件
         if email:
-            pwd = email_password or ""
+            pwd = (
+                ""
+                if account is not None and account.provider == "NINEMALL"
+                else email_password or ""
+            )
             accounts_file = os.path.join(COOKIE_OUTPUT_DIR, "accounts.txt")
             with open(accounts_file, "a", encoding="utf-8") as f:
                 f.write(f"{email}|{pwd}|{session_key}\n")
@@ -3126,8 +3397,8 @@ async def save_cookies(context, profile_id, email=None, email_password=None):
         try:
             from common.session_export import save_claude_token
             save_claude_token(session_key, email)
-        except Exception as e:
-            print(f"  [WARN] 保存 claude 标准 token 失败: {e}")
+        except Exception:
+            print("  [WARN] failed to save Claude token")
         return session_key
     else:
         filename = os.path.join(COOKIE_OUTPUT_DIR, f"cookies_{profile_id}_{ts}.json")
@@ -3206,7 +3477,11 @@ async def _get_and_verify_phone(page, max_attempts=2):
             return True
 
         except Exception as e:
-            print(f"  [re-verify] error: {e}")
+            log_claude_flow_error(
+                "[re-verify] phone_attempt_failed",
+                e,
+                provider=EMAIL_PROVIDER,
+            )
             if pkey:
                 release_phone(pkey)
     return False
@@ -3214,14 +3489,15 @@ async def _get_and_verify_phone(page, max_attempts=2):
 
 async def register(
     profile_id,
-    email="",
-    email_password="",
-    email_token="",
+    account=None,
+    account_store=None,
     account_lease=None,
 ):
     """Run one registration. Returns sessionKey on success, None on failure."""
     bb = BitBrowser()
     start_time = time.time()
+    email = ""
+    email_password = ""
 
     def check_timeout():
         elapsed = time.time() - start_time
@@ -3363,19 +3639,28 @@ async def register(
                     pass
 
             # 如果没有邮箱，先尝试自注册，失败则从 emails.txt 读取
-            if not email:
+            if account is None:
                 print("\n[3/6] get outlook email...")
                 # 尝试自注册
                 print("  [outlook] trying self-register...")
-                email, email_password = await register_outlook(page)
-                if not email:
+                registered_email, registered_password = await register_outlook(page)
+                if registered_email:
+                    account = ClaudeEmailAccount(
+                        provider="OUTLOOK",
+                        email=registered_email,
+                        password=registered_password,
+                        client_id="9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+                        refresh_token="",
+                    )
+                else:
                     # 自注册失败，从 emails.txt 读取
                     print("  [outlook] self-register failed, trying emails.txt...")
-                    result = read_next_email_from_file()
-                    if result:
-                        email, email_password, email_token = result
-                    else:
-                        raise Exception("no email available")
+                    account = account_store.reserve_one()
+                    if account is None:
+                        raise RuntimeError("no email available")
+
+            email = account.email
+            email_password = account.password
 
             check_timeout()
 
@@ -3388,7 +3673,7 @@ async def register(
                 pass
             await page.goto(CLAUDE_LOGIN_URL, timeout=60000)
             await asyncio.sleep(5)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
 
             # solve Cloudflare Turnstile
             await solve_turnstile(page, max_wait=60)
@@ -3416,6 +3701,7 @@ async def register(
             await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
             await asyncio.sleep(1)
 
+            magic_requested_at = time.time()
             if not await click_continue_email(page):
                 print("  [warn] continue-email button not found in any language")
             check_timeout()
@@ -3423,69 +3709,57 @@ async def register(
             # poll magic link from outlook inbox
             print("\n[4/6] get magic link...")
             # 优先用 OAuth token 方式（快，不需要浏览器）
-            magic_link = None
-            if email_token:
-                print("  trying token API method...")
-                magic_link = get_magic_link_by_token(
-                    email,
-                    email_token,
-                    max_wait=60,
-                    account_lease=account_lease,
-                )
-            if not magic_link:
-                outlook_page = await context.new_page()
-                magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
+            magic_link = await fetch_claude_magic_link(
+                context,
+                account,
+                max_wait=60,
+                received_after=magic_requested_at,
+                account_lease=account_lease,
+            )
 
             # 如果没收到，重新发一次
             if not magic_link:
                 print("  magic link not received, resending...")
-                if email_token:
-                    await outlook_page.close() if 'outlook_page' in dir() else None
-                else:
-                    await outlook_page.close()
                 # 回到 Claude 登录页重新发
+                resend_requested_at = time.time()
                 try:
                     await page.goto(CLAUDE_LOGIN_URL, timeout=30000)
                     await asyncio.sleep(5)
                     await solve_turnstile(page, max_wait=30)
                     await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
                     await asyncio.sleep(1)
+                    resend_requested_at = time.time()
                     await click_continue_email(page)
                     print("  resent magic link")
                 except Exception as e:
-                    print(f"  resend error: {e}")
-                await asyncio.sleep(3)
-                if email_token:
-                    magic_link = get_magic_link_by_token(
-                        email,
-                        email_token,
-                        max_wait=60,
-                        account_lease=account_lease,
+                    log_claude_flow_error(
+                        "resend_failed", e, account=account
                     )
-                if not magic_link:
-                    outlook_page = await context.new_page()
-                    magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
+                await asyncio.sleep(3)
+                magic_link = await fetch_claude_magic_link(
+                    context,
+                    account,
+                    max_wait=60,
+                    received_after=resend_requested_at,
+                    account_lease=account_lease,
+                )
 
             if not magic_link:
-                await outlook_page.close()
-                raise Exception("magic link timeout, no email received")
+                if account.provider == "NINEMALL":
+                    raise NineMallMailboxError("magic_link_timeout")
+                raise RuntimeError("magic link timeout, no email received")
 
-            await outlook_page.close()
-            print(f"  link: {magic_link[:80]}...")
+            print("  magic link found")
             # open magic link
-            try:
-                await page.goto(magic_link, timeout=60000)
-            except Exception:
-                await page.evaluate(f"window.location.href = `{magic_link}`")
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await navigate_to_claude_magic_link(page, magic_link, timeout=60000)
             await asyncio.sleep(5)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
 
             check_timeout()
 
             # registration form
             print("\n[5/6] fill registration form")
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
             await asyncio.sleep(2)
 
             first_name, last_name = generate_name()
@@ -3506,7 +3780,7 @@ async def register(
                 except Exception:
                     print("  birthday submit button not clickable, skip")
                 await asyncio.sleep(3)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
             check_timeout()
 
             # detect and fill form fields
@@ -3601,9 +3875,9 @@ async def register(
                 await submit_btn.click(timeout=8000)
                 print("  submitted")
             except Exception:
-                print(f"  no submit button (likely already logged in at {page.url}), skip form submit")
+                print("  no submit button (likely already logged in), skip form submit")
             await asyncio.sleep(3)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
             check_timeout()
 
             # check for birthday page after submit
@@ -3619,7 +3893,7 @@ async def register(
                 except Exception:
                     print("  birthday(after) submit button not clickable, skip")
                 await asyncio.sleep(3)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
 
             # detect if phone verification needed
             await asyncio.sleep(2)
@@ -3754,7 +4028,11 @@ async def register(
                     except TimeoutError:
                         raise
                     except Exception as e:
-                        print(f"  exception: {e}")
+                        log_claude_flow_error(
+                            "phone_verification_attempt_failed",
+                            e,
+                            account=account,
+                        )
                         if pkey:
                             release_phone(pkey)
                         if attempt < MAX_PHONE_ATTEMPTS:
@@ -3763,7 +4041,9 @@ async def register(
 
                 if not phone_verified:
                     print(f"\n  {MAX_PHONE_ATTEMPTS} attempts failed, aborting.")
-                    mark_email_error(email, email_password, "phone_verify_failed")
+                    mark_claude_account_error(
+                        account, account_store, "phone_verify_failed"
+                    )
                     return None
 
                 await asyncio.sleep(3)
@@ -3775,7 +4055,7 @@ async def register(
 
                 # 等待进入聊天页面
                 await asyncio.sleep(5)
-                print(f"  URL: {page.url}")
+                log_safe_page_origin("  URL origin: ", page.url)
 
                 from urllib.parse import urlparse as _urlparse
                 url_path = _urlparse(page.url).path
@@ -3798,22 +4078,29 @@ async def register(
                         print(f"  re-login email: {email}")
                         await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
                         await asyncio.sleep(1)
+                        relogin_requested_at = time.time()
                         await click_continue_email(page)
                         print("  clicked continue")
 
                         # 获取新 magic link（等几秒让新邮件到达，避免读到旧的）
                         print("  getting new magic link (waiting 10s for new email)...")
                         await asyncio.sleep(10)
-                        re_outlook = await context.new_page()
-                        re_magic = await get_magic_link_outlook_pw(re_outlook, email, email_password, max_wait=60)
-                        await re_outlook.close()
+                        re_magic = await fetch_claude_magic_link(
+                            context,
+                            account,
+                            max_wait=60,
+                            received_after=relogin_requested_at,
+                            account_lease=account_lease,
+                        )
                         if not re_magic:
                             print("  re-login: magic link not received")
                             break
-                        print(f"  re-login magic link: {re_magic[:80]}...")
-                        await page.goto(re_magic, timeout=30000)
+                        print("  re-login magic link found")
+                        await navigate_to_claude_magic_link(
+                            page, re_magic, timeout=30000
+                        )
                         await asyncio.sleep(5)
-                        print(f"  re-login URL: {page.url}")
+                        log_safe_page_origin("  re-login URL origin: ", page.url)
 
                         # 如果需要手机验证
                         try:
@@ -3829,8 +4116,8 @@ async def register(
                         except Exception:
                             pass
                         continue  # 重试 onboarding
-                    except Exception as e:
-                        print(f"  re-login error: {e}")
+                    except Exception:
+                        print("  re-login error: registration_recovery_failed")
                         break
                 else:
                     break  # 其他失败，不重试
@@ -3843,37 +4130,66 @@ async def register(
                     cookies = await context.cookies()
                     sk_cookie = next((c["value"] for c in cookies if c["name"] == "sessionKey"), None)
                     if sk_cookie:
-                        print(f"  found sessionKey in cookies: {sk_cookie[:60]}...")
+                        print("  found sessionKey in cookies")
                         session_key = sk_cookie
-                        await save_cookies(context, profile_id, email=email, email_password=email_password)
-                        mark_email_used(email, email_password)
+                        await save_cookies(
+                            context,
+                            profile_id,
+                            email=email,
+                            email_password=email_password,
+                            account=account,
+                        )
+                        mark_claude_account_used(account, account_store)
                         return session_key
                 except Exception as e:
-                    print(f"  cookie read error: {e}")
+                    log_claude_flow_error(
+                        "cookie_read_failed", e, account=account
+                    )
 
                 print("  ERROR: not on chat page, not saving cookies")
-                mark_email_error(email, email_password, "onboarding_stuck")
+                mark_claude_account_error(
+                    account, account_store, "onboarding_stuck"
+                )
                 return None
 
             # 直接保存 cookie
             await asyncio.sleep(2)
-            session_key = await save_cookies(context, profile_id, email=email, email_password=email_password)
+            session_key = await save_cookies(
+                context,
+                profile_id,
+                email=email,
+                email_password=email_password,
+                account=account,
+            )
             if session_key:
-                mark_email_used(email, email_password)
+                mark_claude_account_used(account, account_store)
             else:
                 print("  no sessionKey in cookies")
-                mark_email_error(email, email_password, "no_session_key")
+                mark_claude_account_error(
+                    account, account_store, "no_session_key"
+                )
 
     except TimeoutError as e:
-        print(f"\n  TIMEOUT: {e}")
-        if email:
-            mark_email_error(email, email_password, f"timeout")
+        log_claude_flow_error("timeout", e, account=account)
+        if account is not None:
+            mark_claude_account_error(account, account_store, "timeout")
     except Exception as e:
-        print(f"\n  ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        if email:
-            mark_email_error(email, email_password, str(e)[:100])
+        if account is not None and account.provider == "NINEMALL":
+            reason = (
+                e.code
+                if isinstance(e, NineMallMailboxError)
+                else "registration_error"
+            )
+            print(f"\n  ERROR: {reason}")
+            mark_claude_account_error(account, account_store, reason)
+        else:
+            log_claude_flow_error("registration_error", e, account=account)
+            import traceback
+            traceback.print_exc()
+            if account is not None:
+                mark_claude_account_error(
+                    account, account_store, str(e)[:100]
+                )
     finally:
         try:
             bb.close_browser(profile_id)
@@ -3894,14 +4210,17 @@ async def main():
     parser.add_argument("--count", "-n", type=int, default=1, help="number of accounts to register")
     parser.add_argument("--timeout", "-t", type=int, default=480, help="timeout per registration (seconds)")
     parser.add_argument("--concurrency", "-c", type=int, default=1, help="number of concurrent registrations")
-    parser.add_argument("--emails", "-e", type=str, help="file with outlook emails (one per line: account----password----token----ClientID)")
-    parser.add_argument("--email", type=str, help="single fixed outlook email for debug")
+    parser.add_argument("--emails", "-e", type=str, help="provider account file override")
+    parser.add_argument("--email", type=str, help="single fixed email for debug")
     parser.add_argument("--password", type=str, default="", help="password for --email")
     parser.add_argument("--token", type=str, default="", help="refresh token for --email")
+    parser.add_argument("--client-id", type=str, default="", help="client ID for --email")
     parser.add_argument("--node", type=str, default="none",
                         help="Clash 出口节点绕 claude 区域封锁：none=不走代理 / auto=自动探测 / 具体节点名")
     parser.add_argument("--proxy-port", type=str, default="7897", help="Clash mixed-port 代理端口")
     args = parser.parse_args()
+    if args.count <= 0:
+        parser.error("--count must be greater than zero")
 
     global REGISTER_TIMEOUT, CLAUDE_PROXY_NODE, CLAUDE_PROXY_PORT
     REGISTER_TIMEOUT = args.timeout
@@ -3926,34 +4245,36 @@ async def main():
     print("=" * 50)
 
     # 读取邮箱文件
-    email_list = []
+    accounts, account_store = prepare_email_accounts(args)
+    if EMAIL_PROVIDER == "NINEMALL" and len(accounts) < args.count:
+        print(
+            f"  NINEMALL accounts available: {len(accounts)}/{args.count}; "
+            "running available accounts only"
+        )
+    if EMAIL_PROVIDER == "NINEMALL" and not accounts:
+        print("  no NINEMALL accounts available")
+        return
     if args.email:
-        email_list.append((args.email.strip(), args.password.strip(), args.token.strip()))
-        print(f"  using fixed email: {args.email.strip()}")
-    if args.emails:
-        try:
-            with open(args.emails, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split("----")
-                    if len(parts) >= 3:
-                        email_list.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
-                    elif len(parts) >= 2:
-                        email_list.append((parts[0].strip(), parts[1].strip(), ""))
-            print(f"  loaded {len(email_list)} emails from {args.emails}")
-        except Exception as e:
-            print(f"  failed to load emails: {e}")
-            return
+        print(f"  using fixed email: {accounts[0].email}")
+    elif args.emails:
+        print(f"  loaded {len(accounts)} emails from {args.emails}")
 
-    bb = BitBrowser()
+    try:
+        bb = BitBrowser()
+    except Exception:
+        release_claude_accounts(accounts, account_store)
+        if any(
+            account is not None and account.provider == "NINEMALL"
+            for account in accounts
+        ):
+            raise RuntimeError("browser_initialization_failed") from None
+        raise
     results = []
     results_lock = asyncio.Lock()
     sem = asyncio.Semaphore(args.concurrency)
 
     # 确定总数：有邮箱文件用文件数量，否则用 --count
-    total = len(email_list) if email_list else args.count
+    total = len(accounts)
 
     async def run_one(i):
         async with sem:
@@ -3964,10 +4285,9 @@ async def main():
             print(f"  #{i}/{total}")
             print(f"{'#' * 50}")
 
-            email, email_password, email_token = "", "", ""
-            if email_list:
-                email, email_password, email_token = email_list[i - 1]
-                print(f"\n  email from file: {email}")
+            account = accounts[i - 1]
+            if account is not None:
+                print(f"\n  email from file: {account.email}")
 
             account_lease = inherited_lease
             if account_lease is None and ipmart_settings.enabled:
@@ -3979,7 +4299,31 @@ async def main():
                         f"exit={account_lease.exit_ip}"
                     )
                 except IPMartProxyError as exc:
-                    print(f"  FATAL: IPMart proxy unavailable: {exc}")
+                    if account is not None and account.provider == "NINEMALL":
+                        print("  FATAL: IPMart proxy unavailable")
+                        mark_claude_account_error(
+                            account, account_store, "registration_error"
+                        )
+                    else:
+                        log_claude_flow_error(
+                            "FATAL: IPMart proxy unavailable",
+                            exc,
+                            account=account,
+                        )
+                    async with results_lock:
+                        results.append({
+                            "index": i,
+                            "profile": "-",
+                            "status": "ERROR",
+                            "sk": None,
+                    })
+                    return
+                except Exception as exc:
+                    if account is None or account.provider != "NINEMALL":
+                        raise
+                    log_claude_flow_error(
+                        "proxy_acquisition_failed", exc, account=account
+                    )
                     async with results_lock:
                         results.append({
                             "index": i,
@@ -4016,7 +4360,11 @@ async def main():
                         if safe_category is None:
                             print(f"\n  窗口数量已满，自动清理...")
                         else:
-                            print(f"\n  {e}; window quota, cleaning up...")
+                            log_claude_flow_error(
+                                "window_quota_reached",
+                                e,
+                                account=account,
+                            )
                         bb.cleanup_browsers(keep=0)
                         continue
                     elif safe_category == "transient" or (
@@ -4030,13 +4378,34 @@ async def main():
                             or 'timeout' in err_msg
                         )
                     ):
-                        print(f"  create browser network error (retry {_retry+1}/3): {err_msg[:80]}")
+                        log_claude_flow_error(
+                            f"create_browser_network_error_retry_{_retry + 1}",
+                            e,
+                            account=account,
+                        )
                         await asyncio.sleep(5)
                         continue
                     else:
+                        if account is not None and account.provider == "NINEMALL":
+                            print("  FATAL: create browser failed")
+                            mark_claude_account_error(
+                                account, account_store, "registration_error"
+                            )
+                            async with results_lock:
+                                results.append({
+                                    "index": i,
+                                    "profile": name,
+                                    "status": "ERROR",
+                                    "sk": None,
+                                })
+                            return
                         raise
             if not profile_id:
                 print(f"  FATAL: create browser failed after 3 retries")
+                if account is not None and account.provider == "NINEMALL":
+                    mark_claude_account_error(
+                        account, account_store, "registration_error"
+                    )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
                 return
@@ -4050,23 +4419,41 @@ async def main():
                     })
                     print(f"  [proxy] window via {CLAUDE_PROXY_HOST}:{CLAUDE_PROXY_PORT} (node={CLAUDE_PROXY_NODE})")
                 except Exception as e:
-                    print(f"  [proxy] window update failed: {e}")
+                    log_claude_flow_error(
+                        "[proxy] window_update_failed",
+                        e,
+                        account=account,
+                    )
             try:
                 sk = await register(
                     profile_id,
-                    email,
-                    email_password,
-                    email_token,
+                    account=account,
+                    account_store=account_store,
                     account_lease=account_lease,
                 )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "OK" if sk else "FAIL", "sk": sk})
             except Exception as e:
-                print(f"  FATAL: {e}")
+                if account is not None and account.provider == "NINEMALL":
+                    print("  FATAL: registration_error")
+                    mark_claude_account_error(
+                        account, account_store, "registration_error"
+                    )
+                else:
+                    log_claude_flow_error(
+                        "FATAL: registration_error", e, account=account
+                    )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
 
-    await asyncio.gather(*[run_one(i) for i in range(1, total + 1)])
+    try:
+        await asyncio.gather(*[run_one(i) for i in range(1, total + 1)])
+    except Exception:
+        if EMAIL_PROVIDER == "NINEMALL":
+            raise RuntimeError("registration_batch_failed") from None
+        raise
+    finally:
+        release_claude_accounts(accounts, account_store)
 
     # summary
     print(f"\n{'=' * 50}")
@@ -4075,8 +4462,7 @@ async def main():
     ok = 0
     for r in results:
         tag = "OK" if r["sk"] else "FAIL"
-        sk_preview = r["sk"][:40] + "..." if r["sk"] else "-"
-        print(f"  #{r['index']} [{tag}] {r['profile']}  {sk_preview}")
+        print(f"  #{r['index']} [{tag}] {r['profile']}")
         if r["sk"]:
             ok += 1
     print(f"\n  success: {ok}/{len(results)}")

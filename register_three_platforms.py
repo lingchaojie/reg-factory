@@ -26,10 +26,58 @@ from common.account_proxy import (
     strip_account_proxy_env,
     strip_http_proxy_env,
 )
+from common.claude_email_accounts import (
+    ClaudeEmailAccountStore,
+    normalize_email_provider,
+)
+from common.process_lifecycle import (
+    process_group_kwargs,
+    shutdown_async_process,
+)
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(ROOT, "tri_register_logs")
+
+
+class PlatformLaunchError(RuntimeError):
+    pass
+
+
+class _ReservedPoolAccount(tuple):
+    def __new__(cls, account, store):
+        values = (
+            account.email,
+            account.password,
+            account.refresh_token,
+            account.client_id,
+        )
+        instance = super().__new__(cls, values)
+        instance.account = account
+        instance.store = store
+        instance.active = True
+        instance.owned_processes = set()
+        return instance
+
+    def track_process(self, process):
+        self.owned_processes.add(id(process))
+
+    def confirm_process_stopped(self, process, confirmed):
+        if confirmed:
+            self.owned_processes.discard(id(process))
+
+    def release(self):
+        if self.active:
+            self.active = False
+            if self.owned_processes:
+                return False
+            return self.store.release(self.account)
+        return False
+
+
+def _release_pool_account(account):
+    if isinstance(account, _ReservedPoolAccount):
+        account.release()
 
 
 def build_command(platform, args, account):
@@ -48,6 +96,8 @@ def build_command(platform, args, account):
         ]
         if token:
             cmd += ["--token", token]
+        if client_id:
+            cmd += ["--client-id", client_id]
         return cmd
 
     if platform == "chatgpt":
@@ -94,44 +144,82 @@ def build_command(platform, args, account):
     raise ValueError(f"unknown platform: {platform}")
 
 
-async def run_platform(platform, cmd, run_id, child_env=None):
+async def run_platform(
+    platform,
+    cmd,
+    run_id,
+    child_env=None,
+    process_owner=None,
+):
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"{run_id}_{platform}.log")
     print(f"\n[{platform}] start")
     print(f"[{platform}] log: {log_path}")
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=ROOT,
-        env=child_env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    proc = None
+    try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=ROOT,
+                env=child_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                **process_group_kwargs(),
+            )
+        except Exception as exc:
+            raise PlatformLaunchError(f"failed to launch {platform}") from exc
+        if process_owner is not None:
+            process_owner.track_process(proc)
 
-    saw_success = False
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        assert proc.stdout is not None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace")
-            if "success: 1/1" in text.lower():
-                saw_success = True
-            log.write(text)
-            log.flush()
-            print(f"[{platform}] {text}", end="")
+        saw_success = False
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace")
+                if "success: 1/1" in text.lower():
+                    saw_success = True
+                log.write(text)
+                log.flush()
+                print(f"[{platform}] {text}", end="")
 
-    rc = await proc.wait()
+        rc = await proc.wait()
+        if process_owner is not None:
+            confirmed = await shutdown_async_process(proc)
+            process_owner.confirm_process_stopped(proc, confirmed)
+    except BaseException:
+        if proc is not None:
+            cleanup = asyncio.create_task(shutdown_async_process(proc))
+            try:
+                confirmed = await asyncio.shield(cleanup)
+            except BaseException:
+                confirmed = False
+            if process_owner is not None:
+                process_owner.confirm_process_stopped(proc, confirmed)
+        raise
     ok = rc == 0 and saw_success
     status = "OK" if ok else f"FAIL(exit={rc}, success_marker={saw_success})"
     print(f"[{platform}] done: {status}")
     return platform, ok, rc, log_path
 
 
+def next_pool_account(args):
+    provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
+    if provider == "NINEMALL" and set(args.platforms) == {"claude"}:
+        store = ClaudeEmailAccountStore(provider="NINEMALL")
+        account = store.reserve_one()
+        if account is None:
+            return None
+        return _ReservedPoolAccount(account, store)
+    return email_pool.next_email("tri")
+
+
 def parse_account(args):
     if args.from_pool:
-        em = email_pool.next_email("tri")
+        em = next_pool_account(args)
         if not em:
             raise SystemExit("no email available in emails.txt")
         return em
@@ -169,10 +257,18 @@ def child_env_for(args):
     return env
 
 
-def platform_child_env(platform, base_env):
+def platform_child_env(platform, base_env, platforms=None):
     env = dict(base_env)
-    if platform == "claude" and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
-        strip_http_proxy_env(env)
+    if platform == "claude":
+        if env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
+            strip_http_proxy_env(env)
+        if (
+            platforms is not None
+            and set(platforms) != {"claude"}
+            and normalize_email_provider(env.get("EMAIL_PROVIDER"))
+            == "NINEMALL"
+        ):
+            env["EMAIL_PROVIDER"] = "OUTLOOK"
         return env
     if (
         platform in {"chatgpt", "grok"}
@@ -197,23 +293,43 @@ async def process_account(account, args, child_env):
     platforms = list(args.platforms)
     if child_env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
         platforms.sort(key=lambda platform: platform != "claude")
-    jobs = [(p, build_command(p, args, account)) for p in platforms]
-    if args.parallel:
-        results = await asyncio.gather(*(
-            run_platform(p, cmd, run_id, platform_child_env(p, child_env))
-            for p, cmd in jobs
-        ))
-    else:
-        results = []
-        for platform, cmd in jobs:
-            results.append(await run_platform(
-                platform,
-                cmd,
-                run_id,
-                platform_child_env(platform, child_env),
-            ))
+    process_owner = (
+        account if isinstance(account, _ReservedPoolAccount) else None
+    )
 
-    broker_release(args.broker, email)   # 释放该号 Outlook 会话
+    def launch(platform, cmd):
+        kwargs = {}
+        if process_owner is not None:
+            kwargs["process_owner"] = process_owner
+        return run_platform(
+            platform,
+            cmd,
+            run_id,
+            platform_child_env(platform, child_env, args.platforms),
+            **kwargs,
+        )
+
+    try:
+        jobs = [(p, build_command(p, args, account)) for p in platforms]
+        if args.parallel:
+            results = await asyncio.gather(*(
+                launch(p, cmd)
+                for p, cmd in jobs
+            ))
+        else:
+            results = []
+            for platform, cmd in jobs:
+                results.append(await launch(platform, cmd))
+    except BaseException:
+        _release_pool_account(account)
+        raise
+
+    if any(not ok for _platform, ok, _rc, _log_path in results):
+        _release_pool_account(account)
+
+    provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
+    if not (provider == "NINEMALL" and set(args.platforms) == {"claude"}):
+        broker_release(args.broker, email)   # 释放该号 Outlook 会话
     print(f"\n  Summary [{email}]")
     for platform, ok, rc, log_path in results:
         print(f"    {platform}: {'OK' if ok else f'FAIL(exit={rc})'}  log={log_path}")
@@ -267,7 +383,7 @@ async def main():
             # 节流：处理中的邮箱达到上限就等空位，避免把池里的号一次性 reserve 光
             while len(tasks) >= args.max_inflight:
                 await asyncio.sleep(2)
-            acc = email_pool.next_email("tri")
+            acc = next_pool_account(args)
             if not acc:
                 print(f"  [loop] pool empty, waiting for producer... ({args.poll_wait}s)")
                 await asyncio.sleep(args.poll_wait)
@@ -277,8 +393,12 @@ async def main():
             t.add_done_callback(tasks.discard)
     else:
         account = parse_account(args)
-        await process_account(account, args, child_env)
+        results = await process_account(account, args, child_env)
+        provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
+        if provider == "NINEMALL" and set(args.platforms) == {"claude"}:
+            return 0 if all(result[1] for result in results) else 1
+        return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
