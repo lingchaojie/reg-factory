@@ -132,6 +132,40 @@ class NineMallMailboxTests(unittest.TestCase):
             ["INBOX", "Junk"],
         )
 
+    def test_platform_polling_returns_code_from_inbox_after_one_folder_sweep(self):
+        client = self.client([
+            FakeResponse(200, {"data": [message(
+                "Sign in",
+            ) | {"subject": "Your Claude Platform verification code is 482731"}]}),
+            FakeResponse(200, {"data": []}),
+        ])
+
+        result = client.poll_claude_platform_verification(account(), max_wait=20)
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(result.magic_link, "")
+        self.assertEqual(
+            [call[1]["mailbox"] for call in self.session.calls],
+            ["INBOX", "Junk"],
+        )
+
+    def test_platform_polling_returns_code_from_junk_after_one_folder_sweep(self):
+        client = self.client([
+            FakeResponse(200, {"data": []}),
+            FakeResponse(200, {"data": [message(
+                "Use this code",
+            ) | {"subject": "Your Claude Platform login code is 482731"}]}),
+        ])
+
+        result = client.poll_claude_platform_verification(account(), max_wait=20)
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(result.magic_link, "")
+        self.assertEqual(
+            [call[1]["mailbox"] for call in self.session.calls],
+            ["INBOX", "Junk"],
+        )
+
     def test_safelinks_target_is_decoded_and_validated(self):
         good = (
             "https://nam01.safelinks.protection.outlook.com/"
