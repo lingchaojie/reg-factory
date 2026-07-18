@@ -4,11 +4,9 @@ import asyncio
 import hashlib
 import json
 import os
-import threading
 import uuid
 
-
-_INDEX_LOCK = threading.Lock()
+from common.interprocess_lock import InterprocessFileLock
 
 
 def _email_key(email):
@@ -38,10 +36,21 @@ def _write_fsynced(path, payload):
         os.close(descriptor)
 
 
+def _fsync_directory(path):
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _replace_index(index, record):
     encoded_record = (json.dumps(record) + "\n").encode("utf-8")
     temporary = index.parent / f".{index.name}.{uuid.uuid4().hex}.tmp"
-    with _INDEX_LOCK:
+    lock_path = index.parent / f".{index.name}.lock"
+    with InterprocessFileLock(lock_path):
         existing = index.read_bytes() if index.exists() else b""
         separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
         payload = existing + separator + encoded_record
@@ -66,12 +75,13 @@ def _persist_claude_platform_session(platform_cookies, email, output_dir):
     index = target / "accounts.jsonl"
     final_created = False
     try:
-        temporary.write_text(
-            json.dumps(platform_cookies, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        cookie_payload = json.dumps(
+            platform_cookies, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        _write_fsynced(temporary, cookie_payload)
+        os.replace(temporary, path)
         final_created = True
+        _fsync_directory(target)
         _replace_index(index, {
             "email_key": email_key,
             "cookie_file": path.name,
@@ -80,6 +90,7 @@ def _persist_claude_platform_session(platform_cookies, email, output_dir):
         temporary.unlink(missing_ok=True)
         if final_created:
             path.unlink(missing_ok=True)
+            _fsync_directory(target)
         raise
     finally:
         temporary.unlink(missing_ok=True)

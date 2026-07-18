@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -78,6 +79,24 @@ class PlatformLaunchError(RuntimeError):
     pass
 
 
+def _masked_email(email):
+    local, separator, domain = str(email or "").partition("@")
+    if not separator:
+        return "***"
+    return f"{local[:2]}***@{domain}"
+
+
+_EMAIL_TEXT_RE = re.compile(
+    r"(?i)\b[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+)
+
+
+def _mask_email_text(value):
+    return _EMAIL_TEXT_RE.sub(
+        lambda match: _masked_email(match.group(0)), str(value or "")
+    )
+
+
 class _ReservedStageAccount(tuple):
     def __new__(cls, account, stores):
         values = (
@@ -103,12 +122,12 @@ class _ReservedStageAccount(tuple):
     def release(self):
         if not self.active:
             return False
-        self.active = False
         if self.owned_processes:
             return False
         released = False
         for store in self.stores.values():
             released = store.release(self.account) or released
+        self.active = False
         return released
 
 
@@ -196,7 +215,11 @@ def stage_email(args, env):
                 break
             line = proc.stdout.readline()
             if line:
-                print(f"  [outlook] {line}", end="", flush=True)
+                print(
+                    f"  [outlook] {_mask_email_text(line)}",
+                    end="",
+                    flush=True,
+                )
             now = time.time()
             if now - last_check >= 2:
                 last_check = now
@@ -204,7 +227,11 @@ def stage_email(args, env):
                 fresh = [t for t in cur if t[0] not in before]
                 if fresh:
                     new_email = fresh[-1]
-                    log(f"检测到新邮箱：{new_email[0]} —— 停止 Stage A 循环", "A")
+                    log(
+                        f"检测到新邮箱：{_masked_email(new_email[0])} "
+                        "—— 停止 Stage A 循环",
+                        "A",
+                    )
                     break
             if now > deadline:
                 log(f"Stage A 总超时 {args.email_total_timeout}s 仍无新号", "A")
@@ -251,10 +278,7 @@ def acquire_stage_account(
             account, stores = result
             return _ReservedStageAccount(account, stores)
         purpose = purposes[0]
-        store_args = {"provider": "NINEMALL"}
-        if purpose != "claude":
-            store_args["purpose"] = purpose
-        store = store_factory(**store_args)
+        store = store_factory(provider="NINEMALL", purpose=purpose)
         account = store.reserve_one()
         if account is None:
             return None
@@ -272,7 +296,11 @@ def stage_platforms(
     client_id="",
     process_owner=None,
 ):
-    log(f"Stage B 平台注册：{email}  platforms={','.join(args.platforms)}", "B")
+    log(
+        f"Stage B 平台注册：{_masked_email(email)}  "
+        f"platforms={','.join(args.platforms)}",
+        "B",
+    )
     # token 由 Stage A 注册时抽 Graph 写入 emails.txt；有真 token 走 Graph API 直收码(免浏览器)，
     # 没有(抽取失败回退 fresh/空)则下游退化到浏览器/broker 取码。
     cmd = [
@@ -371,7 +399,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         email, password = args.email.strip(), args.password.strip()
         token = (getattr(args, "token", "") or "").strip()
         client_id = (getattr(args, "client_id", "") or "").strip()
-        log(f"跳过邮箱注册，直接用 {email}", "A")
+        log(f"跳过邮箱注册，直接用 {_masked_email(email)}", "A")
     else:
         got = acquire_stage_account(
             args,
@@ -426,7 +454,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             _release_stage_account(reserved_account)
         print("=" * 64)
         dt = time.time() - t0
-        log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
+        log(f"本轮结束  email={_masked_email(email)}  Stage B exit={rc}  用时 {dt:.0f}s",
             "OK" if rc == 0 else "WARN")
         completed = True
         return rc, email

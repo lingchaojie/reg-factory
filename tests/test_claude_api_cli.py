@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import io
+import multiprocessing
 import threading
 import time
 import unittest
@@ -17,6 +18,82 @@ from tests.test_claude_api_registration import (
     DelayedPlatformPage,
     FakePlatformPage,
 )
+
+
+def _run_registration_with_hung_open(result_queue):
+    """Spawn-safe regression probe for asyncio.run executor shutdown hangs."""
+    import register_claude_api as target
+
+    class HungBrowserApi:
+        def create_browser(self, **_kwargs):
+            return "profile-hung"
+
+        def open_browser(self, _profile_id):
+            threading.Event().wait()
+
+        def close_browser(self, _profile_id):
+            return None
+
+        def delete_browser(self, _profile_id):
+            return None
+
+    class Store:
+        def release(self, _account):
+            return None
+
+        def mark_error(self, _account, _reason):
+            return None
+
+        def mark_used(self, _account):
+            return None
+
+    result = asyncio.run(target.register_one(
+        HungBrowserApi(),
+        account(),
+        Store(),
+        timeout=0.02,
+    ))
+    result_queue.put(result)
+
+
+def _run_main_with_hung_proxy_acquisition(result_queue):
+    import register_claude_api as target
+
+    selected = account()
+
+    class Store:
+        def reserve_many(self, limit=None):
+            return [selected]
+
+        def release(self, _account):
+            return True
+
+    class Parser:
+        def parse_args(self):
+            return SimpleNamespace(
+                count=1,
+                concurrency=1,
+                timeout=0.02,
+                emails=None,
+                email=None,
+                password="",
+                token="",
+                client_id="",
+                node="none",
+                proxy_port=7897,
+            )
+
+        def error(self, message):
+            raise RuntimeError(message)
+
+    target._build_parser = Parser
+    target.EMAIL_PROVIDER = "NINEMALL"
+    target.ClaudeEmailAccountStore = lambda **_kwargs: Store()
+    target.lease_from_env = lambda: None
+    target.settings_from_env = lambda: SimpleNamespace(enabled=True)
+    target.BitBrowser = lambda: object()
+    target.acquire_proxy = lambda: threading.Event().wait()
+    result_queue.put(asyncio.run(target.main()))
 
 
 def account(provider="NINEMALL"):
@@ -639,6 +716,7 @@ class ClaudeApiCliTests(unittest.IsolatedAsyncioTestCase):
             77,
             account_lease=inherited,
             browser_proxy_fields={},
+            deadline=unittest.mock.ANY,
         )
         self.assertEqual(output.getvalue().splitlines()[-1], "success: 1/1")
 
@@ -751,6 +829,7 @@ class ClaudeApiClashProxyTests(unittest.IsolatedAsyncioTestCase):
                 "host": "127.0.0.1",
                 "port": "8899",
             },
+            deadline=unittest.mock.ANY,
         )
 
     async def test_auto_node_probes_existing_candidates_and_supplies_proxy(self):
@@ -855,6 +934,130 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             await drain(0.1)
             self.assertFalse(register_claude_api._RETAINED_BACKGROUND_TASKS)
 
+    async def test_profile_creation_hang_is_inside_absolute_account_deadline(self):
+        release = threading.Event()
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+
+        def hung_create(**_kwargs):
+            release.wait()
+            return "late-profile"
+
+        self.bb.create_browser.side_effect = hung_create
+        try:
+            with self.playwright_patch(), patch.object(
+                register_claude_api, "CLEANUP_OPERATION_TIMEOUT", 0.01
+            ):
+                started_at = time.monotonic()
+                result = await register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=0.05
+                )
+                elapsed = time.monotonic() - started_at
+
+            self.assertIsNone(result)
+            self.assertLess(elapsed, 0.15)
+            self.bb.close_browser.assert_not_called()
+            self.bb.delete_browser.assert_not_called()
+            self.store.mark_used.assert_not_called()
+            self.store.mark_error.assert_not_called()
+            self.store.release.assert_not_called()
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join(timeout=0.5)
+
+    async def test_profile_open_hang_retains_reservation_and_never_races_delete(self):
+        release = threading.Event()
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+
+        def hung_open(_profile_id):
+            release.wait()
+            return {"ws": "ws://late-browser"}
+
+        self.bb.open_browser.side_effect = hung_open
+        try:
+            with self.playwright_patch(), patch.object(
+                register_claude_api, "CLEANUP_OPERATION_TIMEOUT", 0.01
+            ):
+                started_at = time.monotonic()
+                result = await register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=0.05
+                )
+                elapsed = time.monotonic() - started_at
+
+            self.assertIsNone(result)
+            self.assertLess(elapsed, 0.15)
+            self.bb.close_browser.assert_not_called()
+            self.bb.delete_browser.assert_not_called()
+            self.store.mark_used.assert_not_called()
+            self.store.mark_error.assert_not_called()
+            self.store.release.assert_not_called()
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join(timeout=0.5)
+
+    async def test_cdp_connection_hang_is_inside_account_deadline(self):
+        release = asyncio.Event()
+        cancellations = 0
+        asyncio.get_running_loop().call_later(0.2, release.set)
+
+        async def resist_connect(_ws):
+            nonlocal cancellations
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellations += 1
+            return self.browser
+
+        self.playwright.chromium.connect_over_cdp.side_effect = resist_connect
+        with self.playwright_patch(), patch.object(
+            register_claude_api, "TASK_CANCEL_GRACE", 0.005
+        ), patch.object(
+            register_claude_api, "CLEANUP_OPERATION_TIMEOUT", 0.005
+        ):
+            try:
+                started_at = time.monotonic()
+                result = await register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=0.05
+                )
+                elapsed = time.monotonic() - started_at
+
+                self.assertIsNone(result)
+                self.assertLess(elapsed, 0.12)
+                self.assertGreaterEqual(cancellations, 2)
+                self.bb.close_browser.assert_not_called()
+                self.bb.delete_browser.assert_not_called()
+                self.store.mark_used.assert_not_called()
+                self.store.mark_error.assert_not_called()
+                self.store.release.assert_not_called()
+            finally:
+                release.set()
+                await self.drain_background_tasks()
+
+    def test_asyncio_run_does_not_wait_for_hung_profile_executor(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_registration_with_hung_open,
+            args=(result_queue,),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(
+                process.is_alive(),
+                "asyncio.run waited for a cancellation-resistant executor",
+            )
+            self.assertEqual(process.exitcode, 0)
+            self.assertIsNone(result_queue.get(timeout=1))
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
     async def test_cancellation_resistant_flow_is_detached_at_fixed_bound(self):
         started = asyncio.Event()
         release = asyncio.Event()
@@ -898,14 +1101,61 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
                 self.assertIsNone(registration.result())
                 self.assertLess(elapsed, 0.06)
                 self.assertGreaterEqual(cancellations, 2)
-                self.store.mark_error.assert_called_once_with(
-                    self.account, "timeout"
-                )
+                self.store.mark_error.assert_not_called()
+                self.store.mark_used.assert_not_called()
+                self.store.release.assert_not_called()
+                self.bb.close_browser.assert_not_called()
+                self.bb.delete_browser.assert_not_called()
             finally:
                 release.set()
                 if not registration.done():
                     registration.cancel()
                 await asyncio.gather(registration, return_exceptions=True)
+                await self.drain_background_tasks()
+
+    async def test_repeated_cancellation_preserves_unconfirmed_async_owner(self):
+        started = asyncio.Event()
+        first_child_cancel = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resist_cancellation(*_args, **_kwargs):
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    first_child_cancel.set()
+            return "late-success.json"
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            side_effect=resist_cancellation,
+        ), patch.object(
+            register_claude_api,
+            "TASK_CANCEL_GRACE",
+            0.05,
+        ):
+            registration = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=1
+                )
+            )
+            await started.wait()
+            registration.cancel()
+            await first_child_cancel.wait()
+            registration.cancel()
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await registration
+
+                self.bb.close_browser.assert_not_called()
+                self.bb.delete_browser.assert_not_called()
+                self.store.mark_used.assert_not_called()
+                self.store.mark_error.assert_not_called()
+                self.store.release.assert_not_called()
+            finally:
+                release.set()
                 await self.drain_background_tasks()
 
     async def test_stuck_code_is_classified_before_emergency_timeout(self):
@@ -1014,9 +1264,9 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
         ):
             result = await asyncio.wait_for(
                 register_claude_api.register_one(
-                    self.bb, self.account, self.store, timeout=0.01
+                    self.bb, self.account, self.store, timeout=0.05
                 ),
-                timeout=0.1,
+                timeout=0.2,
             )
 
         self.assertIsNone(result)
@@ -1027,10 +1277,10 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
         self.bb.close_browser.side_effect = RuntimeError("profile close secret")
         self.bb.delete_browser.side_effect = RuntimeError("profile delete secret")
 
-    def assert_all_cleanup_attempted(self):
+    def assert_cleanup_stopped_before_delete(self):
         self.browser.close.assert_awaited_once_with()
         self.bb.close_browser.assert_called_once_with("profile-a")
-        self.bb.delete_browser.assert_called_once_with("profile-a")
+        self.bb.delete_browser.assert_not_called()
 
     async def test_cleanup_errors_do_not_change_success(self):
         self.make_cleanup_failures()
@@ -1044,9 +1294,11 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
                 self.bb, self.account, self.store, timeout=90
             )
 
-        self.assertEqual(result, "cookies/session.json")
-        self.store.mark_used.assert_called_once_with(self.account)
-        self.assert_all_cleanup_attempted()
+        self.assertIsNone(result)
+        self.store.mark_used.assert_not_called()
+        self.store.mark_error.assert_not_called()
+        self.store.release.assert_not_called()
+        self.assert_cleanup_stopped_before_delete()
         self.assertNotIn("secret", output.getvalue())
 
     async def test_cleanup_errors_do_not_change_stable_failure(self):
@@ -1065,10 +1317,9 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             )
 
         self.assertIsNone(result)
-        self.store.mark_error.assert_called_once_with(
-            self.account, "verification_rejected"
-        )
-        self.assert_all_cleanup_attempted()
+        self.store.mark_error.assert_not_called()
+        self.store.release.assert_not_called()
+        self.assert_cleanup_stopped_before_delete()
 
     async def test_cleanup_errors_do_not_replace_cancellation(self):
         self.make_cleanup_failures()
@@ -1091,8 +1342,9 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-        self.store.release.assert_called_once_with(self.account)
-        self.assert_all_cleanup_attempted()
+        self.store.release.assert_not_called()
+        self.store.mark_error.assert_not_called()
+        self.assert_cleanup_stopped_before_delete()
 
     async def test_hung_browser_close_is_bounded_and_later_cleanup_runs(self):
         close_started = asyncio.Event()
@@ -1138,12 +1390,14 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             elapsed = asyncio.get_running_loop().time() - started_at
             try:
                 self.assertIn(registration, done)
-                self.assertEqual(registration.result(), "cookies/session.json")
+                self.assertIsNone(registration.result())
                 self.assertLess(elapsed, 0.06)
                 self.assertGreaterEqual(close_cancellations, 2)
-                self.bb.close_browser.assert_called_once_with("profile-a")
-                self.bb.delete_browser.assert_called_once_with("profile-a")
-                self.store.mark_used.assert_called_once_with(self.account)
+                self.bb.close_browser.assert_not_called()
+                self.bb.delete_browser.assert_not_called()
+                self.store.mark_used.assert_not_called()
+                self.store.mark_error.assert_not_called()
+                self.store.release.assert_not_called()
                 self.assertIn("browser_cleanup_failed", output.getvalue())
                 self.assertNotIn("mail-pass", output.getvalue())
             finally:
@@ -1191,10 +1445,9 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
 
             self.assertIsNone(result)
             self.assertLess(elapsed, 0.08)
-            self.bb.delete_browser.assert_called_once_with("profile-a")
-            self.store.mark_error.assert_called_once_with(
-                self.account, "verification_rejected"
-            )
+            self.bb.delete_browser.assert_not_called()
+            self.store.mark_error.assert_not_called()
+            self.store.release.assert_not_called()
             self.assertIn("profile_close_failed", output.getvalue())
             self.assertNotIn("mail-pass", output.getvalue())
         finally:
@@ -1247,7 +1500,8 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
                 elapsed = time.monotonic() - started_at
 
             self.assertLess(elapsed, 0.08)
-            self.store.release.assert_called_once_with(self.account)
+            self.store.release.assert_not_called()
+            self.store.mark_error.assert_not_called()
             self.assertIn("profile_delete_failed", output.getvalue())
             self.assertNotIn("mail-pass", output.getvalue())
         finally:
@@ -1388,6 +1642,27 @@ class ClaudeApiMainBatchTests(unittest.IsolatedAsyncioTestCase):
         )
         for secret in ("proxy-secret", "proxy-secret-2", "proxy-secret-3"):
             self.assertNotIn(secret, output.getvalue())
+
+    def test_asyncio_run_does_not_wait_for_hung_proxy_executor(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_main_with_hung_proxy_acquisition,
+            args=(result_queue,),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(
+                process.is_alive(),
+                "asyncio.run waited for a cancellation-resistant proxy call",
+            )
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(result_queue.get(timeout=1), 1)
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
 
     async def test_final_marker_matches_mixed_results(self):
         stack = self.main_stack([

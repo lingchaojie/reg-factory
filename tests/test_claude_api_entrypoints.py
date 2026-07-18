@@ -846,6 +846,205 @@ class ClaudeAPIEntrypointTests(unittest.TestCase):
         self.assertEqual(selected, expected)
         stage.assert_called_once_with(args, {"EMAIL_PROVIDER": "NINEMALL"})
 
+    def test_outlook_claude_api_from_pool_uses_purpose_store_not_tri_pool(self):
+        mailbox = Mock(
+            email="person@example.com",
+            password="mail-pass",
+            refresh_token="refresh-secret",
+            client_id="client-guid",
+        )
+        store = Mock()
+        store.reserve_one.return_value = mailbox
+        args = platform_args(["claude_api"])
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms,
+            "ClaudeEmailAccountStore",
+            return_value=store,
+        ) as store_factory, patch.object(
+            register_three_platforms.email_pool,
+            "next_email",
+            side_effect=AssertionError("legacy tri pool used"),
+        ):
+            selected = register_three_platforms.next_pool_account(args)
+
+        self.assertEqual(tuple(selected), account_tuple(mailbox))
+        self.assertEqual(set(selected.stores), {"claude_api"})
+        store_factory.assert_called_once_with(
+            provider="OUTLOOK", purpose="claude_api"
+        )
+
+    def test_outlook_dual_claude_family_from_pool_is_atomic(self):
+        mailbox = Mock(
+            email="person@example.com",
+            password="mail-pass",
+            refresh_token="refresh-secret",
+            client_id="client-guid",
+        )
+        stores = {"claude": Mock(), "claude_api": Mock()}
+        shared = Mock(return_value=(mailbox, stores))
+        args = platform_args(["claude", "claude_api"])
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms,
+            "reserve_shared_claude_account",
+            shared,
+        ), patch.object(
+            register_three_platforms.email_pool,
+            "next_email",
+            side_effect=AssertionError("legacy tri pool used"),
+        ):
+            selected = register_three_platforms.next_pool_account(args)
+
+        self.assertEqual(tuple(selected), account_tuple(mailbox))
+        shared.assert_called_once_with(
+            "OUTLOOK", ("claude", "claude_api")
+        )
+
+    def test_mixed_outlook_run_retains_legacy_tri_pool(self):
+        args = platform_args(["claude_api", "chatgpt"])
+        legacy = (
+            "person@example.com",
+            "mail-pass",
+            "refresh-secret",
+            "client-guid",
+        )
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms.email_pool,
+            "next_email",
+            return_value=legacy,
+        ) as next_email, patch.object(
+            register_three_platforms,
+            "ClaudeEmailAccountStore",
+            side_effect=AssertionError("purpose store used for mixed run"),
+        ):
+            selected = register_three_platforms.next_pool_account(args)
+
+        self.assertEqual(selected, legacy)
+        next_email.assert_called_once_with("tri")
+
+    def test_full_flow_outlook_claude_api_retains_stage_a_mail_creation(self):
+        args = platform_args(["claude_api"])
+        args.dry_run = False
+        mailbox = (
+            "person@example.com",
+            "mail-pass",
+            "refresh-secret",
+            "client-guid",
+        )
+        stage = Mock(return_value=mailbox)
+
+        selected = run_full_flow.acquire_stage_account(
+            args,
+            {"EMAIL_PROVIDER": "OUTLOOK"},
+            stage_email_fn=stage,
+            store_factory=Mock(
+                side_effect=AssertionError("OUTLOOK pool used")
+            ),
+        )
+
+        self.assertEqual(selected, mailbox)
+        stage.assert_called_once_with(args, {"EMAIL_PROVIDER": "OUTLOOK"})
+
+    def test_run_full_flow_masks_mailbox_in_stage_logs(self):
+        args = platform_args(["claude_api"])
+        args.broker = ""
+        args.dry_run = True
+        args.platform_timeout = 600
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            status = run_full_flow.stage_platforms(
+                args,
+                {},
+                "person@example.com",
+                "mail-pass",
+                "refresh-secret",
+                "client-guid",
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("person@example.com", output.getvalue())
+        self.assertIn("pe***@example.com", output.getvalue())
+
+
+class ClaudeApiExitPropagationTests(unittest.IsolatedAsyncioTestCase):
+    def argv(self, platforms, *, parallel=False):
+        values = [
+            "register_three_platforms.py",
+            "--email",
+            "person@example.com",
+            "--password",
+            "mail-pass",
+            "--platforms",
+            *platforms,
+            "--broker",
+            "",
+        ]
+        if parallel:
+            values.append("--parallel")
+        return values
+
+    async def test_claude_api_failure_returns_nonzero_sequential_and_parallel(self):
+        failed = [("claude_api", False, 1, "safe.log")]
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel), patch.object(
+                register_three_platforms.sys,
+                "argv",
+                self.argv(["claude_api"], parallel=parallel),
+            ), patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+                register_three_platforms,
+                "process_account",
+                new=AsyncMock(return_value=failed),
+            ):
+                self.assertEqual(await register_three_platforms.main(), 1)
+
+    async def test_mixed_run_propagates_claude_api_failure(self):
+        results = [
+            ("chatgpt", True, 0, "safe.log"),
+            ("claude_api", False, 1, "safe.log"),
+        ]
+        with patch.object(
+            register_three_platforms.sys,
+            "argv",
+            self.argv(["chatgpt", "claude_api"]),
+        ), patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms,
+            "process_account",
+            new=AsyncMock(return_value=results),
+        ):
+            self.assertEqual(await register_three_platforms.main(), 1)
+
+    async def test_claude_api_start_failure_returns_nonzero(self):
+        with patch.object(
+            register_three_platforms.sys,
+            "argv",
+            self.argv(["claude_api"]),
+        ), patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms,
+            "process_account",
+            new=AsyncMock(
+                side_effect=register_three_platforms.PlatformLaunchError(
+                    "launch failed"
+                )
+            ),
+        ):
+            self.assertEqual(await register_three_platforms.main(), 1)
+
+    async def test_legacy_outlook_claude_failure_exit_remains_zero(self):
+        with patch.object(
+            register_three_platforms.sys,
+            "argv",
+            self.argv(["claude"]),
+        ), patch.dict(os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}), patch.object(
+            register_three_platforms,
+            "process_account",
+            new=AsyncMock(
+                return_value=[("claude", False, 1, "safe.log")]
+            ),
+        ):
+            self.assertEqual(await register_three_platforms.main(), 0)
+
 
 class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -948,6 +1147,49 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
                     "person@example.com----released",
                 ],
             )
+
+    async def test_full_flow_release_stays_retryable_until_process_stops(self):
+        account, stores = self.reserve()
+        reserved = run_full_flow._ReservedStageAccount(account, stores)
+        process = object()
+        reserved.track_process(process)
+
+        self.assertFalse(reserved.release())
+        self.assertTrue(reserved.active)
+        self.assertEqual(reserved.owned_processes, {id(process)})
+
+        reserved.confirm_process_stopped(process, True)
+        self.assertTrue(reserved.release())
+        self.assertFalse(reserved.active)
+        self.assertEqual(reserved.owned_processes, set())
+
+    async def test_full_flow_release_stays_retryable_after_store_failure(self):
+        account, stores = self.reserve()
+
+        class FailOnceStore:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.calls = 0
+
+            def release(self, selected):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("injected release failure")
+                return self.delegate.release(selected)
+
+        failing = FailOnceStore(stores["claude_api"])
+        reserved = run_full_flow._ReservedStageAccount(
+            account,
+            {"claude": stores["claude"], "claude_api": failing},
+        )
+
+        with self.assertRaises(OSError):
+            reserved.release()
+        self.assertTrue(reserved.active)
+
+        self.assertTrue(reserved.release())
+        self.assertFalse(reserved.active)
+        self.assertEqual(failing.calls, 2)
 
     async def test_parallel_launch_failure_cleans_running_sibling_before_release(self):
         events = []
@@ -1588,10 +1830,12 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_orchestrator_output_never_prints_mailbox_secrets(self):
         account, stores = self.reserve()
         reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+        run_ids = []
 
         async def fake_run(
-            platform, _command, _run_id, _child_env, process_owner=None
+            platform, _command, run_id, _child_env, process_owner=None
         ):
+            run_ids.append(run_id)
             self.child_store(platform).mark_used(account)
             return platform, True, 0, "sanitized.log"
 
@@ -1604,8 +1848,24 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         rendered = output.getvalue()
+        self.assertNotIn(account.email, rendered)
+        self.assertIn("pe***@example.com", rendered)
+        self.assertTrue(run_ids)
+        self.assertTrue(all("person" not in run_id for run_id in run_ids))
         for secret in (account.password, account.refresh_token, account.client_id):
             self.assertNotIn(secret, rendered)
+
+    def test_relayed_child_output_masks_complete_mailbox_addresses(self):
+        line = "registered person+claude@example.com successfully\n"
+
+        self.assertEqual(
+            register_three_platforms._mask_email_text(line),
+            "registered pe***@example.com successfully\n",
+        )
+        self.assertEqual(
+            run_full_flow._mask_email_text(line),
+            "registered pe***@example.com successfully\n",
+        )
 
 
 if __name__ == "__main__":

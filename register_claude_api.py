@@ -1,8 +1,10 @@
 from urllib.parse import unquote, urlparse
 import argparse
 import asyncio
+import concurrent.futures
 import functools
 import os
+import queue
 import sys
 import threading
 import time
@@ -63,12 +65,123 @@ _CONSOLE_BLOCKED_PATH_SEGMENTS = {
 _CONSOLE_EXCLUSIVE_MARKER = '[data-testid="workspace-switcher"]'
 _FIRST_MAIL_FRACTION = 0.40
 _SECOND_MAIL_END_FRACTION = 0.80
+_DEADLINE_SETTLE_FRACTION = 0.20
+_DEADLINE_SETTLE_CAP = 0.05
+_DEADLINE_SETTLE_MIN = 0.01
 
 
 class ClaudeApiRegistrationError(RuntimeError):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+class _OperationUnconfirmed(asyncio.TimeoutError):
+    """A timed-out operation may still own browser/profile resources."""
+
+
+class _CancellationUnconfirmed(asyncio.CancelledError):
+    """Cancellation returned before the owned async operation stopped."""
+
+
+class _SerialCallWorker:
+    """Run synchronous provider calls serially on a non-blocking daemon thread."""
+
+    _STOP = object()
+
+    def __init__(self, name):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is self._STOP:
+                return
+            future, operation = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = operation()
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def submit(self, operation):
+        future = concurrent.futures.Future()
+        self._queue.put((future, operation))
+        return future
+
+    async def wait(self, future, timeout):
+        wrapped = asyncio.wrap_future(future)
+        done, _pending = await asyncio.wait(
+            {wrapped}, timeout=max(0.0, float(timeout))
+        )
+        if wrapped not in done:
+            raise _OperationUnconfirmed
+        return wrapped.result()
+
+    def stop(self):
+        self._queue.put(self._STOP)
+
+
+class _ProfileOperations:
+    """Own one temporary profile and serialize its provider API lifecycle."""
+
+    def __init__(self, bb, profile_id=None):
+        self.bb = bb
+        self.profile_id = profile_id
+        self.close_confirmed = False
+        self.worker = _SerialCallWorker("claude-api-profile-owner")
+
+    def create(self, name, proxy_fields):
+        def operation():
+            self.profile_id = self.bb.create_browser(
+                name=name,
+                **proxy_fields,
+            )
+            return self.profile_id
+
+        return self.worker.submit(operation)
+
+    def open(self):
+        return self.worker.submit(
+            lambda: self.bb.open_browser(self.profile_id)
+        )
+
+    def close(self):
+        def operation():
+            if self.profile_id is None:
+                self.close_confirmed = True
+                return False
+            self.bb.close_browser(self.profile_id)
+            self.close_confirmed = True
+            return True
+
+        return self.worker.submit(operation)
+
+    def delete(self):
+        def operation():
+            if not self.close_confirmed:
+                raise RuntimeError("profile close is unconfirmed")
+            if self.profile_id is None:
+                return False
+            self.bb.delete_browser(self.profile_id)
+            return True
+
+        return self.worker.submit(operation)
+
+    async def wait(self, future, timeout):
+        return await self.worker.wait(future, timeout)
+
+    def stop(self):
+        self.worker.stop()
 
 
 async def apply_verification_artifact(page, artifact, navigation_timeout=60000):
@@ -246,17 +359,18 @@ async def _cancel_task_bounded(task, cancel_grace):
         done, _pending = await asyncio.wait({task}, timeout=grace)
         if task in done:
             _consume_background_task(task)
-            return
+            return True
         task.cancel()
         done, _pending = await asyncio.wait({task}, timeout=grace)
         if task in done:
             _consume_background_task(task)
-            return
+            return True
     except asyncio.CancelledError:
         task.cancel()
         _retain_background_task(task)
         raise
     _retain_background_task(task)
+    return False
 
 
 async def _run_bounded(awaitable, timeout, *, cancel_grace=None):
@@ -278,6 +392,50 @@ async def _run_bounded(awaitable, timeout, *, cancel_grace=None):
         return task.result()
     await _cancel_task_bounded(task, cancel_grace)
     raise asyncio.TimeoutError
+
+
+async def _run_owned_async(awaitable, timeout, *, cancel_grace=None):
+    """Bound an async owner and report when cancellation did not stop it."""
+    if cancel_grace is None:
+        cancel_grace = TASK_CANCEL_GRACE
+    try:
+        task = asyncio.ensure_future(awaitable)
+    except BaseException:
+        _close_unawaited(awaitable)
+        raise
+
+    async def cancel_owner():
+        try:
+            return await _cancel_task_bounded(task, cancel_grace)
+        except asyncio.CancelledError:
+            if task.done():
+                _consume_background_task(task)
+                raise
+            raise _CancellationUnconfirmed from None
+
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=max(0.0, float(timeout))
+        )
+    except asyncio.CancelledError:
+        confirmed = await cancel_owner()
+        if not confirmed:
+            raise _CancellationUnconfirmed from None
+        raise
+    if task in done:
+        return task.result()
+    confirmed = await cancel_owner()
+    if not confirmed:
+        raise _OperationUnconfirmed
+    raise asyncio.TimeoutError
+
+
+async def _run_sync_call_daemon(operation, timeout, name):
+    worker = _SerialCallWorker(name)
+    try:
+        return await worker.wait(worker.submit(operation), timeout)
+    finally:
+        worker.stop()
 
 
 async def _drain_retained_tasks(timeout=RETAINED_TASK_DRAIN_TIMEOUT):
@@ -394,7 +552,10 @@ async def run_claude_platform_flow(
     fetch_verification,
     max_wait,
     output_dir="cookies/claude_api",
+    progress=None,
 ):
+    progress = progress if progress is not None else {}
+    progress["phase"] = "registration"
     deadline = _clock() + max(0.0, float(max_wait))
 
     async def start_registration():
@@ -420,6 +581,7 @@ async def run_claude_platform_flow(
     except Exception:
         raise ClaudeApiRegistrationError("registration_error") from None
 
+    progress["phase"] = "mail"
     mail_phase_started = _clock()
     mail_available = _remaining(deadline)
     first_mail_deadline = (
@@ -477,6 +639,7 @@ async def run_claude_platform_flow(
     except Exception:
         raise ClaudeApiRegistrationError("mail_timeout") from None
 
+    progress["phase"] = "verification"
     try:
         method = await _await_by_deadline(
             apply_verification_artifact(
@@ -485,6 +648,9 @@ async def run_claude_platform_flow(
                 navigation_timeout=_navigation_timeout(deadline),
             ),
             deadline,
+        )
+        progress["phase"] = (
+            "code_confirmation" if method == "code" else "console"
         )
         await _wait_for_post_verification_state(
             page,
@@ -496,6 +662,7 @@ async def run_claude_platform_flow(
     except Exception:
         raise ClaudeApiRegistrationError("console_not_reached") from None
 
+    progress["phase"] = "session"
     try:
         return await _await_by_deadline(
             save_claude_platform_session(
@@ -652,36 +819,92 @@ def log_flow_error(code, error=None, *, account=None):
     print(value)
 
 
-async def _cleanup_registration_resources(bb, browser, profile_id):
-    cleanup_cancelled = None
+async def _cleanup_registration_resources(
+    bb,
+    browser,
+    profile_id,
+    *,
+    profile_operations=None,
+    async_owner_unconfirmed=False,
+    operation_timeout=None,
+):
+    operations = profile_operations or _ProfileOperations(bb, profile_id)
+    owns_operations = profile_operations is None
+    cleanup_timeout = (
+        CLEANUP_OPERATION_TIMEOUT
+        if operation_timeout is None
+        else max(0.0, float(operation_timeout))
+    )
+    try:
+        if async_owner_unconfirmed:
+            log_flow_error("browser_cleanup_unconfirmed")
+            return False
 
-    async def attempt(operation, error_code):
-        nonlocal cleanup_cancelled
+        if browser is not None:
+            try:
+                await _run_owned_async(
+                    browser.close(),
+                    cleanup_timeout,
+                    cancel_grace=TASK_CANCEL_GRACE,
+                )
+            except (_OperationUnconfirmed, _CancellationUnconfirmed) as exc:
+                log_flow_error("browser_cleanup_failed", exc)
+                return False
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                # A completed exception cannot race the serialized profile close.
+                log_flow_error("browser_cleanup_failed", exc)
+
+        close_future = operations.close()
         try:
-            awaitable = operation()
-            await _run_bounded(
-                awaitable,
-                CLEANUP_OPERATION_TIMEOUT,
-                cancel_grace=TASK_CANCEL_GRACE,
+            profile_existed = await operations.wait(
+                close_future,
+                cleanup_timeout,
             )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            log_flow_error("profile_close_failed", exc)
+            return False
+
+        if not profile_existed:
+            return True
+
+        delete_future = operations.delete()
+        try:
+            await operations.wait(
+                delete_future,
+                cleanup_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            log_flow_error("profile_delete_failed", exc)
+            return False
+        return True
+    finally:
+        if owns_operations:
+            operations.stop()
+
+
+async def _shield_registration_cleanup(cleanup_awaitable):
+    cleanup_task = asyncio.create_task(cleanup_awaitable)
+    cleanup_cancelled = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
         except asyncio.CancelledError as exc:
             if cleanup_cancelled is None:
                 cleanup_cancelled = exc
-        except BaseException as exc:
-            log_flow_error(error_code, exc)
-
-    if browser is not None:
-        await attempt(browser.close, "browser_cleanup_failed")
-    if profile_id is not None:
-        await attempt(
-            lambda: asyncio.to_thread(bb.close_browser, profile_id),
-            "profile_close_failed",
-        )
-        await attempt(
-            lambda: asyncio.to_thread(bb.delete_browser, profile_id),
-            "profile_delete_failed",
-        )
-    return cleanup_cancelled
+        except BaseException:
+            break
+    try:
+        complete = cleanup_task.result()
+    except BaseException as exc:
+        log_flow_error("browser_cleanup_failed", exc)
+        complete = False
+    return complete, cleanup_cancelled
 
 
 async def register_one(
@@ -691,31 +914,63 @@ async def register_one(
     timeout,
     account_lease=None,
     browser_proxy_fields=None,
+    deadline=None,
 ):
+    if deadline is None:
+        deadline = _clock() + max(0.0, float(timeout))
+    profile_operations = _ProfileOperations(bb)
     profile_id = None
     browser = None
     cookie_path = None
     error_code = None
     escaped = None
     cancelled = None
-    release_on_error = False
+    async_owner_unconfirmed = False
+    phase = "create"
+    flow_progress = {}
+
+    async def run_profile_call(submit):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        future = submit()
+        return await profile_operations.wait(future, remaining)
+
     try:
         proxy_fields = (
             bitbrowser_proxy_fields(account_lease)
             if account_lease
             else dict(browser_proxy_fields or {})
         )
-        profile_id = bb.create_browser(
-            name=f"claude_api_{int(time.time())}",
-            **proxy_fields,
+        profile_id = await run_profile_call(
+            lambda: profile_operations.create(
+                f"claude_api_{int(time.time())}",
+                proxy_fields,
+            )
         )
-        opened = bb.open_browser(profile_id)
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.connect_over_cdp(opened["ws"])
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else await context.new_page()
-            cookie_path = await _run_bounded(
-                run_claude_platform_flow(
+        phase = "open"
+        opened = await run_profile_call(profile_operations.open)
+        phase = "async"
+
+        async def run_browser_registration():
+            nonlocal browser
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.connect_over_cdp(opened["ws"])
+                context = browser.contexts[0]
+                page = (
+                    context.pages[0]
+                    if context.pages
+                    else await context.new_page()
+                )
+                available = _remaining(deadline)
+                settle_margin = min(
+                    _DEADLINE_SETTLE_CAP,
+                    max(
+                        available * _DEADLINE_SETTLE_FRACTION,
+                        min(_DEADLINE_SETTLE_MIN, available * 0.5),
+                    ),
+                )
+                return await run_claude_platform_flow(
                     page,
                     context,
                     account,
@@ -723,39 +978,81 @@ async def register_one(
                         fetch_platform_verification,
                         account_lease=account_lease,
                     ),
-                    max_wait=timeout,
-                ),
-                timeout=float(timeout) + EMERGENCY_TIMEOUT_CUSHION,
-                cancel_grace=TASK_CANCEL_GRACE,
-            )
-    except asyncio.TimeoutError:
+                    max_wait=max(0.0, available - settle_margin),
+                    progress=flow_progress,
+                )
+
+        cookie_path = await _run_owned_async(
+            run_browser_registration(),
+            _remaining(deadline),
+            cancel_grace=TASK_CANCEL_GRACE,
+        )
+    except _CancellationUnconfirmed as exc:
+        cancelled = exc
+        async_owner_unconfirmed = True
+    except _OperationUnconfirmed:
         error_code = "timeout"
-    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
-        error_code = exc.code
+        async_owner_unconfirmed = phase == "async"
+    except asyncio.TimeoutError:
+        error_code = {
+            "mail": "mail_timeout",
+            "code_confirmation": "verification_rejected",
+            "console": "console_not_reached",
+            "session": "console_not_reached",
+        }.get(flow_progress.get("phase"), "timeout")
     except asyncio.CancelledError as exc:
         cancelled = exc
+    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
+        error_code = exc.code
     except BaseException as exc:
         escaped = exc
-        if profile_id is None:
-            release_on_error = True
-        else:
+        if profile_operations.profile_id is not None:
             error_code = "registration_error"
 
-    cleanup_cancelled = await _cleanup_registration_resources(
-        bb, browser, profile_id
+    cleanup_complete, cleanup_cancelled = await _shield_registration_cleanup(
+        _cleanup_registration_resources(
+            bb,
+            browser,
+            profile_id,
+            profile_operations=profile_operations,
+            async_owner_unconfirmed=async_owner_unconfirmed,
+            operation_timeout=min(
+                CLEANUP_OPERATION_TIMEOUT,
+                max(0.0, float(timeout)),
+            ),
+        )
     )
-    if cancelled is not None or cleanup_cancelled is not None:
+    profile_operations.stop()
+    if cancelled is None:
+        cancelled = cleanup_cancelled
+
+    if not cleanup_complete:
+        if cancelled is not None:
+            raise cancelled
+        if escaped is not None:
+            raise escaped
+        return None
+
+    if cancelled is not None:
         account_store.release(account)
-        raise cancelled or cleanup_cancelled
+        raise cancelled
     if cookie_path is not None:
         account_store.mark_used(account)
         return cookie_path
-    if release_on_error:
-        account_store.release(account)
-    elif error_code is not None:
-        account_store.mark_error(account, error_code)
     if escaped is not None:
+        if profile_operations.profile_id is None:
+            account_store.release(account)
+        else:
+            account_store.mark_error(
+                account,
+                error_code or "registration_error",
+            )
         raise escaped
+    if error_code is not None:
+        if profile_operations.profile_id is None:
+            account_store.release(account)
+        else:
+            account_store.mark_error(account, error_code)
     return None
 
 
@@ -894,13 +1191,26 @@ async def main():
     async def run_selected(index, selected):
         try:
             async with semaphore:
+                account_deadline = _clock() + max(0.0, float(args.timeout))
                 account_lease = inherited_lease
                 if account_lease is None and ipmart_settings.enabled:
                     try:
-                        account_lease = await asyncio.to_thread(acquire_proxy)
+                        account_lease = await _run_sync_call_daemon(
+                            acquire_proxy,
+                            _remaining(account_deadline),
+                            "claude-api-proxy-acquisition",
+                        )
                     except asyncio.CancelledError:
                         release_once(index, selected)
                         raise
+                    except _OperationUnconfirmed as exc:
+                        release_once(index, selected)
+                        log_flow_error(
+                            "proxy_acquisition_timeout",
+                            exc,
+                            account=selected,
+                        )
+                        return None
                     except IPMartProxyError as exc:
                         release_once(index, selected)
                         log_flow_error(
@@ -921,6 +1231,7 @@ async def main():
                     args.timeout,
                     account_lease=account_lease,
                     browser_proxy_fields=browser_proxy_fields,
+                    deadline=account_deadline,
                 )
         except asyncio.CancelledError:
             release_once(index, selected)

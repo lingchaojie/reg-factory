@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; final lifecycle, durability, routing, and redaction corrections incorporated on 2026-07-19.
+
 **Goal:** Add an independent `claude_api` flow that authenticates at `platform.claude.com` with either the email magic link or numeric code, selects a personal account, exports the console session, and leaves recharge for a later feature.
 
 **Architecture:** Keep Claude.ai registration in `register.py` unchanged and add a focused `register_claude_api.py`. Extend the existing Claude mailbox account store with purpose-specific ledgers, add a pure Claude Platform verification-artifact parser used by NINEMALL and OUTLOOK channels, and expose the new flow through both orchestrators and the WebUI.
@@ -20,6 +22,10 @@
 - Only an explicit personal-account option may be selected. Never submit organization or team creation.
 - Success requires both an authenticated Platform URL and a stable console-only element.
 - Save full Platform cookies under `cookies/claude_api/`; never persist mailbox passwords, client IDs, refresh tokens, API passwords, codes, or magic links in logs or indexes.
+- Serialize every ledger mutation across processes. Shared-purpose reservation must be transactional and crash-recoverable; a partial append may not consume only one purpose.
+- Start one monotonic account deadline before optional IPMart acquisition. Proxy acquisition, profile create/open, CDP connection, registration, and session export consume only its remaining budget.
+- Serialize synchronous profile operations in a daemon owner. Never submit delete until close has completed successfully, and never finalize a ledger while async ownership or cleanup is unconfirmed.
+- Publish session cookies before their index record, using fsynced private files, atomic replacement, and an interprocess index lock.
 - Do not create API keys, add credit, bind payment, or perform recharge in this plan.
 - Automated tests must mock AppleEmail, Microsoft, Anthropic, proxy, browser, and account-creation I/O.
 
@@ -28,6 +34,7 @@
 ## File Structure
 
 - `common/claude_email_accounts.py`: provider parsing, purpose-specific state files, shared Claude-family reservation.
+- `common/interprocess_lock.py`: cross-platform advisory lock shared by durable ledgers and session indexes.
 - `common/claude_platform_mailbox.py`: pure message model, Platform magic-link/code extraction, Graph and Outlook-browser polling.
 - `common/ninemail_mailbox.py`: AppleEmail transport and Platform dual-artifact polling; existing Claude.ai magic-link API remains intact.
 - `common/claude_platform_session.py`: console-success predicate and secret-safe full-cookie export.
@@ -175,8 +182,12 @@ _SAFE_REASONS.update({
 })
 ```
 
-Implement atomic shared selection under the existing `_POOL_LOCK`; do not call
-`reserve_one()` while holding the lock because it locks again:
+Implement shared selection under `_locked_pool(root_dir)`, which combines the
+in-process mutex with a per-root interprocess advisory lock. Before appending
+to either purpose ledger, write and fsync a credential-free recovery journal
+containing only each target filename, whether it existed, and its original
+size. Roll back every target on any append failure; the next lock holder also
+performs the same recovery after an interrupted process:
 
 ```python
 def reserve_shared_claude_account(
@@ -198,14 +209,24 @@ def reserve_shared_claude_account(
         for purpose in requested
     }
     base = stores[requested[0]]
-    with _POOL_LOCK:
+    with _locked_pool(base.root_dir):
         blocked = {purpose: store._blocked() for purpose, store in stores.items()}
         for account in base._load_accounts():
             email = account.email.lower()
             if any(email in blocked[purpose] for purpose in requested):
                 continue
-            for purpose, store in stores.items():
-                store._append_state(store.used_file, account, "reserved")
+            _prepare_pool_transaction(
+                base.root_dir,
+                [store.used_file for store in stores.values()],
+            )
+            try:
+                for store in stores.values():
+                    store._append_state(store.used_file, account, "reserved")
+            except BaseException:
+                _recover_pool_transaction(base.root_dir)
+                raise
+            _finish_pool_transaction(base.root_dir)
+            for store in stores.values():
                 store._active_reservations.add(email)
             return account, stores
     return None
@@ -218,6 +239,8 @@ mail_used_claude_api.txt
 mail_error_claude_api.txt
 emails_used_claude_api.txt
 emails_error_claude_api.txt
+.claude_email_pool.lock
+.claude_email_pool.journal
 ```
 
 - [ ] **Step 4: Run focused and existing account-store tests**
@@ -522,7 +545,7 @@ git commit -m "feat: read Claude Platform verification mail"
 
 **Interfaces:**
 - Consumes: `ClaudePlatformVerification`, existing `_get_access_token()`, `fetch_messages()`, Outlook login/folder helpers, and broker `/fetch`.
-- Produces: `get_claude_platform_verification_by_token(email, refresh_token, client_id, max_wait=120, poll=5, received_after=None, account_lease=None)`; `get_claude_platform_verification_outlook_pw(page, email, password, max_wait=120, received_after=None)`; `fetch_claude_platform_from_broker(email, password, max_wait=120)`; broker `kind="claude_platform"` returning `{magic_link, code, received_at}`.
+- Produces: `get_claude_platform_verification_by_token(email, refresh_token, client_id, max_wait=120, poll=5, received_after=None, account_lease=None)`; `get_claude_platform_verification_outlook_pw(page, email, password, max_wait=120, received_after=None)`; `fetch_claude_platform_from_broker(email, password, max_wait=120, received_after=None)`; broker `kind="claude_platform"` returning `{magic_link, code, received_at}`.
 
 - [ ] **Step 1: Write failing Graph and broker tests**
 
@@ -668,6 +691,7 @@ async def fetch_claude_platform_from_broker(
     email,
     password,
     max_wait=120,
+    received_after=None,
 ):
     base = os.environ.get("MAILBOX_BROKER")
     if not base:
@@ -680,6 +704,7 @@ async def fetch_claude_platform_from_broker(
         "regex": "",
         "kind": "claude_platform",
         "timeout": max_wait,
+        "received_after": received_after,
     }
     timeout = aiohttp.ClientTimeout(total=max_wait + 60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -695,10 +720,11 @@ async def fetch_claude_platform_from_broker(
     code = str(value.get("code") or "")
     if not magic_link and not code:
         return None
-    return ClaudePlatformVerification(
-        magic_link=magic_link,
-        code=code,
-        received_at=float(value.get("received_at") or 0.0),
+    return validate_claude_platform_verification(
+        magic_link,
+        code,
+        value.get("received_at"),
+        received_after=received_after,
     )
 ```
 
@@ -858,41 +884,60 @@ Expected: FAIL because `register_claude_api.py` and session helpers do not exist
 Create `common/claude_platform_session.py`:
 
 ```python
-from datetime import datetime
-from pathlib import Path
-import hashlib
-import json
-
-def _email_key(email):
-    return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
+def _persist_claude_platform_session(platform_cookies, email, output_dir):
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    email_key = _email_key(email)
+    path = target / (
+        f"full_{email_key}_{datetime.now():%Y%m%d_%H%M%S_%f}_"
+        f"{uuid.uuid4().hex}.json"
+    )
+    temporary = target / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    final_created = False
+    try:
+        _write_fsynced(
+            temporary,
+            json.dumps(platform_cookies, ensure_ascii=False, indent=2)
+            .encode("utf-8"),
+        )
+        os.replace(temporary, path)
+        final_created = True
+        _fsync_directory(target)
+        _replace_index(
+            target / "accounts.jsonl",
+            {"email_key": email_key, "cookie_file": path.name},
+        )
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        if final_created:
+            path.unlink(missing_ok=True)
+            _fsync_directory(target)
+        raise
+    return path
 
 async def save_claude_platform_session(context, email, output_dir="cookies/claude_api"):
     cookies = await context.cookies()
     platform_cookies = [
         cookie for cookie in cookies
-        if (cookie.get("domain") or "").lstrip(".").endswith("claude.com")
+        if _is_claude_domain(cookie.get("domain"))
     ]
     if not platform_cookies:
         raise RuntimeError("console_not_reached")
-    target = Path(output_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = target / f"full_{_email_key(email)}_{stamp}.json"
-    path.write_text(
-        json.dumps(platform_cookies, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    return await asyncio.to_thread(
+        _persist_claude_platform_session,
+        platform_cookies,
+        email,
+        output_dir,
     )
-    index = target / "accounts.jsonl"
-    with index.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "email_key": _email_key(email),
-            "cookie_file": path.name,
-        }) + "\n")
-    return path
 ```
 
-Do not write raw email, mailbox credentials, artifact values, or cookie values
-to `accounts.jsonl`.
+`_write_fsynced()` creates private mode-`0600` files, handles short writes, and
+fsyncs before publication. `_replace_index()` holds an interprocess advisory
+lock while it copies the previous index plus one record into a private,
+fsynced temporary file and atomically replaces `accounts.jsonl`. Publish the
+cookie before the record and remove the cookie if the index update fails. Do
+not write raw email, mailbox credentials, artifact values, or cookie values to
+`accounts.jsonl`.
 
 - [ ] **Step 4: Implement exact page-state helpers**
 
@@ -1144,41 +1189,79 @@ async def fetch_platform_verification(
             await confirm_worker_stopped(worker, cancel_event)
             raise
 
-    if account.refresh_token:
-        result = await asyncio.to_thread(
-            get_claude_platform_verification_by_token,
-            account.email,
-            account.refresh_token,
-            account.client_id,
-            max_wait,
-            5,
-            received_after,
-            account_lease,
-        )
-        if result:
-            return result
+    deadline = _clock() + max_wait
+    channels = (["graph"] if account.refresh_token else [])
     if os.environ.get("MAILBOX_BROKER"):
-        result = await fetch_claude_platform_from_broker(
-            account.email,
-            account.password,
-            max_wait,
-        )
-        if result:
-            return result
-    outlook_page = await context.new_page()
-    try:
-        return await get_claude_platform_verification_outlook_pw(
-            outlook_page,
-            account.email,
-            account.password,
-            max_wait=max_wait,
-            received_after=received_after,
-        )
-    finally:
-        await outlook_page.close()
+        channels.append("broker")
+    channels.append("browser")
+
+    for index, channel in enumerate(channels):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            return None
+        # A failed early channel cannot consume the later channels' shares.
+        channel_budget = remaining / (len(channels) - index)
+        channel_deadline = _clock() + channel_budget
+        try:
+            if channel == "graph":
+                result = await _await_external_by_deadline(
+                    asyncio.to_thread(
+                        get_claude_platform_verification_by_token,
+                        account.email,
+                        account.refresh_token,
+                        account.client_id,
+                        channel_budget,
+                        5,
+                        received_after,
+                        account_lease,
+                    ),
+                    channel_deadline,
+                )
+            elif channel == "broker":
+                result = await _await_external_by_deadline(
+                    fetch_claude_platform_from_broker(
+                        account.email,
+                        account.password,
+                        channel_budget,
+                        received_after,
+                    ),
+                    channel_deadline,
+                )
+            else:
+                outlook_page = await _await_external_by_deadline(
+                    context.new_page(), channel_deadline
+                )
+                try:
+                    result = await _await_external_by_deadline(
+                        get_claude_platform_verification_outlook_pw(
+                            outlook_page,
+                            account.email,
+                            account.password,
+                            max_wait=max(0.0, channel_deadline - _clock()),
+                            received_after=received_after,
+                        ),
+                        channel_deadline,
+                    )
+                finally:
+                    close_awaitable = outlook_page.close()
+                    if _remaining(deadline) > 0:
+                        await _await_external_by_deadline(
+                            close_awaitable, deadline
+                        )
+                    else:
+                        _close_unawaited(close_awaitable)
+            if result:
+                return result
+        except asyncio.TimeoutError:
+            continue
+    return None
 ```
 
-The NINEMALL branch returns or raises before any OUTLOOK call.
+The NINEMALL branch returns or raises before any OUTLOOK call. OUTLOOK divides
+the one remaining mailbox budget across Graph, broker, and browser channels;
+every channel receives the same `received_after` freshness baseline. A broker
+response is revalidated locally for artifact shape, host/path, finite timestamp,
+and freshness before it is accepted.
 
 Construct the NINEMALL client and confirm cancellation with these concrete
 helpers:
@@ -1231,15 +1314,15 @@ IPMart verification, `bitbrowser_proxy_fields`, browser provider creation,
 Playwright CDP connection, and `common.process_lifecycle` shutdown confirmation
 patterns already used by `register.py` and the NINEMALL entry points.
 
-`register_one()` must always close and delete its temporary profile after its
-mailbox worker is stopped. On success call `store.mark_used(account)`; on a
-stable flow/mailbox error call `store.mark_error(account, error.code)`; on
-startup unwind call `store.release(account)`.
+`register_one()` must clean up its temporary profile before publishing a
+terminal ledger entry. A timed-out or cancelled operation that may still own a
+browser/profile is not a completed failure: keep the reservation in its
+`reserved` state for conservative recovery.
 
-Use this lifecycle implementation with explicit imports for `asyncio`,
-`functools`, `time`, `async_playwright`, `BitBrowser`,
-`bitbrowser_proxy_fields`, `ClaudeApiRegistrationError`,
-`NineMallMailboxError`, and the functions produced by Tasks 2-4:
+Start `account_deadline` in the account worker before optional IPMart
+acquisition and pass it into `register_one()`. Use a daemon-backed serialized
+owner for blocking BitBrowser operations so a hung provider call cannot block
+`asyncio.run()` shutdown or race a later close/delete. The lifecycle shape is:
 
 ```python
 async def register_one(
@@ -1248,24 +1331,44 @@ async def register_one(
     account_store,
     timeout,
     account_lease=None,
+    deadline=None,
 ):
+    deadline = deadline or (_clock() + timeout)
+    operations = _ProfileOperations(bb)
     profile_id = None
     browser = None
+    cookie_path = None
+    error_code = None
+    progress = {}
+    async_owner_unconfirmed = False
+
+    async def profile_call(submit):
+        remaining = _remaining(deadline)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await operations.wait(submit(), remaining)
+
     try:
-        proxy_fields = (
-            bitbrowser_proxy_fields(account_lease) if account_lease else {}
+        profile_id = await profile_call(
+            lambda: operations.create(
+                f"claude_api_{int(time.time())}",
+                bitbrowser_proxy_fields(account_lease)
+                if account_lease else {},
+            )
         )
-        profile_id = bb.create_browser(
-            name=f"claude_api_{int(time.time())}",
-            **proxy_fields,
-        )
-        opened = bb.open_browser(profile_id)
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.connect_over_cdp(opened["ws"])
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else await context.new_page()
-            cookie_path = await asyncio.wait_for(
-                run_claude_platform_flow(
+        opened = await profile_call(operations.open)
+
+        async def browser_registration():
+            nonlocal browser
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.connect_over_cdp(opened["ws"])
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else await context.new_page()
+                available = _remaining(deadline)
+                # This margin stays inside the same absolute deadline. It lets
+                # the inner state machine unwind with a contextual phase code.
+                settle = _deadline_settle_margin(available)
+                return await run_claude_platform_flow(
                     page,
                     context,
                     account,
@@ -1273,36 +1376,88 @@ async def register_one(
                         fetch_platform_verification,
                         account_lease=account_lease,
                     ),
-                    max_wait=min(120, timeout),
-                ),
-                timeout=timeout,
-            )
+                    max_wait=max(0.0, available - settle),
+                    progress=progress,
+                )
+
+        cookie_path = await _run_owned_async(
+            browser_registration(),
+            _remaining(deadline),
+            cancel_grace=TASK_CANCEL_GRACE,
+        )
+    except _CancellationUnconfirmed:
+        async_owner_unconfirmed = True
+    except asyncio.TimeoutError:
+        error_code = {
+            "mail": "mail_timeout",
+            "code_confirmation": "verification_rejected",
+            "console": "console_not_reached",
+            "session": "console_not_reached",
+        }.get(progress.get("phase"), "timeout")
+    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
+        error_code = exc.code
+
+    cleanup_complete, cancellation = await _shield_registration_cleanup(
+        _cleanup_registration_resources(
+            bb,
+            browser,
+            profile_id,
+            profile_operations=operations,
+            async_owner_unconfirmed=async_owner_unconfirmed,
+            operation_timeout=min(CLEANUP_OPERATION_TIMEOUT, timeout),
+        )
+    )
+    if not cleanup_complete:
+        # Ownership is unresolved: no ok/error/released append is safe.
+        return None
+    if cancellation is not None:
+        account_store.release(account)
+        raise cancellation
+    if cookie_path is not None:
         account_store.mark_used(account)
         return cookie_path
-    except asyncio.TimeoutError:
-        account_store.mark_error(account, "timeout")
-        return None
-    except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
-        account_store.mark_error(account, exc.code)
-        return None
-    except asyncio.CancelledError:
-        account_store.release(account)
-        raise
-    except BaseException:
-        if profile_id is None:
-            account_store.release(account)
-        else:
-            account_store.mark_error(account, "registration_error")
-        raise
-    finally:
-        if browser is not None:
-            await browser.close()
-        if profile_id is not None:
-            try:
-                bb.close_browser(profile_id)
-            finally:
-                bb.delete_browser(profile_id)
+    if error_code is not None:
+        account_store.mark_error(account, error_code)
+    return None
 ```
+
+`_cleanup_registration_resources()` first confirms the owned Playwright
+operation has stopped, then closes the Playwright browser. It submits
+`operations.close()` and awaits completion; only a successfully completed close
+may enqueue `operations.delete()`. A close timeout or exception returns
+unconfirmed cleanup without issuing delete. `_shield_registration_cleanup()`
+records caller cancellation but lets this bounded ownership check finish.
+
+The account-worker deadline setup must share the same budget with proxy
+acquisition:
+
+```python
+account_deadline = _clock() + args.timeout
+if ipmart_settings.enabled:
+    account_lease = await _run_sync_call_daemon(
+        acquire_proxy,
+        _remaining(account_deadline),
+        "claude-api-proxy-acquisition",
+    )
+return await register_one(
+    bb,
+    account,
+    account_store,
+    args.timeout,
+    account_lease=account_lease,
+    deadline=account_deadline,
+)
+```
+
+On success call `store.mark_used(account)`. On a stable flow/mailbox error and
+confirmed cleanup call `store.mark_error(account, error.code)`. Release only a
+pre-profile or confirmed-cancellation reservation. Never turn an unconfirmed
+owner into success, error, or release.
+
+The obsolete synchronous pattern is intentionally not used: direct
+`bb.create_browser()` / `bb.open_browser()` calls can escape the account
+deadline, and unconditional close/delete can delete a profile while its open or
+Playwright task still owns it.
 
 Print exactly one final line in this format:
 
@@ -1413,7 +1568,7 @@ if platform == "claude_api":
 Add `claude_api` to both argparse choices. Treat `claude` and `claude_api` as
 Claude-family platforms for IPMart ordering and HTTP-proxy stripping.
 
-- [ ] **Step 4: Generalize NINEMALL-only routing without leaking it to other platforms**
+- [ ] **Step 4: Generalize purpose-ledger routing without leaking it to mixed platforms**
 
 Define:
 
@@ -1425,10 +1580,13 @@ def is_claude_family_only(platforms):
     return bool(selected) and selected <= CLAUDE_FAMILY
 ```
 
-Replace exact `{"claude"}` checks only where they govern NINEMALL account
-selection, broker release, exit status, and Claude-family child environment.
-Mixed ChatGPT/Grok runs continue forcing `EMAIL_PROVIDER=OUTLOOK` for the
-Claude-family child, preserving current mixed-mailbox behavior.
+In `register_three_platforms.py --from-pool`, replace exact `{"claude"}` checks
+where they govern purpose-ledger selection, broker release, exit status, and
+Claude-family child environment. Pure `claude_api` uses the normalized current
+provider (NINEMALL or OUTLOOK), and a dual-family run reserves both purposes.
+Pure OUTLOOK `claude` retains the legacy `tri` pool. Mixed ChatGPT/Grok runs
+also continue using `tri` and force `EMAIL_PROVIDER=OUTLOOK` for the
+Claude-family child, preserving existing mailbox behavior.
 
 For a two-child Claude-family run, use `reserve_shared_claude_account()` and
 attach both stores to the reserved process owner. After each child result,
@@ -1466,27 +1624,47 @@ class _ReservedPoolAccount(tuple):
     def release(self):
         if not self.active:
             return False
-        self.active = False
         if self.owned_processes:
             return False
         released = False
         for store in self.stores.values():
             released = store.release(self.account) or released
+        self.active = False
         return released
 ```
 
 Build the reservation with:
 
 ```python
-purposes = tuple(
-    platform for platform in args.platforms if platform in CLAUDE_FAMILY
-)
-result = reserve_shared_claude_account("NINEMALL", purposes)
-if result is None:
-    return None
-account, stores = result
-return _ReservedPoolAccount(account, stores)
+provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
+if is_claude_family_only(args.platforms):
+    purposes = tuple(dict.fromkeys(
+        platform for platform in args.platforms if platform in CLAUDE_FAMILY
+    ))
+    if provider == "OUTLOOK" and purposes == ("claude",):
+        return email_pool.next_email("tri")
+    if len(purposes) > 1:
+        result = reserve_shared_claude_account(provider, purposes)
+        if result is None:
+            return None
+        account, stores = result
+    else:
+        store = ClaudeEmailAccountStore(provider=provider, purpose=purposes[0])
+        account = store.reserve_one()
+        if account is None:
+            return None
+        stores = {purposes[0]: store}
+    return _ReservedPoolAccount(account, stores)
+return email_pool.next_email("tri")
 ```
+
+Keep `active=True` while any tracked child process remains unconfirmed so a
+later confirmed shutdown can retry release. Mask complete email addresses in
+both the parent summary and relayed child output without modifying command
+arguments or account objects. If the run includes `claude_api`, propagate
+launch failure, nonzero child exit, or missing success marker as a nonzero
+orchestrator exit; retain the historical exit convention for runs that do not
+include `claude_api`.
 
 - [ ] **Step 5: Generalize full-flow lease and platform environment logic**
 
@@ -1494,6 +1672,12 @@ Rename `is_ninemail_claude_only()` to
 `is_ninemail_claude_family_only()`. Include `claude_api` when deciding whether
 to acquire and re-verify an account lease. Restore inherited HTTP proxy values
 only when at least one requested platform is outside the Claude family.
+
+This full-flow change remains intentionally provider-specific: bypass Stage A
+and use purpose-ledger reservation only when `EMAIL_PROVIDER=NINEMALL` and all
+selected platforms are in the Claude family. Explicit OUTLOOK continues the
+existing Stage A mailbox-registration workflow; do not replace it with the
+provider-agnostic `register_three_platforms.py --from-pool` behavior.
 
 Update argparse choices to:
 

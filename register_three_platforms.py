@@ -13,7 +13,9 @@ Examples:
 
 import argparse
 import asyncio
+import hashlib
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -44,6 +46,29 @@ CLAUDE_FAMILY = {"claude", "claude_api"}
 
 class PlatformLaunchError(RuntimeError):
     pass
+
+
+def _masked_email(email):
+    local, separator, domain = str(email or "").partition("@")
+    if not separator:
+        return "***"
+    return f"{local[:2]}***@{domain}"
+
+
+_EMAIL_TEXT_RE = re.compile(
+    r"(?i)\b[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+)
+
+
+def _mask_email_text(value):
+    return _EMAIL_TEXT_RE.sub(
+        lambda match: _masked_email(match.group(0)), str(value or "")
+    )
+
+
+def _email_log_key(email):
+    normalized = str(email or "").strip().lower().encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()[:10]
 
 
 class _ReservedPoolAccount(tuple):
@@ -235,9 +260,10 @@ async def run_platform(
                 text = line.decode("utf-8", errors="replace")
                 if "success: 1/1" in text.lower():
                     saw_success = True
-                log.write(text)
+                display_text = _mask_email_text(text)
+                log.write(display_text)
                 log.flush()
-                print(f"[{platform}] {text}", end="")
+                print(f"[{platform}] {display_text}", end="")
 
         rc = await proc.wait()
         if process_owner is not None:
@@ -261,22 +287,24 @@ async def run_platform(
 
 def next_pool_account(args):
     provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
-    if provider == "NINEMALL" and is_claude_family_only(args.platforms):
+    if is_claude_family_only(args.platforms):
         purposes = tuple(dict.fromkeys(
             platform for platform in args.platforms
             if platform in CLAUDE_FAMILY
         ))
+        if provider == "OUTLOOK" and purposes == ("claude",):
+            return email_pool.next_email("tri")
         if len(purposes) > 1:
-            result = reserve_shared_claude_account("NINEMALL", purposes)
+            result = reserve_shared_claude_account(provider, purposes)
             if result is None:
                 return None
             account, stores = result
             return _ReservedPoolAccount(account, stores)
         purpose = purposes[0]
-        store_args = {"provider": "NINEMALL"}
-        if purpose != "claude":
-            store_args["purpose"] = purpose
-        store = ClaudeEmailAccountStore(**store_args)
+        store = ClaudeEmailAccountStore(
+            provider=provider,
+            purpose=purpose,
+        )
         account = store.reserve_one()
         if account is None:
             return None
@@ -309,7 +337,7 @@ def broker_release(broker_url, email):
     try:
         import requests
         requests.post(broker_url.rstrip("/") + "/release", json={"email": email}, timeout=30)
-        print(f"  [broker] released {email}")
+        print(f"  [broker] released {_masked_email(email)}")
     except Exception as e:
         print(f"  [broker] release failed: {e}")
 
@@ -352,9 +380,13 @@ def platform_child_env(platform, base_env, platforms=None):
 
 async def process_account(account, args, child_env):
     email = account[0]
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + email.split("@")[0][:8]
+    display_email = _masked_email(email)
+    run_id = (
+        datetime.now().strftime("%Y%m%d_%H%M%S_")
+        + _email_log_key(email)
+    )
     print("=" * 60)
-    print(f"  account: {email}  platforms={','.join(args.platforms)}  mode={'parallel' if args.parallel else 'sequential'}")
+    print(f"  account: {display_email}  platforms={','.join(args.platforms)}  mode={'parallel' if args.parallel else 'sequential'}")
     print("=" * 60)
 
     platforms = list(args.platforms)
@@ -405,7 +437,7 @@ async def process_account(account, args, child_env):
         provider == "NINEMALL" and is_claude_family_only(args.platforms)
     ):
         broker_release(args.broker, email)   # 释放该号 Outlook 会话
-    print(f"\n  Summary [{email}]")
+    print(f"\n  Summary [{display_email}]")
     for platform, ok, rc, log_path in results:
         print(f"    {platform}: {'OK' if ok else f'FAIL(exit={rc})'}  log={log_path}")
     return results
@@ -452,7 +484,10 @@ async def main():
             try:
                 await process_account(acc, args, child_env)
             except Exception as e:
-                print(f"  [loop] account {acc[0]} error: {e}")
+                print(
+                    f"  [loop] account {_masked_email(acc[0])} "
+                    f"error: {type(e).__name__}"
+                )
 
         while True:
             # 节流：处理中的邮箱达到上限就等空位，避免把池里的号一次性 reserve 光
@@ -468,9 +503,20 @@ async def main():
             t.add_done_callback(tasks.discard)
     else:
         account = parse_account(args)
-        results = await process_account(account, args, child_env)
+        try:
+            results = await process_account(account, args, child_env)
+        except PlatformLaunchError:
+            if "claude_api" in args.platforms:
+                return 1
+            raise
         provider = normalize_email_provider(os.environ.get("EMAIL_PROVIDER"))
-        if provider == "NINEMALL" and is_claude_family_only(args.platforms):
+        if (
+            "claude_api" in args.platforms
+            or (
+                provider == "NINEMALL"
+                and is_claude_family_only(args.platforms)
+            )
+        ):
             return 0 if all(result[1] for result in results) else 1
         return 0
 

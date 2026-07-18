@@ -1,9 +1,12 @@
 import asyncio
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import stat
 from tempfile import TemporaryDirectory
 import threading
+import time
 import traceback
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -12,6 +15,58 @@ from urllib.parse import quote
 from common.claude_email_accounts import ClaudeEmailAccount
 from common.claude_platform_mailbox import ClaudePlatformVerification
 import register_claude_api
+
+
+def _persist_session_in_process(
+    output_dir,
+    email,
+    worker_index,
+    start_event,
+    result_queue,
+):
+    """Spawn-safe writer that widens the process-local index race."""
+    import common.claude_platform_session as session
+
+    real_write = session._write_fsynced
+
+    def slow_index_write(path, payload):
+        if Path(path).name.startswith(".accounts.jsonl."):
+            time.sleep(0.1)
+        return real_write(path, payload)
+
+    session._write_fsynced = slow_index_write
+    start_event.wait(timeout=5)
+    try:
+        path = session._persist_claude_platform_session(
+            [{
+                "name": "session",
+                "value": f"cookie-{worker_index}",
+                "domain": ".claude.com",
+            }],
+            email,
+            output_dir,
+        )
+        result_queue.put(("ok", path.name))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
+def _crash_session_before_index_replace(output_dir):
+    import common.claude_platform_session as session
+
+    real_write = session._write_fsynced
+
+    def crash_after_index_temp_is_durable(path, payload):
+        real_write(path, payload)
+        if Path(path).name.startswith(".accounts.jsonl."):
+            os._exit(23)
+
+    session._write_fsynced = crash_after_index_temp_is_durable
+    session._persist_claude_platform_session(
+        [{"name": "session", "value": "cookie", "domain": ".claude.com"}],
+        "crash@example.com",
+        output_dir,
+    )
 
 
 class FakeLocator:
@@ -969,18 +1024,23 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         write_barrier = threading.Barrier(worker_count)
         writer_threads = set()
         writer_threads_lock = threading.Lock()
-        real_write_text = Path.write_text
+        import common.claude_platform_session as session
 
-        def synchronized_cookie_write(path, *args, **kwargs):
+        real_write_fsynced = session._write_fsynced
+
+        def synchronized_cookie_write(path, payload):
+            path = Path(path)
             if path.name.startswith(".full_") and path.name.endswith(".tmp"):
                 with writer_threads_lock:
                     writer_threads.add(threading.get_ident())
                 write_barrier.wait(timeout=0.5)
-            return real_write_text(path, *args, **kwargs)
+            return real_write_fsynced(path, payload)
 
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "cookies" / "claude_api"
-            with patch.object(Path, "write_text", synchronized_cookie_write):
+            with patch.object(
+                session, "_write_fsynced", synchronized_cookie_write
+            ):
                 paths = await asyncio.gather(*(
                     register_claude_api.save_claude_platform_session(
                         context,
@@ -1013,18 +1073,115 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 for record in records
             ))
 
+    def test_multiprocess_session_writers_preserve_every_durable_record(self):
+        context = multiprocessing.get_context("spawn")
+        start_event = context.Event()
+        result_queue = context.Queue()
+        worker_count = 5
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            workers = [
+                context.Process(
+                    target=_persist_session_in_process,
+                    args=(
+                        str(output_dir),
+                        "person@example.com",
+                        index,
+                        start_event,
+                        result_queue,
+                    ),
+                )
+                for index in range(worker_count)
+            ]
+            for worker in workers:
+                worker.start()
+            start_event.set()
+            results = [result_queue.get(timeout=10) for _worker in workers]
+            for worker in workers:
+                worker.join(timeout=10)
+                self.assertEqual(worker.exitcode, 0)
+
+            self.assertTrue(all(result[0] == "ok" for result in results), results)
+            records = [
+                json.loads(line)
+                for line in (output_dir / "accounts.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(len(records), worker_count)
+            self.assertEqual(
+                len({record["cookie_file"] for record in records}),
+                worker_count,
+            )
+            self.assertEqual(
+                {record["cookie_file"] for record in records},
+                {result[1] for result in results},
+            )
+            self.assertTrue(all(
+                (output_dir / record["cookie_file"]).is_file()
+                for record in records
+            ))
+            index_text = (output_dir / "accounts.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("person@example.com", index_text)
+            self.assertNotIn("cookie-", index_text)
+
+    def test_crashed_writer_never_publishes_a_missing_cookie_reference(self):
+        context = multiprocessing.get_context("spawn")
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            worker = context.Process(
+                target=_crash_session_before_index_replace,
+                args=(str(output_dir),),
+            )
+            worker.start()
+            worker.join(timeout=10)
+            self.assertEqual(worker.exitcode, 23)
+
+            index = output_dir / "accounts.jsonl"
+            records = [] if not index.exists() else [
+                json.loads(line)
+                for line in index.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(all(
+                (output_dir / record["cookie_file"]).is_file()
+                for record in records
+            ))
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not portable on Windows")
+    def test_cookie_and_index_files_are_owner_only(self):
+        from common.claude_platform_session import (
+            _persist_claude_platform_session,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            cookie = _persist_claude_platform_session(
+                [{"name": "session", "value": "secret", "domain": ".claude.com"}],
+                "person@example.com",
+                output_dir,
+            )
+            index = output_dir / "accounts.jsonl"
+
+            self.assertEqual(stat.S_IMODE(cookie.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(index.stat().st_mode), 0o600)
+
     async def test_interrupted_cookie_write_removes_partial_temp_and_final_files(self):
         context = FakeBrowserContext([
             {"name": "session", "value": "cookie", "domain": ".claude.com"},
         ])
 
-        def partial_write(path, *_args, **_kwargs):
-            path.write_bytes(b"partial-cookie-secret")
+        def partial_write(path, _payload):
+            Path(path).write_bytes(b"partial-cookie-secret")
             raise OSError("interrupted cookie write")
 
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "cookies" / "claude_api"
-            with patch.object(Path, "write_text", partial_write):
+            with patch(
+                "common.claude_platform_session._write_fsynced",
+                side_effect=partial_write,
+            ):
                 with self.assertRaises(OSError):
                     await register_claude_api.save_claude_platform_session(
                         context,

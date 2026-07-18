@@ -1,8 +1,11 @@
 import os
+import multiprocessing
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from common.claude_email_accounts import (
     AccountFormatError,
@@ -14,6 +17,34 @@ from common.claude_email_accounts import (
 
 NINEMALL_ROW = "person@example.com----MailboxPass1!----client-guid----refresh-secret"
 OUTLOOK_ROW = "legacy@example.com----MailboxPass2!----refresh-old----client-old"
+
+
+def _reserve_shared_in_process(root_dir, source_file, start_event, result_queue):
+    """Spawn-safe worker that deliberately widens the pre-append race window."""
+    from common.claude_email_accounts import (
+        ClaudeEmailAccountStore,
+        reserve_shared_claude_account,
+    )
+
+    real_load = ClaudeEmailAccountStore._load_accounts
+
+    def slow_load(self, limit=None):
+        accounts = real_load(self, limit=limit)
+        time.sleep(0.1)
+        return accounts
+
+    ClaudeEmailAccountStore._load_accounts = slow_load
+    start_event.wait(timeout=5)
+    try:
+        reserved = reserve_shared_claude_account(
+            "OUTLOOK",
+            ("claude", "claude_api"),
+            source_file,
+            root_dir,
+        )
+        result_queue.put(reserved[0].email if reserved is not None else None)
+    except BaseException as exc:
+        result_queue.put((type(exc).__name__, str(exc)))
 
 
 class ClaudeEmailAccountStoreTests(unittest.TestCase):
@@ -97,6 +128,31 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         ):
             self.assertNotIn(credential, used_state)
             self.assertNotIn(credential, state)
+
+    def test_outlook_address_can_be_used_once_for_each_claude_purpose(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        claude = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude"
+        )
+        claude_account = claude.reserve_one()
+        claude.mark_used(claude_account)
+
+        claude_api = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        )
+        api_account = claude_api.reserve_one()
+
+        self.assertEqual(api_account.email, claude_account.email)
+        self.assertIn(
+            "MailboxPass2!",
+            (self.root / "emails_used.txt").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "MailboxPass2!",
+            (self.root / "emails_used_claude_api.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     def test_outlook_claude_api_release_allows_reselection(self):
         source = self.write("emails.txt", OUTLOOK_ROW + "\n")
@@ -199,6 +255,85 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             accounts = list(pool.map(lambda _i: store.reserve_one(), range(8)))
         self.assertEqual(len({account.email for account in accounts}), 8)
+
+    def test_shared_reservation_is_atomic_across_processes(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        context = multiprocessing.get_context("spawn")
+        start_event = context.Event()
+        result_queue = context.Queue()
+        workers = [
+            context.Process(
+                target=_reserve_shared_in_process,
+                args=(str(self.root), str(source), start_event, result_queue),
+            )
+            for _index in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        start_event.set()
+        results = [result_queue.get(timeout=10) for _worker in workers]
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertEqual(worker.exitcode, 0)
+
+        self.assertEqual(results.count("legacy@example.com"), 1)
+        self.assertEqual(results.count(None), 3)
+        for purpose in ("claude", "claude_api"):
+            ledger = ClaudeEmailAccountStore(
+                "OUTLOOK", source, self.root, purpose=purpose
+            ).used_file
+            reservations = [
+                line for line in ledger.read_text(encoding="utf-8").splitlines()
+                if line.endswith("----reserved")
+            ]
+            self.assertEqual(len(reservations), 1)
+
+    def test_shared_reservation_rolls_back_every_ledger_on_second_write_failure(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        claude_store = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude"
+        )
+        api_store = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        )
+        claude_store.used_file.write_text(
+            "prior@example.com----PriorPass1!----released\n",
+            encoding="utf-8",
+        )
+        api_store.used_file.write_text(
+            "prior@example.com----released\n",
+            encoding="utf-8",
+        )
+        before = {
+            claude_store.used_file: claude_store.used_file.read_bytes(),
+            api_store.used_file: api_store.used_file.read_bytes(),
+        }
+        real_append = ClaudeEmailAccountStore._append_state
+        append_calls = 0
+
+        def fail_second_append(store, path, selected, status):
+            nonlocal append_calls
+            append_calls += 1
+            if append_calls == 2:
+                raise OSError("injected second-ledger failure")
+            return real_append(store, path, selected, status)
+
+        with patch.object(
+            ClaudeEmailAccountStore,
+            "_append_state",
+            fail_second_append,
+        ):
+            with self.assertRaisesRegex(OSError, "second-ledger"):
+                reserve_shared_claude_account(
+                    "OUTLOOK",
+                    ("claude", "claude_api"),
+                    source,
+                    self.root,
+                )
+
+        for path, original in before.items():
+            self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.root / ".claude_email_pool.journal").exists())
 
     def test_nonpositive_limit_returns_empty_without_state_writes(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")
