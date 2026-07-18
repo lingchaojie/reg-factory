@@ -5,6 +5,8 @@ from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from nexacard_otp.errors import NexaCardPageError, NexaCardTransientError, OtpLookupTimedOut
 from nexacard_otp.lookup import OtpLookupService, VerificationPage
 from nexacard_otp.models import CardType, LookupInput, OtpRow
@@ -79,6 +81,8 @@ class _RoutePage:
             url="https://admin.jushipay.com/api/verify/code/list",
             finished=AsyncMock(return_value=None),
         )
+        self.evaluate = AsyncMock(return_value=5)
+        self.wait_for_function = AsyncMock()
 
     def locator(self, selector):
         if selector == "input[placeholder='请输入卡号']":
@@ -103,6 +107,8 @@ class _SettlePage:
         self.loading = _CountLocator()
         self.active = _CountLocator()
         self.table = _CountLocator()
+        self.url = "https://www.nexacardvcc.com/#/nova-v-card-b/verify-code"
+        self.wait_for_function = AsyncMock()
 
     def locator(self, selector):
         if selector == ".el-loading-mask":
@@ -111,6 +117,8 @@ class _SettlePage:
             return self.active
         if selector == "table tbody":
             return self.table
+        if selector == 'input[placeholder="请输入用户名"]':
+            return _CountLocator()
         raise AssertionError(selector)
 
 
@@ -170,6 +178,29 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
                 page.search_button.click.assert_awaited_once()
                 page.response.finished.assert_awaited_once()
 
+    async def test_query_marker_is_installed_after_fill_and_before_the_search_click(self):
+        page = _RoutePage()
+        trace = []
+
+        async def evaluate(_script):
+            trace.append("marker")
+            return 11
+
+        async def click():
+            trace.append("click")
+
+        async def fill(_value):
+            trace.append("fill")
+
+        page.evaluate.side_effect = evaluate
+        page.search_button.click.side_effect = click
+        page.card_input.fill.side_effect = fill
+        reader = VerificationPage()
+        reader._settle_rows = AsyncMock(return_value=[])
+        await reader.search_rows(page, self.lookup_b, self.settings)
+        self.assertEqual(trace, ["fill", "marker", "click"])
+        self.assertEqual(reader._settle_rows.await_args.kwargs["query_marker"], 11)
+
     async def test_hash_login_route_signals_logout(self):
         page = _RoutePage("https://www.nexacardvcc.com/#/login")
         with self.assertRaises(PermissionError):
@@ -190,6 +221,16 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(VerificationPage._is_verify_response(Mock(url="https://evil.invalid/api/verify/code/list")))
         self.assertFalse(VerificationPage._is_verify_response(Mock(url="http://admin.jushipay.com/api/verify/code/list")))
         self.assertFalse(VerificationPage._is_verify_response(Mock(url="https://admin.jushipay.com/api/other")))
+
+    async def test_response_body_that_never_finishes_becomes_a_bounded_transient_error(self):
+        page = _RoutePage()
+        page.response.finished = AsyncMock(side_effect=asyncio.Event().wait)
+        with patch("nexacard_otp.lookup.RESPONSE_FINISHED_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaises(NexaCardTransientError):
+                await asyncio.wait_for(
+                    VerificationPage()._click_and_wait_for_query(page, page.search_button),
+                    timeout=0.2,
+                )
 
     async def test_empty_table_placeholder_is_an_empty_result(self):
         page = _TablePage([_CellRow(["暂无数据"])])
@@ -224,6 +265,44 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(NexaCardPageError):
                 await reader._settle_rows(_SettlePage(), self.settings, previous_signature=reader._page_signature(old))
         self.assertLessEqual(reader._current_rows.await_count, 4)
+
+    async def test_query_marker_allows_same_rows_after_this_query_mutates_the_page(self):
+        same = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(return_value=same)
+        page = _SettlePage()
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
+            rows = await reader._settle_rows(page, self.settings, query_marker=7)
+        self.assertEqual(rows, same)
+        page.wait_for_function.assert_awaited_once()
+
+    async def test_query_marker_allows_an_empty_result_after_this_query_mutates_the_page(self):
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(return_value=[])
+        page = _SettlePage()
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
+            rows = await reader._settle_rows(page, self.settings, query_marker=7)
+        self.assertEqual(rows, [])
+        page.wait_for_function.assert_awaited_once()
+
+    async def test_missing_query_mutation_becomes_a_bounded_transient_error(self):
+        page = _SettlePage()
+        page.wait_for_function.side_effect = PlaywrightTimeoutError("timed out")
+        with self.assertRaises(NexaCardTransientError):
+            await VerificationPage()._settle_rows(page, self.settings, query_marker=7)
+
+    async def test_settle_detects_delayed_hash_logout_before_parsing_rows(self):
+        page = _SettlePage()
+
+        async def mutation(*_args, **_kwargs):
+            page.url = "https://www.nexacardvcc.com/#/login"
+
+        page.wait_for_function.side_effect = mutation
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(return_value=[])
+        with self.assertRaises(PermissionError):
+            await reader._settle_rows(page, self.settings, query_marker=7)
+        reader._current_rows.assert_not_awaited()
 
     async def test_missing_or_disabled_next_ends_pagination(self):
         for next_button in (_CountLocator(), _CountLocator(1, disabled=True)):

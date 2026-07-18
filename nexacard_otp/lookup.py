@@ -29,7 +29,35 @@ MAX_AUTH_CHECKS = 2
 DOM_SETTLE_CHECKS = 4
 DOM_SETTLE_INTERVAL_SECONDS = 0.05
 DOM_SETTLE_TIMEOUT_MS = 1_000
+RESPONSE_FINISHED_TIMEOUT_SECONDS = 5.0
 _OTP_PATTERN = re.compile(r"\d{6}\Z")
+
+_QUERY_MARKER_KEY = "__nexacardOtpQueryMarker"
+QUERY_MARKER_INSTALL_SCRIPT = f"""
+() => {{
+  const key = {_QUERY_MARKER_KEY!r};
+  const root = document.documentElement;
+  let marker = window[key];
+  if (!marker || marker.root !== root) {{
+    marker = {{ root, generation: 0 }};
+    marker.observer = new MutationObserver(() => {{ marker.generation += 1; }});
+    marker.observer.observe(root, {{ childList: true, subtree: true, attributes: true, characterData: true }});
+    window[key] = marker;
+  }}
+  return marker.generation;
+}}
+"""
+QUERY_MARKER_ADVANCED_SCRIPT = f"""
+(generation) => {{
+  const marker = window[{_QUERY_MARKER_KEY!r}];
+  const loading = document.querySelector({LOADING_MASK!r});
+  const loggedOut = location.hash.split('?', 1)[0] === '#/login'
+    || Boolean(document.querySelector({USERNAME_INPUT!r}));
+  const loadingVisible = loading && getComputedStyle(loading).display !== 'none'
+    && getComputedStyle(loading).visibility !== 'hidden';
+  return Boolean(loggedOut || (marker && marker.generation > generation && !loadingVisible));
+}}
+"""
 
 
 class VerificationPage:
@@ -61,13 +89,15 @@ class VerificationPage:
             async with page.expect_response(self._is_verify_response) as response_info:
                 await locator.click()
             response = await response_info.value
-            failure = await response.finished()
+            await asyncio.wait_for(
+                response.finished(), timeout=RESPONSE_FINISHED_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as exc:
+            raise NexaCardTransientError("NexaCard verification response did not finish") from exc
         except PlaywrightTimeoutError as exc:
             raise NexaCardTransientError("NexaCard verification request timed out") from exc
         except PlaywrightError as exc:
             raise NexaCardTransientError("NexaCard verification request failed temporarily") from exc
-        if failure:
-            raise NexaCardTransientError("NexaCard verification request failed temporarily")
 
         status = response.status
         if status in {401, 403}:
@@ -153,23 +183,54 @@ class VerificationPage:
         except PlaywrightError as exc:
             raise NexaCardPageError("NexaCard pagination state is unusable") from exc
 
+    async def _query_marker(self, page: Page) -> int:
+        """Install one observer per page document and snapshot it immediately before a query click."""
+        try:
+            marker = await page.evaluate(QUERY_MARKER_INSTALL_SCRIPT)
+            return int(marker)
+        except (TypeError, ValueError) as exc:
+            raise NexaCardPageError("NexaCard query marker is unusable") from exc
+        except PlaywrightError as exc:
+            raise NexaCardTransientError("NexaCard query marker could not be installed") from exc
+
+    async def _wait_for_query_marker(self, page: Page, marker: int) -> None:
+        try:
+            await page.wait_for_function(
+                QUERY_MARKER_ADVANCED_SCRIPT,
+                arg=marker,
+                timeout=DOM_SETTLE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError as exc:
+            if await self._is_logged_out(page):
+                raise PermissionError("NexaCard session is logged out") from exc
+            raise NexaCardTransientError("NexaCard verification result did not update") from exc
+        except PlaywrightError as exc:
+            raise NexaCardTransientError("NexaCard verification result could not be observed") from exc
+
     async def _settle_rows(
         self,
         page: Page,
         settings: Settings,
+        query_marker: int | None = None,
         previous_signature: tuple[tuple[int, str, str, datetime], ...] | None = None,
         previous_active_page: str | None = None,
     ) -> list[OtpRow]:
         """Wait briefly for Vue to finish rendering the response without accepting stale pages."""
         await self._wait_for_table_attached(page)
+        if query_marker is not None:
+            await self._wait_for_query_marker(page, query_marker)
         changed = previous_signature is None
         stable_signature: tuple[tuple[int, str, str, datetime], ...] | None = None
         stable_count = 0
         for check in range(DOM_SETTLE_CHECKS):
+            if await self._is_logged_out(page):
+                raise PermissionError("NexaCard session is logged out")
             if await self._loading_is_visible(page):
                 await asyncio.sleep(DOM_SETTLE_INTERVAL_SECONDS)
                 continue
             rows = await self._current_rows(page, settings)
+            if await self._is_logged_out(page):
+                raise PermissionError("NexaCard session is logged out")
             signature = self._page_signature(rows)
             active_page = await self._active_page(page)
             if not changed:
@@ -184,6 +245,8 @@ class VerificationPage:
                     stable_signature = signature
                     stable_count = 1
                 if stable_count >= 2:
+                    if await self._is_logged_out(page):
+                        raise PermissionError("NexaCard session is logged out")
                     return rows
             if check < DOM_SETTLE_CHECKS - 1:
                 await asyncio.sleep(DOM_SETTLE_INTERVAL_SECONDS)
@@ -208,11 +271,14 @@ class VerificationPage:
             raise NexaCardTransientError("NexaCard card search timed out") from exc
         except PlaywrightError as exc:
             raise NexaCardPageError("NexaCard card search form is unusable") from exc
+        query_marker = await self._query_marker(page)
         await self._click_and_wait_for_query(page, page.locator(SEARCH_BUTTON))
         if await self._is_logged_out(page):
             raise PermissionError("NexaCard session is logged out")
 
-        current_rows = await self._settle_rows(page, settings)
+        current_rows = await self._settle_rows(
+            page, settings, query_marker=query_marker
+        )
         rows: list[OtpRow] = []
         seen_signatures: set[tuple[tuple[int, str, str, datetime], ...]] = set()
         page_count = 0
@@ -236,12 +302,14 @@ class VerificationPage:
             except PlaywrightError as exc:
                 raise NexaCardPageError("NexaCard pagination control is unusable") from exc
 
+            query_marker = await self._query_marker(page)
             await self._click_and_wait_for_query(page, next_button)
             if await self._is_logged_out(page):
                 raise PermissionError("NexaCard session expired during pagination")
             current_rows = await self._settle_rows(
                 page,
                 settings,
+                query_marker=query_marker,
                 previous_signature=signature,
                 previous_active_page=active_page,
             )
