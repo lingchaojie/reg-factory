@@ -115,6 +115,9 @@ class ClaudeEmailAccountStore:
 
     def _blocked(self):
         terminal = set()
+        two_field_events = (
+            self.provider == "NINEMALL" or self.purpose == "claude_api"
+        )
         if self.error_file.exists():
             for raw in self.error_file.read_text(encoding="utf-8").splitlines():
                 value = raw.strip()
@@ -131,20 +134,22 @@ class ClaudeEmailAccountStore:
                 parts = [part.strip() for part in value.split("----")]
                 email = parts[0].lower()
                 released = (
-                    self.provider == "NINEMALL"
+                    two_field_events
                     and len(parts) == 2
                     and parts[1].lower() == "released"
                 ) or (
                     self.provider == "OUTLOOK"
+                    and self.purpose == "claude"
                     and len(parts) >= 3
                     and parts[-1].lower() == "released"
                 )
                 terminal_success = (
-                    self.provider == "NINEMALL"
+                    two_field_events
                     and len(parts) == 2
                     and parts[1].lower() == "ok"
                 ) or (
                     self.provider == "OUTLOOK"
+                    and self.purpose == "claude"
                     and len(parts) >= 3
                     and parts[-1].lower() == "ok"
                 )
@@ -165,7 +170,7 @@ class ClaudeEmailAccountStore:
     def _append_state(self, path, account, status):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            if self.provider == "OUTLOOK":
+            if self.provider == "OUTLOOK" and self.purpose == "claude":
                 handle.write(f"{account.email}----{account.password}----{status}\n")
             else:
                 handle.write(f"{account.email}----{status}\n")

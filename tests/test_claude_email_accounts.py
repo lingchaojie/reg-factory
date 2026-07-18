@@ -71,7 +71,7 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         self.assertEqual(account.email, "second@example.com")
         self.assertEqual(set(stores), {"claude", "claude_api"})
 
-    def test_outlook_claude_api_uses_separate_state_files(self):
+    def test_outlook_claude_api_state_files_exclude_mailbox_credentials(self):
         source = self.write("emails.txt", OUTLOOK_ROW + "\n")
         store = ClaudeEmailAccountStore(
             "OUTLOOK", source, self.root, purpose="claude_api"
@@ -85,7 +85,73 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         state = (self.root / "emails_error_claude_api.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("legacy@example.com----MailboxPass2!----mail_timeout", state)
+        used_state = (self.root / "emails_used_claude_api.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(used_state, "legacy@example.com----reserved\n")
+        self.assertEqual(state, "legacy@example.com----mail_timeout\n")
+        for credential in (
+            account.password,
+            account.client_id,
+            account.refresh_token,
+        ):
+            self.assertNotIn(credential, used_state)
+            self.assertNotIn(credential, state)
+
+    def test_outlook_claude_api_release_allows_reselection(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        store = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        )
+        account = store.reserve_one()
+
+        self.assertTrue(store.release(account))
+        state = (self.root / "emails_used_claude_api.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            state,
+            "legacy@example.com----reserved\nlegacy@example.com----released\n",
+        )
+
+        selected = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        ).reserve_one()
+        self.assertEqual(selected.email, account.email)
+
+    def test_outlook_claude_api_terminal_success_remains_blocked(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        store = ClaudeEmailAccountStore(
+            "OUTLOOK", source, self.root, purpose="claude_api"
+        )
+        account = store.reserve_one()
+        store.mark_used(account)
+
+        state = (self.root / "emails_used_claude_api.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            state,
+            "legacy@example.com----reserved\nlegacy@example.com----ok\n",
+        )
+        self.assertIsNone(
+            ClaudeEmailAccountStore(
+                "OUTLOOK", source, self.root, purpose="claude_api"
+            ).reserve_one()
+        )
+
+    def test_outlook_claude_ledger_retains_legacy_password_state_format(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        store = ClaudeEmailAccountStore("OUTLOOK", source, self.root)
+        account = store.reserve_one()
+        store.mark_used(account)
+
+        state = (self.root / "emails_used.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            state,
+            "legacy@example.com----MailboxPass2!----reserved\n"
+            "legacy@example.com----MailboxPass2!----ok\n",
+        )
 
     def test_ninemail_column_order(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")
