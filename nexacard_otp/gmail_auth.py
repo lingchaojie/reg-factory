@@ -114,8 +114,22 @@ def _metadata_expiry(metadata: dict[str, object]) -> datetime | None:
         return None
 
 
+def _sanitize_metadata() -> dict[str, object]:
+    metadata = _load_safe_metadata()
+    if PRIVATE_TOKEN_META_PATH.is_file():
+        atomic_write_text(
+            PRIVATE_TOKEN_META_PATH,
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+        )
+    return metadata
+
+
 def get_auth_status(expected_email: str = "") -> AuthStatus:
     """Return a safe Gmail authorization status without reading token fields into metadata."""
+    try:
+        metadata = _sanitize_metadata()
+    except OSError:
+        return AuthStatus("unknown", "Gmail authorization metadata is temporarily unavailable")
     try:
         credentials = load_valid_credentials()
         authorized_email = _profile_email(credentials)
@@ -124,7 +138,6 @@ def get_auth_status(expected_email: str = "") -> AuthStatus:
     except GmailTemporarilyUnavailable as exc:
         return AuthStatus("unknown", str(exc))
 
-    metadata = _load_safe_metadata()
     updated_metadata = dict(metadata)
     updated_metadata["authorized_email"] = authorized_email
     atomic_write_text(

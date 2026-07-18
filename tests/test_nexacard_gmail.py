@@ -69,6 +69,26 @@ class NexaCardGmailTests(unittest.TestCase):
 
         self.assertIsNone(parse_login_code(_encoded(raw), RECEIVED_MS, SENT_AFTER))
 
+    def test_parser_ignores_filename_parts_without_attachment_disposition(self):
+        message_prefix = (
+            b"From: NexaCardVCC <jushihui@mail.jushipay.com>\n"
+            b"Subject: NexaCard Verification Code\nMIME-Version: 1.0\n"
+        )
+        parts = (
+            b"Content-Type: text/plain; name=legacy-code.txt\n\n123456789",
+            b"Content-Type: text/plain\nContent-Disposition: inline; filename=inline-code.txt\n\n123456789",
+        )
+
+        for part in parts:
+            with self.subTest(part=part):
+                self.assertIsNone(parse_login_code(_encoded(message_prefix + part), RECEIVED_MS, SENT_AFTER))
+
+    def test_naive_sent_after_is_rejected_without_using_host_timezone(self):
+        raw = Path("tests/fixtures/nexacard_verification_code.eml").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            parse_login_code(_encoded(raw), RECEIVED_MS, SENT_AFTER.replace(tzinfo=None))
+
     def test_expired_access_token_refreshes_and_is_rewritten(self):
         credentials = Mock(valid=False, expired=True, refresh_token="refresh", to_json=Mock(return_value='{"token":"new"}'))
         with tempfile.TemporaryDirectory() as directory:
@@ -169,6 +189,49 @@ class NexaCardGmailTests(unittest.TestCase):
             "nexacard_otp.gmail_auth.build", return_value=profile
         ):
             self.assertEqual(get_auth_status("owner@example.com").state, "unknown")
+
+    def test_temporary_profile_failure_still_removes_token_fields_from_metadata(self):
+        credentials = Mock()
+        profile = Mock()
+        profile.users().getProfile().execute.side_effect = OSError("offline")
+        with tempfile.TemporaryDirectory() as directory:
+            meta_path = Path(directory) / "token.meta.json"
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "authorized_email": "owner@example.com",
+                        "access_token": "must-not-survive",
+                        "refresh_token": "must-not-survive",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", meta_path
+            ), patch("nexacard_otp.gmail_auth.build", return_value=profile):
+                status = get_auth_status("owner@example.com")
+
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(status.state, "unknown")
+            self.assertEqual(metadata, {"authorized_email": "owner@example.com"})
+
+    def test_second_profile_http_failure_remains_unknown_after_one_refresh(self):
+        for retry_status in (401, 503):
+            with self.subTest(retry_status=retry_status), tempfile.TemporaryDirectory() as directory:
+                credentials = Mock(to_json=Mock(return_value="{}"))
+                first_profile = Mock()
+                first_profile.users().getProfile().execute.side_effect = HttpError(Mock(status=401), b"unauthorized")
+                retry_profile = Mock()
+                retry_profile.users().getProfile().execute.side_effect = HttpError(
+                    Mock(status=retry_status), b"unavailable"
+                )
+                with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
+                    "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", Path(directory) / "token.json"
+                ), patch("nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", Path(directory) / "token.meta.json"), patch(
+                    "nexacard_otp.gmail_auth.build", side_effect=[first_profile, retry_profile]
+                ):
+                    self.assertEqual(get_auth_status("owner@example.com").state, "unknown")
+                credentials.refresh.assert_called_once()
 
     def test_temporary_gmail_failure_is_retried_inside_bounded_mail_poll(self):
         reader = GmailCodeReader()

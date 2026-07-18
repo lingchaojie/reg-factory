@@ -26,6 +26,8 @@ def _decode(raw: str) -> bytes:
 
 def parse_login_code(raw_message: str, internal_date_ms: int, sent_after: datetime) -> str | None:
     """Return a fresh NexaCard code only from the expected MIME message body."""
+    if sent_after.tzinfo is None or sent_after.utcoffset() is None:
+        raise ValueError("sent_after must be timezone-aware")
     received = datetime.fromtimestamp(internal_date_ms / 1000, tz=timezone.utc)
     if received <= sent_after.astimezone(timezone.utc):
         return None
@@ -45,7 +47,11 @@ def parse_login_code(raw_message: str, internal_date_ms: int, sent_after: dateti
 
     bodies: list[str] = []
     for part in message.walk():
-        if part.is_multipart() or part.get_content_disposition() == "attachment":
+        if (
+            part.is_multipart()
+            or part.get_content_disposition() == "attachment"
+            or part.get_filename() is not None
+        ):
             continue
         if part.get_content_type() not in {"text/plain", "text/html"}:
             continue
