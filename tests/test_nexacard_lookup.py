@@ -42,6 +42,21 @@ class _CountLocator:
         return self._disabled
 
 
+class _ResponseContext:
+    def __init__(self, response):
+        self.value = self._response_value(response)
+
+    @staticmethod
+    async def _response_value(response):
+        return response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+
 class _TablePage:
     def __init__(self, rows):
         self.rows = rows
@@ -57,8 +72,13 @@ class _RoutePage:
         self.url = url
         self.goto = AsyncMock()
         self.card_input = Mock(fill=AsyncMock())
-        self.search_button = Mock()
+        self.search_button = Mock(click=AsyncMock())
         self.next_button = _CountLocator()
+        self.response = Mock(
+            status=200,
+            url="https://admin.jushipay.com/api/verify/code/list",
+            finished=AsyncMock(return_value=None),
+        )
 
     def locator(self, selector):
         if selector == "input[placeholder='请输入卡号']":
@@ -67,8 +87,30 @@ class _RoutePage:
             return self.search_button
         if selector == ".el-pagination .btn-next":
             return self.next_button
+        if selector == ".el-pagination .number.active":
+            return _CountLocator()
         if selector == 'input[placeholder="请输入用户名"]':
             return _CountLocator()
+        raise AssertionError(selector)
+
+    def expect_response(self, predicate):
+        self.response_predicate = predicate
+        return _ResponseContext(self.response)
+
+
+class _SettlePage:
+    def __init__(self):
+        self.loading = _CountLocator()
+        self.active = _CountLocator()
+        self.table = _CountLocator()
+
+    def locator(self, selector):
+        if selector == ".el-loading-mask":
+            return self.loading
+        if selector == ".el-pagination .number.active":
+            return self.active
+        if selector == "table tbody":
+            return self.table
         raise AssertionError(selector)
 
 
@@ -121,16 +163,67 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
         for lookup, route in ((self.lookup_b, "/nova-v-card-b/verify-code"), (self.lookup_3d, "/3d-1-card/verify-code")):
             with self.subTest(route=route):
                 page = _RoutePage()
-                reader._click_and_wait_for_query = AsyncMock()
-                reader._current_rows = AsyncMock(return_value=[])
+                reader._settle_rows = AsyncMock(return_value=[])
                 await reader.search_rows(page, lookup, self.settings)
                 self.assertTrue(page.goto.await_args.args[0].endswith(route))
                 page.card_input.fill.assert_awaited_once_with(lookup.card_number)
+                page.search_button.click.assert_awaited_once()
+                page.response.finished.assert_awaited_once()
 
     async def test_hash_login_route_signals_logout(self):
         page = _RoutePage("https://www.nexacardvcc.com/#/login")
         with self.assertRaises(PermissionError):
             await VerificationPage().search_rows(page, self.lookup_b, self.settings)
+
+    async def test_search_rechecks_hash_logout_after_successful_query_before_reading_rows(self):
+        page = _RoutePage()
+        page.search_button.click.side_effect = lambda: setattr(page, "url", "https://www.nexacardvcc.com/#/login")
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(return_value=[])
+        with self.assertRaises(PermissionError):
+            await reader.search_rows(page, self.lookup_b, self.settings)
+        reader._current_rows.assert_not_awaited()
+        page.response.finished.assert_awaited_once()
+
+    async def test_verify_response_requires_the_confirmed_https_admin_origin_and_prefix(self):
+        self.assertTrue(VerificationPage._is_verify_response(Mock(url="https://admin.jushipay.com/api/verify/code/list")))
+        self.assertFalse(VerificationPage._is_verify_response(Mock(url="https://evil.invalid/api/verify/code/list")))
+        self.assertFalse(VerificationPage._is_verify_response(Mock(url="http://admin.jushipay.com/api/verify/code/list")))
+        self.assertFalse(VerificationPage._is_verify_response(Mock(url="https://admin.jushipay.com/api/other")))
+
+    async def test_empty_table_placeholder_is_an_empty_result(self):
+        page = _TablePage([_CellRow(["暂无数据"])])
+        self.assertEqual(await VerificationPage()._current_rows(page, self.settings), [])
+
+    async def test_initial_settle_waits_for_a_short_stable_table_after_the_response(self):
+        stale = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
+        fresh = [OtpRow(2, "234567", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 2, tzinfo=self.zone))]
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(side_effect=[stale, fresh, fresh])
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()) as sleep:
+            rows = await reader._settle_rows(_SettlePage(), self.settings)
+        self.assertEqual(rows, fresh)
+        self.assertEqual(reader._current_rows.await_count, 3)
+        self.assertGreaterEqual(sleep.await_count, 1)
+
+    async def test_pagination_settle_requires_a_changed_then_stable_table(self):
+        old = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
+        fresh = [OtpRow(2, "234567", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 2, tzinfo=self.zone))]
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(side_effect=[old, old, fresh, fresh])
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
+            rows = await reader._settle_rows(_SettlePage(), self.settings, previous_signature=reader._page_signature(old))
+        self.assertEqual(rows, fresh)
+        self.assertEqual(reader._current_rows.await_count, 4)
+
+    async def test_pagination_dom_that_never_changes_fails_with_a_bounded_page_error(self):
+        old = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
+        reader = VerificationPage()
+        reader._current_rows = AsyncMock(return_value=old)
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(NexaCardPageError):
+                await reader._settle_rows(_SettlePage(), self.settings, previous_signature=reader._page_signature(old))
+        self.assertLessEqual(reader._current_rows.await_count, 4)
 
     async def test_missing_or_disabled_next_ends_pagination(self):
         for next_button in (_CountLocator(), _CountLocator(1, disabled=True)):
@@ -139,27 +232,28 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
                 page.next_button = next_button
                 reader = VerificationPage()
                 reader._click_and_wait_for_query = AsyncMock()
-                reader._current_rows = AsyncMock(return_value=[])
+                reader._settle_rows = AsyncMock(return_value=[])
                 self.assertEqual(await reader.search_rows(page, self.lookup_b, self.settings), [])
-                self.assertEqual(reader._current_rows.await_count, 1)
+                self.assertEqual(reader._settle_rows.await_count, 1)
 
     async def test_pagination_reads_all_pages_and_requires_progress(self):
         page = _RoutePage()
-        page.next_button = _CountLocator(1, disabled=False)
+        page.next_button = Mock(count=AsyncMock(return_value=1), is_disabled=AsyncMock(return_value=False), click=AsyncMock())
         reader = VerificationPage(max_pages=2)
         page_one = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
         page_two = [OtpRow(2, "234567", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 2, tzinfo=self.zone))]
 
-        async def rows_with_progress(_page, _settings):
-            if reader._current_rows.await_count == 2:
-                page.next_button = _CountLocator(1, disabled=True)
+        async def rows_with_progress(_page, _settings, **_kwargs):
+            if reader._settle_rows.await_count == 2:
+                page.next_button.is_disabled.return_value = True
                 return page_two
             return page_one
 
-        reader._current_rows = AsyncMock(side_effect=rows_with_progress)
-        reader._click_and_wait_for_query = AsyncMock()
+        reader._settle_rows = AsyncMock(side_effect=rows_with_progress)
         await reader.search_rows(page, self.lookup_b, self.settings)
-        self.assertEqual(reader._current_rows.await_count, 2)
+        self.assertEqual(reader._settle_rows.await_count, 2)
+        page.next_button.click.assert_awaited_once()
+        self.assertEqual(page.response.finished.await_count, 2)
 
     async def test_pagination_safety_bound_prevents_unbounded_loop(self):
         page = _RoutePage()
@@ -167,15 +261,27 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
         reader = VerificationPage(max_pages=1)
         counter = 0
 
-        async def distinct_rows(_page, _settings):
+        async def distinct_rows(_page, _settings, **_kwargs):
             nonlocal counter
             counter += 1
             return [OtpRow(counter, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, counter, tzinfo=self.zone))]
 
-        reader._current_rows = AsyncMock(side_effect=distinct_rows)
+        reader._settle_rows = AsyncMock(side_effect=distinct_rows)
         reader._click_and_wait_for_query = AsyncMock()
         with self.assertRaises(NexaCardPageError):
             await reader.search_rows(page, self.lookup_b, self.settings)
+
+    async def test_pagination_rejects_a_non_adjacent_repeated_page_signature(self):
+        page = _RoutePage()
+        page.next_button = _CountLocator(1, disabled=False)
+        first = [OtpRow(1, "123456", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 1, tzinfo=self.zone))]
+        second = [OtpRow(2, "234567", self.lookup_b.card_number, datetime(2026, 7, 19, 3, 0, 2, tzinfo=self.zone))]
+        reader = VerificationPage()
+        reader._settle_rows = AsyncMock(side_effect=[first, second, first])
+        reader._click_and_wait_for_query = AsyncMock()
+        with self.assertRaises(NexaCardPageError):
+            await reader.search_rows(page, self.lookup_b, self.settings)
+        self.assertEqual(reader._settle_rows.await_count, 3)
 
     async def test_query_status_maps_auth_to_logout_transient_and_unusable_to_page_error(self):
         reader = VerificationPage()
@@ -184,20 +290,8 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status):
                 page = Mock()
                 response = Mock(status=status, url="https://admin.jushipay.com/api/verify/code/list")
-                class Context:
-                    def __init__(self):
-                        self.value = self._response_value()
-
-                    async def _response_value(self):
-                        return response
-
-                    async def __aenter__(self):
-                        return self
-
-                    async def __aexit__(self, *args):
-                        return None
-
-                context = Context()
+                response.finished = AsyncMock(return_value=None)
+                context = _ResponseContext(response)
                 page.expect_response.return_value = context
                 locator.click = AsyncMock()
                 if expected is NexaCardPageError:
@@ -247,6 +341,22 @@ class OtpLookupServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(NexaCardPageError) as caught:
             await OtpLookupService(_Manager(), AsyncMock(), reader).lookup(self.lookup, self.settings)
         self.assertNotIn(self.lookup.card_number, str(caught.exception))
+
+    async def test_auth_check_false_does_not_spend_real_recovery_budget(self):
+        reader = AsyncMock(search_rows=AsyncMock(side_effect=[PermissionError(), PermissionError(), []]))
+        login = AsyncMock(ensure_authenticated=AsyncMock(side_effect=[False, True]))
+        with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(OtpLookupTimedOut):
+                await OtpLookupService(_Manager(), login, reader).lookup(self.lookup, Mock(max_attempts=1, poll_interval_seconds=0.25))
+        self.assertEqual(login.ensure_authenticated.await_count, 2)
+        self.assertEqual(reader.search_rows.await_count, 3)
+
+    async def test_repeated_false_auth_checks_are_bounded(self):
+        reader = AsyncMock(search_rows=AsyncMock(side_effect=PermissionError()))
+        login = AsyncMock(ensure_authenticated=AsyncMock(return_value=False))
+        with self.assertRaises(NexaCardPageError):
+            await OtpLookupService(_Manager(), login, reader).lookup(self.lookup, Mock(max_attempts=1, poll_interval_seconds=0.25))
+        self.assertLessEqual(login.ensure_authenticated.await_count, 3)
 
     async def test_two_transient_retries_do_not_consume_and_third_fails(self):
         manager = _Manager()
