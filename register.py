@@ -30,7 +30,11 @@ try:
 except Exception:
     proxy_switch = None
 from common import human_mouse as _hm
-from common.account_proxy import bitbrowser_proxy_fields, lease_from_env
+from common.account_proxy import (
+    bitbrowser_proxy_fields,
+    lease_from_env,
+    strip_http_proxy_env,
+)
 from common.ipmart_proxy import (
     IPMartProxyError,
     acquire_proxy,
@@ -107,6 +111,15 @@ def _pick_claude_node():
         node = proxy_switch.find_working_node(
             test_url="https://claude.ai/login", challenge_markers=markers, candidates=alln)
     return node
+
+
+def prepare_claude_network(
+    env=None, *, account_lease=None, ipmart_enabled=False
+):
+    env = os.environ if env is None else env
+    if account_lease is not None or ipmart_enabled:
+        strip_http_proxy_env(env)
+    return env
 
 
 def configure_claude_proxy(
@@ -3869,6 +3882,11 @@ async def main():
 
     inherited_lease = lease_from_env()
     ipmart_settings = settings_from_env()
+    prepare_claude_network(
+        os.environ,
+        account_lease=inherited_lease,
+        ipmart_enabled=ipmart_settings.enabled,
+    )
     configure_claude_proxy(
         args.node,
         inherited_lease,
