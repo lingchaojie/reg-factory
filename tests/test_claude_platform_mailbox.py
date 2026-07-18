@@ -1,12 +1,14 @@
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
+from urllib.parse import quote
 
 from common import claude_platform_mailbox
 from common.claude_platform_mailbox import (
     ClaudePlatformMessage,
     ClaudePlatformVerification,
     extract_claude_platform_verification,
+    validate_claude_platform_magic_link,
 )
 
 
@@ -18,6 +20,34 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
             received=received,
             body=body,
         )
+
+    def test_public_magic_link_validator_accepts_direct_and_safelink_targets(self):
+        direct = "https://platform.claude.com/magic-link?code=abc"
+        safelink = (
+            "https://nam01.safelinks.protection.outlook.com/?url="
+            + quote(direct, safe="")
+        )
+
+        self.assertEqual(validate_claude_platform_magic_link(direct), direct)
+        self.assertEqual(validate_claude_platform_magic_link(safelink), direct)
+
+    def test_public_magic_link_validator_rejects_noncanonical_boundaries(self):
+        invalid = (
+            "http://platform.claude.com/magic-link?code=abc",
+            "https://evil.example/magic-link?code=abc",
+            "https://platform.claude.com/not-magic-link?code=abc",
+            "https://platform.claude.com:444/magic-link?code=abc",
+            "https://user:pass@platform.claude.com/magic-link?code=abc",
+            "http://nam01.safelinks.protection.outlook.com/?url="
+            + quote("https://platform.claude.com/magic-link?code=abc", safe=""),
+            "https://evilsafelinks.protection.outlook.com/?url="
+            + quote("https://platform.claude.com/magic-link?code=abc", safe=""),
+            "https://nam01.safelinks.protection.outlook.com/?url=%ZZ",
+        )
+
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertEqual(validate_claude_platform_magic_link(value), "")
 
     def test_code_only_message_returns_code_without_waiting_for_link(self):
         result = extract_claude_platform_verification([

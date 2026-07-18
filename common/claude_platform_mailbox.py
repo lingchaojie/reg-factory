@@ -90,7 +90,7 @@ _CODE_PATTERNS = (
 )
 
 
-def _validated_platform_link(candidate, allow_safelink=True):
+def validate_claude_platform_magic_link(candidate, allow_safelink=True):
     value = unescape(str(candidate or "")).rstrip(".,);]")
     try:
         parsed = urlparse(value)
@@ -106,12 +106,22 @@ def _validated_platform_link(candidate, allow_safelink=True):
     ):
         if parsed.path == "/magic-link":
             return value
-    if allow_safelink and (parsed.hostname or "").endswith(
-        "safelinks.protection.outlook.com"
+    safelink_host = "safelinks.protection.outlook.com"
+    hostname = parsed.hostname or ""
+    if (
+        allow_safelink
+        and parsed.scheme == "https"
+        and (hostname == safelink_host or hostname.endswith("." + safelink_host))
+        and port is None
+        and parsed.username is None
+        and parsed.password is None
     ):
         wrapped = parse_qs(parsed.query).get("url", [""])[0]
         if wrapped:
-            return _validated_platform_link(unquote(wrapped), allow_safelink=False)
+            return validate_claude_platform_magic_link(
+                unquote(wrapped),
+                allow_safelink=False,
+            )
     return ""
 
 
@@ -142,7 +152,7 @@ def extract_claude_platform_verification(messages, received_after=None):
         combined = unescape(f"{message.subject} {message.body}")
         link = ""
         for candidate in _URL_RE.findall(combined):
-            link = _validated_platform_link(candidate)
+            link = validate_claude_platform_magic_link(candidate)
             if link:
                 break
         code = _verification_code(message.subject, message.body)
