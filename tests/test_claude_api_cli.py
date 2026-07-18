@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import io
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -674,6 +675,65 @@ class ClaudeApiClashProxyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
+    async def drain_background_tasks(self):
+        drain = getattr(register_claude_api, "_drain_retained_tasks", None)
+        if drain is not None:
+            await drain(0.1)
+            self.assertFalse(register_claude_api._RETAINED_BACKGROUND_TASKS)
+
+    async def test_cancellation_resistant_flow_is_detached_at_fixed_bound(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        cancellations = 0
+
+        async def resist_cancellation(*_args, **_kwargs):
+            nonlocal cancellations
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellations += 1
+            return "late-success.json"
+
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            side_effect=resist_cancellation,
+        ), patch.object(
+            register_claude_api, "EMERGENCY_TIMEOUT_CUSHION", 0.005
+        ), patch.object(
+            register_claude_api,
+            "TASK_CANCEL_GRACE",
+            0.005,
+            create=True,
+        ):
+            started_at = asyncio.get_running_loop().time()
+            registration = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=0.005
+                )
+            )
+            await started.wait()
+            done, _pending = await asyncio.wait(
+                {registration}, timeout=0.08
+            )
+            elapsed = asyncio.get_running_loop().time() - started_at
+            try:
+                self.assertIn(registration, done)
+                self.assertIsNone(registration.result())
+                self.assertLess(elapsed, 0.06)
+                self.assertGreaterEqual(cancellations, 2)
+                self.store.mark_error.assert_called_once_with(
+                    self.account, "timeout"
+                )
+            finally:
+                release.set()
+                if not registration.done():
+                    registration.cancel()
+                await asyncio.gather(registration, return_exceptions=True)
+                await self.drain_background_tasks()
+
     async def test_stuck_code_is_classified_before_emergency_timeout(self):
         page = FakePlatformPage(code_submit_target_state="code")
         self.context.pages = [page]
@@ -859,6 +919,168 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
 
         self.store.release.assert_called_once_with(self.account)
         self.assert_all_cleanup_attempted()
+
+    async def test_hung_browser_close_is_bounded_and_later_cleanup_runs(self):
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+        close_cancellations = 0
+
+        async def hung_close():
+            nonlocal close_cancellations
+            close_started.set()
+            while not close_release.is_set():
+                try:
+                    await close_release.wait()
+                except asyncio.CancelledError:
+                    close_cancellations += 1
+
+        self.browser.close.side_effect = hung_close
+        output = io.StringIO()
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ), patch.object(
+            register_claude_api,
+            "CLEANUP_OPERATION_TIMEOUT",
+            0.005,
+            create=True,
+        ), patch.object(
+            register_claude_api,
+            "TASK_CANCEL_GRACE",
+            0.005,
+            create=True,
+        ), redirect_stdout(output):
+            started_at = asyncio.get_running_loop().time()
+            registration = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=1
+                )
+            )
+            await close_started.wait()
+            done, _pending = await asyncio.wait(
+                {registration}, timeout=0.08
+            )
+            elapsed = asyncio.get_running_loop().time() - started_at
+            try:
+                self.assertIn(registration, done)
+                self.assertEqual(registration.result(), "cookies/session.json")
+                self.assertLess(elapsed, 0.06)
+                self.assertGreaterEqual(close_cancellations, 2)
+                self.bb.close_browser.assert_called_once_with("profile-a")
+                self.bb.delete_browser.assert_called_once_with("profile-a")
+                self.store.mark_used.assert_called_once_with(self.account)
+                self.assertIn("browser_cleanup_failed", output.getvalue())
+                self.assertNotIn("mail-pass", output.getvalue())
+            finally:
+                close_release.set()
+                if not registration.done():
+                    registration.cancel()
+                await asyncio.gather(registration, return_exceptions=True)
+                await self.drain_background_tasks()
+
+    async def test_hung_profile_close_is_bounded_and_delete_preserves_failure(self):
+        close_release = threading.Event()
+        timer = threading.Timer(0.15, close_release.set)
+        timer.start()
+
+        def hung_profile_close(_profile_id):
+            close_release.wait()
+
+        self.bb.close_browser.side_effect = hung_profile_close
+        output = io.StringIO()
+        try:
+            with self.playwright_patch(), patch.object(
+                register_claude_api,
+                "run_claude_platform_flow",
+                new=AsyncMock(
+                    side_effect=register_claude_api.ClaudeApiRegistrationError(
+                        "verification_rejected"
+                    )
+                ),
+            ), patch.object(
+                register_claude_api,
+                "CLEANUP_OPERATION_TIMEOUT",
+                0.005,
+                create=True,
+            ), patch.object(
+                register_claude_api,
+                "TASK_CANCEL_GRACE",
+                0.005,
+                create=True,
+            ), redirect_stdout(output):
+                started_at = time.monotonic()
+                result = await register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=1
+                )
+                elapsed = time.monotonic() - started_at
+
+            self.assertIsNone(result)
+            self.assertLess(elapsed, 0.08)
+            self.bb.delete_browser.assert_called_once_with("profile-a")
+            self.store.mark_error.assert_called_once_with(
+                self.account, "verification_rejected"
+            )
+            self.assertIn("profile_close_failed", output.getvalue())
+            self.assertNotIn("mail-pass", output.getvalue())
+        finally:
+            close_release.set()
+            timer.cancel()
+            timer.join(timeout=0.3)
+            await self.drain_background_tasks()
+
+    async def test_hung_profile_delete_is_bounded_and_preserves_cancellation(self):
+        delete_release = threading.Event()
+        timer = threading.Timer(0.15, delete_release.set)
+        timer.start()
+        flow_started = asyncio.Event()
+
+        def hung_profile_delete(_profile_id):
+            delete_release.wait()
+
+        async def blocked_flow(*_args, **_kwargs):
+            flow_started.set()
+            await asyncio.Future()
+
+        self.bb.delete_browser.side_effect = hung_profile_delete
+        output = io.StringIO()
+        try:
+            with self.playwright_patch(), patch.object(
+                register_claude_api,
+                "run_claude_platform_flow",
+                side_effect=blocked_flow,
+            ), patch.object(
+                register_claude_api,
+                "CLEANUP_OPERATION_TIMEOUT",
+                0.005,
+                create=True,
+            ), patch.object(
+                register_claude_api,
+                "TASK_CANCEL_GRACE",
+                0.005,
+                create=True,
+            ), redirect_stdout(output):
+                registration = asyncio.create_task(
+                    register_claude_api.register_one(
+                        self.bb, self.account, self.store, timeout=1
+                    )
+                )
+                await flow_started.wait()
+                started_at = time.monotonic()
+                registration.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await registration
+                elapsed = time.monotonic() - started_at
+
+            self.assertLess(elapsed, 0.08)
+            self.store.release.assert_called_once_with(self.account)
+            self.assertIn("profile_delete_failed", output.getvalue())
+            self.assertNotIn("mail-pass", output.getvalue())
+        finally:
+            delete_release.set()
+            timer.cancel()
+            timer.join(timeout=0.3)
+            await self.drain_background_tasks()
 
 
 class ClaudeApiMainBatchTests(unittest.IsolatedAsyncioTestCase):

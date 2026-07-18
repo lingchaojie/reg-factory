@@ -42,6 +42,10 @@ from config import (
 
 PLATFORM_URL = "https://platform.claude.com/"
 EMERGENCY_TIMEOUT_CUSHION = 5.0
+TASK_CANCEL_GRACE = 0.25
+CLEANUP_OPERATION_TIMEOUT = 5.0
+RETAINED_TASK_DRAIN_TIMEOUT = 0.25
+_RETAINED_BACKGROUND_TASKS = set()
 _CLAUDE_CHALLENGE_MARKERS = (
     "app-unavailable-in-region",
     "unavailable in your",
@@ -178,6 +182,81 @@ def _close_unawaited(awaitable):
     close = getattr(awaitable, "close", None)
     if close is not None:
         close()
+
+
+def _consume_background_task(task):
+    _RETAINED_BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+def _retain_background_task(task):
+    if task.done():
+        _consume_background_task(task)
+        return
+    _RETAINED_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_consume_background_task)
+
+
+async def _cancel_task_bounded(task, cancel_grace):
+    grace = max(0.0, float(cancel_grace))
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+        if task in done:
+            _consume_background_task(task)
+            return
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+        if task in done:
+            _consume_background_task(task)
+            return
+    except asyncio.CancelledError:
+        task.cancel()
+        _retain_background_task(task)
+        raise
+    _retain_background_task(task)
+
+
+async def _run_bounded(awaitable, timeout, *, cancel_grace=None):
+    if cancel_grace is None:
+        cancel_grace = TASK_CANCEL_GRACE
+    try:
+        task = asyncio.ensure_future(awaitable)
+    except BaseException:
+        _close_unawaited(awaitable)
+        raise
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=max(0.0, float(timeout))
+        )
+    except asyncio.CancelledError:
+        await _cancel_task_bounded(task, cancel_grace)
+        raise
+    if task in done:
+        return task.result()
+    await _cancel_task_bounded(task, cancel_grace)
+    raise asyncio.TimeoutError
+
+
+async def _drain_retained_tasks(timeout=RETAINED_TASK_DRAIN_TIMEOUT):
+    for task in tuple(_RETAINED_BACKGROUND_TASKS):
+        if task.done():
+            _consume_background_task(task)
+    tasks = {
+        task for task in _RETAINED_BACKGROUND_TASKS if not task.done()
+    }
+    if not tasks:
+        return
+    done, _pending = await asyncio.wait(
+        tasks, timeout=max(0.0, float(timeout))
+    )
+    for task in done:
+        _consume_background_task(task)
 
 
 async def _await_by_deadline(awaitable, deadline):
@@ -443,22 +522,33 @@ def log_flow_error(code, error=None, *, account=None):
 
 async def _cleanup_registration_resources(bb, browser, profile_id):
     cleanup_cancelled = None
-    if browser is not None:
+
+    async def attempt(operation, error_code):
+        nonlocal cleanup_cancelled
         try:
-            await browser.close()
+            awaitable = operation()
+            await _run_bounded(
+                awaitable,
+                CLEANUP_OPERATION_TIMEOUT,
+                cancel_grace=TASK_CANCEL_GRACE,
+            )
         except asyncio.CancelledError as exc:
-            cleanup_cancelled = exc
+            if cleanup_cancelled is None:
+                cleanup_cancelled = exc
         except BaseException as exc:
-            log_flow_error("browser_cleanup_failed", exc)
+            log_flow_error(error_code, exc)
+
+    if browser is not None:
+        await attempt(browser.close, "browser_cleanup_failed")
     if profile_id is not None:
-        try:
-            bb.close_browser(profile_id)
-        except BaseException as exc:
-            log_flow_error("profile_close_failed", exc)
-        try:
-            bb.delete_browser(profile_id)
-        except BaseException as exc:
-            log_flow_error("profile_delete_failed", exc)
+        await attempt(
+            lambda: asyncio.to_thread(bb.close_browser, profile_id),
+            "profile_close_failed",
+        )
+        await attempt(
+            lambda: asyncio.to_thread(bb.delete_browser, profile_id),
+            "profile_delete_failed",
+        )
     return cleanup_cancelled
 
 
@@ -492,7 +582,7 @@ async def register_one(
             browser = await playwright.chromium.connect_over_cdp(opened["ws"])
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
-            cookie_path = await asyncio.wait_for(
+            cookie_path = await _run_bounded(
                 run_claude_platform_flow(
                     page,
                     context,
@@ -504,6 +594,7 @@ async def register_one(
                     max_wait=timeout,
                 ),
                 timeout=float(timeout) + EMERGENCY_TIMEOUT_CUSHION,
+                cancel_grace=TASK_CANCEL_GRACE,
             )
     except asyncio.TimeoutError:
         error_code = "timeout"
@@ -718,8 +809,10 @@ async def main():
         await asyncio.gather(*tasks, return_exceptions=True)
         for index, selected in enumerate(accounts):
             release_once(index, selected)
+        await _drain_retained_tasks()
         raise
 
+    await _drain_retained_tasks()
     success_count = sum(result is not None for result in results)
     print(f"success: {success_count}/{len(accounts)}")
     return 0 if accounts and success_count == len(accounts) else 1
