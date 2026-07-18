@@ -1,9 +1,14 @@
 import asyncio
+import errno
+import os
 import subprocess
 import sys
+import time
 
 
 PROCESS_SHUTDOWN_TIMEOUT = 5.0
+POSIX_SIGTERM = 15
+POSIX_SIGKILL = 9
 
 
 def process_group_kwargs():
@@ -50,6 +55,56 @@ def _windows_tree_required(process):
         return False
 
 
+def _posix_group_id(process):
+    if sys.platform == "win32":
+        return None
+    try:
+        pid = int(getattr(process, "pid", None))
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _signal_posix_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+def _posix_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+    return True
+
+
+def _wait_posix_group_gone_sync(pgid, timeout):
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while _posix_group_exists(pgid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+    return True
+
+
+async def _wait_posix_group_gone_async(pgid, timeout):
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while _posix_group_exists(pgid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+    return True
+
+
 def _wait_sync(process, timeout):
     try:
         process.wait(timeout=timeout)
@@ -58,7 +113,26 @@ def _wait_sync(process, timeout):
     return True
 
 
+def _shutdown_posix_group_sync(process, pgid, timeout):
+    parent_stopped = getattr(process, "returncode", None) is not None
+    _signal_posix_group(pgid, POSIX_SIGTERM)
+    if not parent_stopped:
+        parent_stopped = _wait_sync(process, timeout)
+    group_stopped = _wait_posix_group_gone_sync(pgid, timeout)
+    if parent_stopped and group_stopped:
+        return True
+
+    _signal_posix_group(pgid, POSIX_SIGKILL)
+    if not parent_stopped:
+        parent_stopped = _wait_sync(process, timeout)
+    group_stopped = _wait_posix_group_gone_sync(pgid, timeout)
+    return parent_stopped and group_stopped
+
+
 def shutdown_sync_process(process, timeout=PROCESS_SHUTDOWN_TIMEOUT):
+    pgid = _posix_group_id(process)
+    if pgid is not None:
+        return _shutdown_posix_group_sync(process, pgid, timeout)
     tree_required = _windows_tree_required(process)
     if getattr(process, "returncode", None) is not None:
         if not tree_required:
@@ -97,7 +171,26 @@ async def _wait_async(process, timeout):
     return True
 
 
+async def _shutdown_posix_group_async(process, pgid, timeout):
+    parent_stopped = getattr(process, "returncode", None) is not None
+    _signal_posix_group(pgid, POSIX_SIGTERM)
+    if not parent_stopped:
+        parent_stopped = await _wait_async(process, timeout)
+    group_stopped = await _wait_posix_group_gone_async(pgid, timeout)
+    if parent_stopped and group_stopped:
+        return True
+
+    _signal_posix_group(pgid, POSIX_SIGKILL)
+    if not parent_stopped:
+        parent_stopped = await _wait_async(process, timeout)
+    group_stopped = await _wait_posix_group_gone_async(pgid, timeout)
+    return parent_stopped and group_stopped
+
+
 async def shutdown_async_process(process, timeout=PROCESS_SHUTDOWN_TIMEOUT):
+    pgid = _posix_group_id(process)
+    if pgid is not None:
+        return await _shutdown_posix_group_async(process, pgid, timeout)
     tree_required = _windows_tree_required(process)
     if getattr(process, "returncode", None) is not None:
         if not tree_required:

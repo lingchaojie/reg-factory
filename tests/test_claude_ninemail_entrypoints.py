@@ -112,6 +112,50 @@ class ControllableSyncProcess:
         return result
 
 
+class NormalAsyncStdout:
+    async def readline(self):
+        return b""
+
+
+class NormalAsyncProcess:
+    def __init__(self, events, return_code=1):
+        self.events = events
+        self.return_code = return_code
+        self.returncode = None
+        self.stdout = NormalAsyncStdout()
+        self.pid = 4242
+
+    def terminate(self):
+        self.events.append("parent_terminate")
+
+    def kill(self):
+        self.events.append("parent_kill")
+
+    async def wait(self):
+        self.events.append("parent_wait")
+        self.returncode = self.return_code
+        return self.return_code
+
+
+class NormalSyncProcess:
+    def __init__(self, events, return_code=1, exited=False):
+        self.events = events
+        self.return_code = return_code
+        self.returncode = return_code if exited else None
+        self.pid = 4242
+
+    def terminate(self):
+        self.events.append("parent_terminate")
+
+    def kill(self):
+        self.events.append("parent_kill")
+
+    def wait(self, timeout=None):
+        self.events.append("parent_wait")
+        self.returncode = self.return_code
+        return self.return_code
+
+
 def full_flow_args():
     return argparse.Namespace(
         skip_email=False,
@@ -854,6 +898,169 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(async_confirmed)
         self.assertEqual(len(tree.call_args_list), 2)
         self.assertTrue(all(call.kwargs["force"] for call in tree.call_args_list))
+
+    async def test_posix_sync_group_termination_escalates_and_confirms_in_order(self):
+        events = []
+        process = NormalSyncProcess(events)
+        group_results = iter([False, True])
+
+        def signal_group(pgid, sig):
+            events.append(("signal", pgid, sig))
+            return True
+
+        def wait_group(pgid, timeout):
+            events.append(("confirm", pgid, timeout))
+            return next(group_results)
+
+        with patch.object(
+            process_lifecycle.sys, "platform", "linux"
+        ), patch.object(
+            process_lifecycle,
+            "_signal_posix_group",
+            side_effect=signal_group,
+            create=True,
+        ), patch.object(
+            process_lifecycle,
+            "_wait_posix_group_gone_sync",
+            side_effect=wait_group,
+            create=True,
+        ):
+            confirmed = process_lifecycle.shutdown_sync_process(process)
+
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            events,
+            [
+                ("signal", 4242, 15),
+                "parent_wait",
+                ("confirm", 4242, process_lifecycle.PROCESS_SHUTDOWN_TIMEOUT),
+                ("signal", 4242, 9),
+                ("confirm", 4242, process_lifecycle.PROCESS_SHUTDOWN_TIMEOUT),
+            ],
+        )
+
+    async def test_posix_async_group_termination_escalates_and_confirms_in_order(self):
+        events = []
+        process = NormalAsyncProcess(events)
+        group_results = iter([False, True])
+
+        def signal_group(pgid, sig):
+            events.append(("signal", pgid, sig))
+            return True
+
+        async def wait_group(pgid, timeout):
+            events.append(("confirm", pgid, timeout))
+            return next(group_results)
+
+        with patch.object(
+            process_lifecycle.sys, "platform", "linux"
+        ), patch.object(
+            process_lifecycle,
+            "_signal_posix_group",
+            side_effect=signal_group,
+            create=True,
+        ), patch.object(
+            process_lifecycle,
+            "_wait_posix_group_gone_async",
+            side_effect=wait_group,
+            create=True,
+        ):
+            confirmed = await process_lifecycle.shutdown_async_process(process)
+
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            events,
+            [
+                ("signal", 4242, 15),
+                "parent_wait",
+                ("confirm", 4242, process_lifecycle.PROCESS_SHUTDOWN_TIMEOUT),
+                ("signal", 4242, 9),
+                ("confirm", 4242, process_lifecycle.PROCESS_SHUTDOWN_TIMEOUT),
+            ],
+        )
+
+    async def test_posix_exited_parent_with_live_group_is_unconfirmed(self):
+        events = []
+        process = NormalSyncProcess(events, exited=True)
+
+        def signal_group(pgid, sig):
+            events.append(("signal", pgid, sig))
+            return True
+
+        def wait_group(pgid, timeout):
+            events.append(("confirm", pgid, timeout))
+            return False
+
+        with patch.object(
+            process_lifecycle.sys, "platform", "linux"
+        ), patch.object(
+            process_lifecycle,
+            "_signal_posix_group",
+            side_effect=signal_group,
+            create=True,
+        ), patch.object(
+            process_lifecycle,
+            "_wait_posix_group_gone_sync",
+            side_effect=wait_group,
+            create=True,
+        ):
+            confirmed = process_lifecycle.shutdown_sync_process(process)
+
+        self.assertFalse(confirmed)
+        self.assertEqual(
+            [event for event in events if isinstance(event, tuple) and event[0] == "signal"],
+            [
+                ("signal", 4242, 15),
+                ("signal", 4242, 9),
+            ],
+        )
+
+    async def test_normal_async_nonzero_exit_retains_unconfirmed_reservation(self):
+        events = []
+        store = FakeStore(self.account, events)
+        reserved = register_three_platforms._ReservedPoolAccount(
+            self.account, store
+        )
+        process = NormalAsyncProcess(events)
+
+        with patch.object(
+            register_three_platforms, "LOG_DIR", self.tmp.name
+        ), patch.object(
+            register_three_platforms.asyncio,
+            "create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ), patch.object(
+            register_three_platforms,
+            "shutdown_async_process",
+            new=AsyncMock(return_value=False),
+        ) as shutdown:
+            results = await register_three_platforms.process_account(
+                reserved, self.platform_args(), {}
+            )
+
+        self.assertFalse(results[0][1])
+        shutdown.assert_awaited_once_with(process)
+        self.assertEqual(store.released, [])
+
+    async def test_normal_sync_nonzero_exit_retains_unconfirmed_reservation(self):
+        events = []
+        store = FakeStore(self.account, events)
+        process = NormalSyncProcess(events)
+
+        with patch.object(
+            run_full_flow, "ClaudeEmailAccountStore", return_value=store
+        ), patch.object(
+            run_full_flow.subprocess, "Popen", return_value=process
+        ), patch.object(
+            run_full_flow, "shutdown_sync_process", return_value=False
+        ) as shutdown:
+            result = run_full_flow.run_once(
+                full_flow_args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        self.assertEqual(result, (1, "person@example.com"))
+        shutdown.assert_called_once_with(process)
+        self.assertEqual(store.released, [])
 
 
 if __name__ == "__main__":

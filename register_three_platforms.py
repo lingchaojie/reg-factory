@@ -188,7 +188,8 @@ async def run_platform(
 
         rc = await proc.wait()
         if process_owner is not None:
-            process_owner.confirm_process_stopped(proc, True)
+            confirmed = await shutdown_async_process(proc)
+            process_owner.confirm_process_stopped(proc, confirmed)
     except BaseException:
         if proc is not None:
             cleanup = asyncio.create_task(shutdown_async_process(proc))

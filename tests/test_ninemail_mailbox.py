@@ -1,5 +1,7 @@
 import unittest
 
+import requests
+
 from common.claude_email_accounts import ClaudeEmailAccount
 from common.ninemail_mailbox import (
     NineMallMailboxClient,
@@ -33,7 +35,10 @@ class FakeSession:
         self.calls.append((url, json, timeout, allow_redirects))
         if self.clock is not None and self.elapsed:
             self.clock.sleep(self.elapsed.pop(0))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 class FakeClock:
@@ -218,6 +223,53 @@ class NineMallMailboxTests(unittest.TestCase):
         self.assertTrue(caught.exception.retryable)
         self.assertEqual(len(self.session.calls), 3)
         self.assertEqual([response.json_calls for response in responses], [0, 0, 0])
+
+    def test_chunked_transport_failure_retries_and_succeeds(self):
+        client = self.client([
+            requests.exceptions.ChunkedEncodingError(
+                "truncated synthetic-refresh-token"
+            ),
+            FakeResponse(200, {"data": []}),
+        ])
+
+        self.assertEqual(client.fetch_folder(account(), "INBOX"), [])
+        self.assertEqual(len(self.session.calls), 2)
+
+    def test_content_decoding_failure_exhaustion_is_secret_safe_network_error(self):
+        client = self.client([
+            requests.exceptions.ContentDecodingError(
+                "decode failed synthetic-refresh-token"
+            )
+            for _attempt in range(3)
+        ])
+
+        with self.assertRaises(NineMallMailboxError) as caught:
+            client.fetch_folder(account(), "INBOX")
+
+        self.assertEqual(caught.exception.code, "network_error")
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("synthetic-refresh-token", str(caught.exception))
+        self.assertEqual(len(self.session.calls), 3)
+
+    def test_transport_failure_does_not_retry_after_deadline(self):
+        self.clock = FakeClock()
+        self.session = FakeSession(
+            [requests.exceptions.ChunkedEncodingError("truncated")],
+            clock=self.clock,
+            elapsed=[4],
+        )
+        client = NineMallMailboxClient(
+            base_url="https://www.appleemail.top",
+            http_timeout=17,
+            poll_interval=5,
+            session=self.session,
+            sleep=self.clock.sleep,
+            clock=self.clock,
+        )
+
+        self.assertIsNone(client.poll_magic_link(account(), max_wait=5))
+        self.assertEqual(len(self.session.calls), 1)
+        self.assertEqual(self.clock.value, 2_000_000_005.0)
 
     def test_every_unlisted_5xx_status_retries(self):
         responses = [

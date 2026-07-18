@@ -1775,10 +1775,19 @@ async def fetch_claude_magic_link(
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancel_event.set()
-            try:
-                await asyncio.shield(worker)
-            except BaseException:
-                pass
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancel_event.set()
+                    continue
+                except BaseException:
+                    break
+            if worker.done():
+                try:
+                    worker.result()
+                except BaseException:
+                    pass
             raise
     link = None
     if account.refresh_token:

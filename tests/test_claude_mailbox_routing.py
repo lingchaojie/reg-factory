@@ -223,6 +223,55 @@ class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.missing_cancel_event.is_set())
         self.assertTrue(client.stopped.is_set())
 
+    async def test_repeated_cancellation_still_drains_ninemail_worker(self):
+        class RepeatedCancellationClient:
+            def __init__(self):
+                self.started = threading.Event()
+                self.cancel_seen = threading.Event()
+                self.allow_finish = threading.Event()
+                self.finished = threading.Event()
+                self.polls_after_cancel = 0
+
+            def poll_magic_link(
+                self,
+                _account,
+                _max_wait,
+                _received_after,
+                *,
+                cancel_event=None,
+            ):
+                self.started.set()
+                cancel_event.wait(1)
+                self.cancel_seen.set()
+                self.allow_finish.wait(1)
+                self.finished.set()
+                return None
+
+        client = RepeatedCancellationClient()
+        task = asyncio.create_task(
+            register.fetch_claude_magic_link(
+                Mock(),
+                mailbox_account("NINEMALL"),
+                60,
+                ninemail_client=client,
+            )
+        )
+        await asyncio.to_thread(client.started.wait)
+        task.cancel()
+        await asyncio.to_thread(client.cancel_seen.wait)
+        task.cancel()
+        await asyncio.sleep(0)
+        still_draining = not task.done()
+        client.allow_finish.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertTrue(still_draining)
+        self.assertTrue(client.finished.is_set())
+        self.assertEqual(client.polls_after_cancel, 0)
+        self.assertGreaterEqual(task.cancelling(), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -219,7 +219,7 @@ class NineMallMailboxClient:
                     timeout=timeout,
                     allow_redirects=False,
                 )
-            except (requests.ConnectionError, requests.Timeout):
+            except requests.RequestException:
                 if self._stopped(deadline, cancel_event):
                     return []
                 if attempt + 1 < self.max_attempts and self._sleep_bounded(

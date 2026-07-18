@@ -298,7 +298,8 @@ def stage_platforms(
     try:
         rc = proc.wait()
         if process_owner is not None:
-            process_owner.confirm_process_stopped(proc, True)
+            confirmed = shutdown_sync_process(proc)
+            process_owner.confirm_process_stopped(proc, confirmed)
         return rc
     except BaseException:
         try:
