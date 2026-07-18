@@ -45,6 +45,8 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
             "IPMART_PROXY_PASSWORD": "proxy-secret",
             "HTTP_PROXY": "http://127.0.0.1:7897",
             "HTTPS_PROXY": "http://127.0.0.1:7897",
+            "http_proxy": "http://127.0.0.1:7897",
+            "https_proxy": "http://127.0.0.1:7897",
             "CLASH_PROXY": "http://127.0.0.1:7897",
         }
 
@@ -80,10 +82,20 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
         self.assertEqual((rc, email), (0, "a@outlook.com"))
         self.assertEqual(len(captured), 2)
         self.assertEqual(captured[0], captured[1])
-        self.assertNotIn("HTTP_PROXY", captured[0])
-        self.assertNotIn("HTTPS_PROXY", captured[0])
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_SID"], "00000042")
-        self.assertEqual(captured[0]["ACCOUNT_PROXY_PASSWORD"], "proxy-secret")
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertNotIn(key, captured[0])
+        expected_lease_env = {
+            "ACCOUNT_PROXY_SOURCE": "ipmart",
+            "ACCOUNT_PROXY_TYPE": "http",
+            "ACCOUNT_PROXY_HOST": "gateway.example",
+            "ACCOUNT_PROXY_PORT": "8080",
+            "ACCOUNT_PROXY_USERNAME": "account-res-US-sid-00000042",
+            "ACCOUNT_PROXY_PASSWORD": "proxy-secret",
+            "ACCOUNT_PROXY_SID": "00000042",
+            "ACCOUNT_PROXY_EXIT_IP": "203.0.113.8",
+        }
+        for key, value in expected_lease_env.items():
+            self.assertEqual(captured[0][key], value)
         self.assertEqual(verify_calls, [(self.lease, "203.0.113.8")])
 
     def test_changed_exit_aborts_before_platform_stage(self):

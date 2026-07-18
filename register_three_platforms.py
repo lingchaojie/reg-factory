@@ -170,7 +170,10 @@ def platform_child_env(platform, base_env):
     if platform == "claude" and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart":
         strip_http_proxy_env(env)
         return env
-    if platform in {"chatgpt", "grok"}:
+    if (
+        platform in {"chatgpt", "grok"}
+        and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart"
+    ):
         strip_account_proxy_env(env)
         clash_proxy = (env.get("CLASH_PROXY") or "").strip()
         if clash_proxy:

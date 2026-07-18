@@ -5,37 +5,86 @@ from unittest.mock import patch
 import register_three_platforms
 
 
+ACCOUNT_PROXY_KEYS = (
+    "ACCOUNT_PROXY_SOURCE",
+    "ACCOUNT_PROXY_TYPE",
+    "ACCOUNT_PROXY_HOST",
+    "ACCOUNT_PROXY_PORT",
+    "ACCOUNT_PROXY_USERNAME",
+    "ACCOUNT_PROXY_PASSWORD",
+    "ACCOUNT_PROXY_SID",
+    "ACCOUNT_PROXY_EXIT_IP",
+)
+HTTP_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
 class PlatformProxyEnvTests(unittest.TestCase):
     def setUp(self):
         self.env = {
             "ACCOUNT_PROXY_SOURCE": "ipmart",
+            "ACCOUNT_PROXY_TYPE": "http",
+            "ACCOUNT_PROXY_HOST": "gateway.example",
+            "ACCOUNT_PROXY_PORT": "8080",
+            "ACCOUNT_PROXY_USERNAME": "account-res-US-sid-00000042",
+            "ACCOUNT_PROXY_PASSWORD": "test-secret",
+            "ACCOUNT_PROXY_SID": "00000042",
+            "ACCOUNT_PROXY_EXIT_IP": "203.0.113.8",
             "CLASH_PROXY": "http://127.0.0.1:7897",
             "HTTP_PROXY": "http://stale.invalid",
             "HTTPS_PROXY": "http://stale.invalid",
+            "http_proxy": "http://stale.invalid",
+            "https_proxy": "http://stale.invalid",
         }
 
     def test_claude_child_has_no_environment_http_proxy(self):
         env = register_three_platforms.platform_child_env("claude", self.env)
-        self.assertNotIn("HTTP_PROXY", env)
-        self.assertNotIn("HTTPS_PROXY", env)
-        self.assertEqual(env["ACCOUNT_PROXY_SOURCE"], "ipmart")
+        for key in HTTP_PROXY_KEYS:
+            self.assertNotIn(key, env)
+        for key in ACCOUNT_PROXY_KEYS:
+            self.assertEqual(env[key], self.env[key])
 
     def test_chatgpt_and_grok_restore_existing_clash_behavior(self):
         for platform in ("chatgpt", "grok"):
             with self.subTest(platform=platform):
                 env = register_three_platforms.platform_child_env(platform, self.env)
-                self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
-                self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-                self.assertNotIn("ACCOUNT_PROXY_SOURCE", env)
+                for key in HTTP_PROXY_KEYS:
+                    self.assertEqual(env[key], "http://127.0.0.1:7897")
+                for key in ACCOUNT_PROXY_KEYS:
+                    self.assertNotIn(key, env)
+
+    def test_chatgpt_and_grok_preserve_proxies_without_ipmart_lease(self):
+        base_env = {
+            "CLASH_PROXY": "http://127.0.0.1:7897",
+            "HTTP_PROXY": "http://upper-http.example",
+            "HTTPS_PROXY": "http://upper-https.example",
+            "http_proxy": "http://lower-http.example",
+            "https_proxy": "http://lower-https.example",
+        }
+        for platform in ("chatgpt", "grok"):
+            with self.subTest(platform=platform):
+                env = register_three_platforms.platform_child_env(
+                    platform, base_env
+                )
+                self.assertEqual(env, base_env)
+                self.assertIsNot(env, base_env)
 
 
 class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.env = {
             "ACCOUNT_PROXY_SOURCE": "ipmart",
+            "ACCOUNT_PROXY_TYPE": "http",
+            "ACCOUNT_PROXY_HOST": "gateway.example",
+            "ACCOUNT_PROXY_PORT": "8080",
+            "ACCOUNT_PROXY_USERNAME": "account-res-US-sid-00000042",
+            "ACCOUNT_PROXY_PASSWORD": "test-secret",
+            "ACCOUNT_PROXY_SID": "00000042",
+            "ACCOUNT_PROXY_EXIT_IP": "203.0.113.8",
             "CLASH_PROXY": "http://127.0.0.1:7897",
             "HTTP_PROXY": "http://stale.invalid",
             "HTTPS_PROXY": "http://stale.invalid",
+            "http_proxy": "http://stale.invalid",
+            "https_proxy": "http://stale.invalid",
         }
 
     async def capture_launch_envs(self, parallel):
@@ -68,13 +117,17 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         return captured
 
     def assert_platform_envs(self, captured):
-        self.assertNotIn("HTTP_PROXY", captured["claude"])
-        self.assertEqual(captured["claude"]["ACCOUNT_PROXY_SOURCE"], "ipmart")
+        for key in HTTP_PROXY_KEYS:
+            self.assertNotIn(key, captured["claude"])
+        for key in ACCOUNT_PROXY_KEYS:
+            self.assertEqual(captured["claude"][key], self.env[key])
         for platform in ("chatgpt", "grok"):
-            self.assertEqual(
-                captured[platform]["HTTP_PROXY"], "http://127.0.0.1:7897"
-            )
-            self.assertNotIn("ACCOUNT_PROXY_SOURCE", captured[platform])
+            for key in HTTP_PROXY_KEYS:
+                self.assertEqual(
+                    captured[platform][key], "http://127.0.0.1:7897"
+                )
+            for key in ACCOUNT_PROXY_KEYS:
+                self.assertNotIn(key, captured[platform])
 
     async def test_sequential_launches_use_platform_environments(self):
         self.assert_platform_envs(await self.capture_launch_envs(parallel=False))
