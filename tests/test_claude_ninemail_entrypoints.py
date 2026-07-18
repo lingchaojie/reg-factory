@@ -683,7 +683,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(events)
         process = ControllableAsyncProcess(stdout, events)
@@ -712,7 +712,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(
             events, RuntimeError("post-spawn failure")
@@ -737,7 +737,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(
             events, RuntimeError("post-spawn failure")
@@ -1019,7 +1019,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         process = NormalAsyncProcess(events)
 

@@ -209,6 +209,44 @@ class FullFlowIPMartProxyTests(unittest.TestCase):
 
         self.assertEqual((rc, email), (0, "existing@outlook.com"))
 
+    def test_skip_email_claude_api_acquires_and_rechecks_one_lease(self):
+        acquired = []
+        verified = []
+        captured = {}
+
+        def acquire(**_kwargs):
+            acquired.append(self.lease)
+            return self.lease
+
+        def verify(lease, expected_exit_ip=None, **_kwargs):
+            verified.append((lease, expected_exit_ip))
+            return expected_exit_ip
+
+        def fake_platforms(_args, child_env, *_account):
+            captured.update(child_env)
+            return 0
+
+        with patch.object(
+            run_full_flow, "stage_platforms", side_effect=fake_platforms
+        ):
+            rc, email = run_full_flow.run_once(
+                args_for_test(
+                    skip_email=True,
+                    email="existing@outlook.com",
+                    password="Pass1!",
+                    platforms=["claude_api"],
+                ),
+                self.base_env,
+                acquire=acquire,
+                verify=verify,
+            )
+
+        self.assertEqual((rc, email), (0, "existing@outlook.com"))
+        self.assertEqual(acquired, [self.lease])
+        self.assertEqual(verified, [(self.lease, self.lease.exit_ip)])
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            self.assertNotIn(key, captured)
+
     def test_outlook_only_lease_is_not_rechecked_without_claude(self):
         with patch.object(
             run_full_flow,

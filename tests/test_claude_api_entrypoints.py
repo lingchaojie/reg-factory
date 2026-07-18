@@ -1,9 +1,45 @@
+import argparse
 import asyncio
+import contextlib
+import io
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import mailbox_broker
+import register_three_platforms
+import run_full_flow
 from common import claude_platform_mailbox, mailbox
+from common.claude_email_accounts import (
+    ClaudeEmailAccountStore,
+    reserve_shared_claude_account,
+)
+
+
+def platform_args(platforms):
+    return argparse.Namespace(
+        platforms=platforms,
+        timeout=600,
+        node="auto",
+        keep_on_fail=False,
+        import_c2a=False,
+        codex=False,
+        codex_group=None,
+        codex_manual_phone=False,
+        grok_sub2api=False,
+        grok_sub2api_group=None,
+    )
+
+
+def account_tuple(account):
+    return (
+        account.email,
+        account.password,
+        account.refresh_token,
+        account.client_id,
+    )
 
 
 class _Response:
@@ -333,6 +369,368 @@ class BrokerPlatformTests(unittest.TestCase):
         self.assertNotIn("person@example.com", rendered)
         self.assertNotIn("mail-pass", rendered)
         self.assertIn("pe***@example.com", rendered)
+
+
+class ClaudeAPIEntrypointTests(unittest.TestCase):
+    def test_claude_api_command_forwards_mailbox_credentials(self):
+        command = register_three_platforms.build_command(
+            "claude_api",
+            platform_args(["claude_api"]),
+            (
+                "person@example.com",
+                "mail-pass",
+                "refresh-secret",
+                "client-guid",
+            ),
+        )
+
+        self.assertEqual(command[2], "register_claude_api.py")
+        self.assertEqual(
+            command[command.index("--token") + 1], "refresh-secret"
+        )
+        self.assertEqual(
+            command[command.index("--client-id") + 1], "client-guid"
+        )
+
+    def test_claude_family_only_predicate_accepts_both_claude_choices(self):
+        self.assertTrue(
+            run_full_flow.is_ninemail_claude_family_only(
+                argparse.Namespace(platforms=["claude_api"]),
+                {"EMAIL_PROVIDER": "NINEMALL"},
+            )
+        )
+        self.assertTrue(
+            run_full_flow.is_ninemail_claude_family_only(
+                argparse.Namespace(platforms=["claude", "claude_api"]),
+                {"EMAIL_PROVIDER": "NINEMALL"},
+            )
+        )
+        self.assertFalse(
+            run_full_flow.is_ninemail_claude_family_only(
+                argparse.Namespace(platforms=["claude_api", "chatgpt"]),
+                {"EMAIL_PROVIDER": "NINEMALL"},
+            )
+        )
+
+    def test_full_flow_dry_run_does_not_reserve_ninemail_account(self):
+        args = argparse.Namespace(
+            platforms=["claude", "claude_api"], dry_run=True
+        )
+        expected = ("dry-run@outlook.com", "DryRunPass1!", "", "")
+        stage = Mock(return_value=expected)
+
+        with patch.object(
+            run_full_flow,
+            "reserve_shared_claude_account",
+            side_effect=AssertionError("dry-run reserved a mailbox"),
+            create=True,
+        ):
+            selected = run_full_flow.acquire_stage_account(
+                args,
+                {"EMAIL_PROVIDER": "NINEMALL"},
+                stage_email_fn=stage,
+            )
+
+        self.assertEqual(selected, expected)
+        stage.assert_called_once_with(args, {"EMAIL_PROVIDER": "NINEMALL"})
+
+
+class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "mail.txt"
+        self.source.write_text(
+            "person@example.com----mail-pass----client-guid----refresh-secret\n",
+            encoding="utf-8",
+        )
+
+    def args(self, platforms=None):
+        values = platform_args(platforms or ["claude", "claude_api"])
+        values.parallel = False
+        values.broker = ""
+        values.grok_timeout = 40
+        return values
+
+    def reserve(self):
+        result = reserve_shared_claude_account(
+            "NINEMALL",
+            ("claude", "claude_api"),
+            source_file=self.source,
+            root_dir=self.root,
+        )
+        self.assertIsNotNone(result)
+        return result
+
+    def ledger(self, purpose):
+        return (
+            self.root / f"mail_used_{purpose}.txt"
+        ).read_text(encoding="utf-8").splitlines()
+
+    def child_store(self, purpose):
+        return ClaudeEmailAccountStore(
+            provider="NINEMALL",
+            purpose=purpose,
+            source_file=self.source,
+            root_dir=self.root,
+        )
+
+    async def test_from_pool_dual_family_uses_atomic_reservation(self):
+        account, stores = self.reserve()
+        shared = Mock(return_value=(account, stores))
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms,
+            "reserve_shared_claude_account",
+            shared,
+            create=True,
+        ), patch.object(
+            register_three_platforms,
+            "ClaudeEmailAccountStore",
+            side_effect=AssertionError("non-atomic reservation used"),
+        ):
+            selected = register_three_platforms.next_pool_account(self.args())
+
+        self.assertEqual(selected, account_tuple(account))
+        self.assertEqual(set(selected.stores), {"claude", "claude_api"})
+        shared.assert_called_once_with(
+            "NINEMALL", ("claude", "claude_api")
+        )
+
+    async def test_full_flow_dual_family_uses_atomic_reservation(self):
+        account, stores = self.reserve()
+        shared = Mock(return_value=(account, stores))
+
+        with patch.object(
+            run_full_flow,
+            "reserve_shared_claude_account",
+            shared,
+            create=True,
+        ):
+            selected = run_full_flow.acquire_stage_account(
+                self.args(),
+                {"EMAIL_PROVIDER": "NINEMALL"},
+                stage_email_fn=Mock(
+                    side_effect=AssertionError("Outlook Stage A ran")
+                ),
+                store_factory=Mock(
+                    side_effect=AssertionError("non-atomic reservation used")
+                ),
+            )
+
+        self.assertEqual(selected, account_tuple(account))
+        self.assertEqual(set(selected.stores), {"claude", "claude_api"})
+        shared.assert_called_once_with(
+            "NINEMALL", ("claude", "claude_api")
+        )
+
+    async def test_full_flow_failed_stage_releases_only_nonterminal_ledger(self):
+        account, stores = self.reserve()
+        args = self.args()
+        args.skip_email = False
+        args.email = ""
+        args.password = ""
+        args.token = ""
+        args.client_id = ""
+        args.dry_run = False
+
+        def fake_platforms(
+            _args,
+            _env,
+            _email,
+            _password,
+            _token,
+            _client_id,
+            process_owner=None,
+        ):
+            self.assertIsInstance(
+                process_owner, run_full_flow._ReservedStageAccount
+            )
+            self.child_store("claude").mark_used(account)
+            return 1
+
+        with patch.object(
+            run_full_flow,
+            "reserve_shared_claude_account",
+            return_value=(account, stores),
+        ), patch.object(
+            run_full_flow, "stage_platforms", side_effect=fake_platforms
+        ):
+            result = run_full_flow.run_once(
+                args, {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        self.assertEqual(result, (1, account.email))
+        self.assertEqual(
+            self.ledger("claude"),
+            ["person@example.com----reserved", "person@example.com----ok"],
+        )
+        self.assertEqual(
+            self.ledger("claude_api"),
+            [
+                "person@example.com----reserved",
+                "person@example.com----released",
+            ],
+        )
+
+    async def test_mixed_result_releases_only_nonterminal_child_reservation(self):
+        account, stores = self.reserve()
+        reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+        commands = {}
+
+        async def fake_run(
+            platform, command, _run_id, _child_env, process_owner=None
+        ):
+            self.assertIs(process_owner, reserved)
+            commands[platform] = command
+            if platform == "claude":
+                self.child_store(platform).mark_used(account)
+                return platform, True, 0, "test.log"
+            return platform, False, 1, "test.log"
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ):
+            results = await register_three_platforms.process_account(
+                reserved, self.args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        self.assertEqual([result[1] for result in results], [True, False])
+        self.assertEqual(
+            self.ledger("claude"),
+            ["person@example.com----reserved", "person@example.com----ok"],
+        )
+        self.assertEqual(
+            self.ledger("claude_api"),
+            [
+                "person@example.com----reserved",
+                "person@example.com----released",
+            ],
+        )
+        for command in commands.values():
+            self.assertEqual(command[command.index("--email") + 1], account.email)
+            self.assertEqual(
+                command[command.index("--password") + 1], account.password
+            )
+            self.assertEqual(
+                command[command.index("--token") + 1], account.refresh_token
+            )
+            self.assertEqual(
+                command[command.index("--client-id") + 1], account.client_id
+            )
+
+    async def test_terminal_failure_is_not_released_or_rewritten_by_parent(self):
+        account, stores = self.reserve()
+        reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            store = self.child_store(platform)
+            if platform == "claude":
+                store.mark_used(account)
+                return platform, True, 0, "test.log"
+            store.mark_error(account, "console_not_reached")
+            return platform, False, 1, "test.log"
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ):
+            await register_three_platforms.process_account(
+                reserved, self.args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        self.assertEqual(
+            self.ledger("claude"),
+            ["person@example.com----reserved", "person@example.com----ok"],
+        )
+        self.assertEqual(
+            self.ledger("claude_api"), ["person@example.com----reserved"]
+        )
+        self.assertEqual(
+            (self.root / "mail_error_claude_api.txt")
+            .read_text(encoding="utf-8")
+            .splitlines(),
+            ["person@example.com----console_not_reached"],
+        )
+
+    async def test_cancellation_releases_only_child_without_terminal_state(self):
+        account, stores = self.reserve()
+        reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            if platform == "claude":
+                self.child_store(platform).mark_used(account)
+                return platform, True, 0, "test.log"
+            raise asyncio.CancelledError
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ), self.assertRaises(asyncio.CancelledError):
+            await register_three_platforms.process_account(
+                reserved, self.args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        self.assertEqual(
+            self.ledger("claude"),
+            ["person@example.com----reserved", "person@example.com----ok"],
+        )
+        self.assertEqual(
+            self.ledger("claude_api"),
+            [
+                "person@example.com----reserved",
+                "person@example.com----released",
+            ],
+        )
+
+    async def test_startup_failure_releases_both_reservations_once(self):
+        account, stores = self.reserve()
+        reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms,
+            "run_platform",
+            side_effect=register_three_platforms.PlatformLaunchError(
+                "launch failed"
+            ),
+        ), self.assertRaises(register_three_platforms.PlatformLaunchError):
+            await register_three_platforms.process_account(
+                reserved, self.args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        for purpose in ("claude", "claude_api"):
+            self.assertEqual(
+                self.ledger(purpose),
+                [
+                    "person@example.com----reserved",
+                    "person@example.com----released",
+                ],
+            )
+
+    async def test_orchestrator_output_never_prints_mailbox_secrets(self):
+        account, stores = self.reserve()
+        reserved = register_three_platforms._ReservedPoolAccount(account, stores)
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            self.child_store(platform).mark_used(account)
+            return platform, True, 0, "sanitized.log"
+
+        output = io.StringIO()
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "NINEMALL"}), patch.object(
+            register_three_platforms, "run_platform", side_effect=fake_run
+        ), contextlib.redirect_stdout(output):
+            await register_three_platforms.process_account(
+                reserved, self.args(), {"EMAIL_PROVIDER": "NINEMALL"}
+            )
+
+        rendered = output.getvalue()
+        for secret in (account.password, account.refresh_token, account.client_id):
+            self.assertNotIn(secret, rendered)
 
 
 if __name__ == "__main__":
