@@ -17,6 +17,7 @@ import string
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -1699,6 +1700,32 @@ async def fetch_claude_magic_link(
         )
     finally:
         await outlook_page.close()
+
+
+async def navigate_to_claude_magic_link(page, magic_link, timeout):
+    try:
+        await page.goto(magic_link, timeout=timeout)
+    except Exception:
+        await page.evaluate(
+            "(url) => { window.location.href = url; }",
+            magic_link,
+        )
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+
+
+def log_safe_page_origin(label, page_url):
+    try:
+        parsed = urlsplit(str(page_url or ""))
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        if scheme not in {"http", "https"} or not hostname:
+            raise ValueError
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        origin = f"{scheme}://{hostname}"
+    except (AttributeError, TypeError, ValueError):
+        origin = "[redacted]"
+    print(f"{label}{origin}")
 
 
 # ---- 多语言按钮匹配（BitBrowser 节点地区不同，Claude 登录界面语言可能是 英/日/中/繁/韩/西/法/德）----
@@ -3523,19 +3550,15 @@ async def register(
 
             print("  magic link found")
             # open magic link
-            try:
-                await page.goto(magic_link, timeout=60000)
-            except Exception:
-                await page.evaluate(f"window.location.href = `{magic_link}`")
-                await page.wait_for_load_state("domcontentloaded", timeout=60000)
+            await navigate_to_claude_magic_link(page, magic_link, timeout=60000)
             await asyncio.sleep(5)
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
 
             check_timeout()
 
             # registration form
             print("\n[5/6] fill registration form")
-            print(f"  URL: {page.url}")
+            log_safe_page_origin("  URL origin: ", page.url)
             await asyncio.sleep(2)
 
             first_name, last_name = generate_name()
@@ -3868,7 +3891,7 @@ async def register(
                         print("  re-login magic link found")
                         await page.goto(re_magic, timeout=30000)
                         await asyncio.sleep(5)
-                        print(f"  re-login URL: {page.url}")
+                        log_safe_page_origin("  re-login URL origin: ", page.url)
 
                         # 如果需要手机验证
                         try:

@@ -16,6 +16,39 @@ def mailbox_account(provider):
 
 
 class ClaudeMailboxRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_navigation_fallback_passes_magic_link_as_data(self):
+        magic_link = (
+            "https://claude.ai/magic-link#token`"
+            "${globalThis.injected = true}`"
+        )
+        page = Mock()
+        page.goto = AsyncMock(side_effect=RuntimeError("navigation failed"))
+        page.evaluate = AsyncMock()
+        page.wait_for_load_state = AsyncMock()
+
+        await register.navigate_to_claude_magic_link(page, magic_link, timeout=60_000)
+
+        page.evaluate.assert_awaited_once_with(
+            "(url) => { window.location.href = url; }", magic_link
+        )
+        script = page.evaluate.await_args.args[0]
+        self.assertNotIn("globalThis.injected", script)
+        page.wait_for_load_state.assert_awaited_once_with(
+            "domcontentloaded", timeout=60_000
+        )
+
+    async def test_safe_page_origin_log_omits_magic_link_and_fragment(self):
+        token = "secret-token"
+        page_url = f"https://claude.ai/magic-link#token`$\u007b{token}\u007d`"
+
+        with patch("builtins.print") as output:
+            register.log_safe_page_origin("  URL origin: ", page_url)
+
+        printed = " ".join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertEqual(printed, "  URL origin: https://claude.ai")
+        self.assertNotIn(token, printed)
+        self.assertNotIn("magic-link", printed)
+
     async def test_ninemail_uses_only_hosted_client(self):
         context = Mock()
         context.new_page = AsyncMock(side_effect=AssertionError("Outlook page opened"))
