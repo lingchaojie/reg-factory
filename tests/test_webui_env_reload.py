@@ -65,6 +65,24 @@ class WebUIEnvReloadTests(unittest.TestCase):
             server._ensure_proxy_env()
             self.assertEqual(os.environ["HTTPS_PROXY"], process_proxy)
 
+    def test_saved_octo_bases_are_visible_to_new_children(self):
+        tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+        tmp.write("OCTO_PUBLIC_API_BASE=https://public.example.test\n")
+        tmp.write("OCTO_LOCAL_API_BASE=http://local.example.test:58888\n")
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+
+        with patch.object(server, "ENV_PATH", tmp.name), patch.object(
+            server, "BOOT_ENV", {}
+        ), patch.dict(os.environ, {}, clear=True):
+            child = server._child_env()
+        self.assertEqual(
+            child["OCTO_PUBLIC_API_BASE"], "https://public.example.test"
+        )
+        self.assertEqual(
+            child["OCTO_LOCAL_API_BASE"], "http://local.example.test:58888"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

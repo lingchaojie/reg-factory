@@ -121,9 +121,17 @@ class BitBrowserClient:
     """BitBrowser local API client with proxy support"""
 
     def __new__(cls, api_base=None):
-        if cls is BitBrowserClient and _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
+        provider = _fingerprint_provider()
+        if cls is BitBrowserClient and provider in {
+            "adspower", "ads_power", "ads"
+        }:
             from bitbrowser import BitBrowser
             return BitBrowser(api_base=api_base)
+        if cls is BitBrowserClient and provider not in {
+            "bitbrowser", "bit", "bb"
+        }:
+            from bitbrowser import BitBrowser
+            return BitBrowser()
         return super().__new__(cls)
 
     def __init__(self, api_base=None):

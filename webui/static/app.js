@@ -31,7 +31,12 @@ async function pollStatus(){
   try{
     const s = await (await fetch('/api/status')).json();
     $('#dot-bb').classList.toggle('on', s.bitbrowser);
-    const label = s.browser_provider === 'adspower' ? 'AdsPower' : 'BitBrowser';
+    const browserNames = {
+      bitbrowser: 'BitBrowser',
+      adspower: 'AdsPower',
+      octo: 'Octo Browser',
+    };
+    const label = browserNames[s.browser_provider] || 'BitBrowser';
     $('#browser-label').textContent = label;
     $('#dot-clash').classList.toggle('on', s.clash);
     $('#dot-k12').classList.remove('pending');

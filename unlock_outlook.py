@@ -67,7 +67,8 @@ def _fingerprint_provider():
 
 def _bb_post(path, data=None):
     global _BROWSER_CLIENT
-    if _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
+    provider = _fingerprint_provider()
+    if provider not in {"bitbrowser", "bit", "bb"}:
         if _BROWSER_CLIENT is None:
             from bitbrowser import BitBrowser
             _BROWSER_CLIENT = BitBrowser()

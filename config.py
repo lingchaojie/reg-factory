@@ -41,8 +41,20 @@ def _env(name, default=""):
 
 
 # ---------------------------------------------------------------- 本地基建
-# Fingerprint browser provider: bitbrowser / adspower
+# Fingerprint browser provider: bitbrowser / adspower / octo
 FINGERPRINT_BROWSER = _env("FINGERPRINT_BROWSER", "bitbrowser").strip().lower()
+
+# Octo Browser API configuration. The old non-BASE environment names remain
+# readable for existing private .env files; new configuration uses *_API_BASE.
+OCTO_API_TOKEN = _env("OCTO_API_TOKEN", "")
+OCTO_PUBLIC_API_BASE = _env(
+    "OCTO_PUBLIC_API_BASE",
+    _env("OCTO_PUBLIC_API", "https://app.octobrowser.net"),
+)
+OCTO_LOCAL_API_BASE = _env(
+    "OCTO_LOCAL_API_BASE",
+    _env("OCTO_LOCAL_API", "http://127.0.0.1:58888"),
+)
 
 # BitBrowser 本地 API 地址
 BITBROWSER_API = _env("BITBROWSER_API", "http://127.0.0.1:54345")

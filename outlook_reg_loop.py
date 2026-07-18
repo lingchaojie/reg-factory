@@ -390,7 +390,8 @@ def _bb_create_for_outlook_reg(name, lease=None):
         if lease is not None
         else {"proxyMethod": 2, "proxyType": "noproxy"}
     )
-    if _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
+    provider = _fingerprint_provider()
+    if provider not in {"bitbrowser", "bit", "bb"}:
         from bitbrowser import BitBrowser
         return BitBrowser().create_browser(
             name=name,

@@ -5,13 +5,21 @@ import time
 import requests
 
 try:
-    from config import OCTO_API_TOKEN, OCTO_LOCAL_API, OCTO_PUBLIC_API
+    from config import (
+        OCTO_API_TOKEN,
+        OCTO_LOCAL_API_BASE,
+        OCTO_PUBLIC_API_BASE,
+    )
 except Exception:
     OCTO_API_TOKEN = os.environ.get("OCTO_API_TOKEN", "")
-    OCTO_PUBLIC_API = os.environ.get(
+    OCTO_PUBLIC_API_BASE = os.environ.get(
+        "OCTO_PUBLIC_API_BASE"
+    ) or os.environ.get(
         "OCTO_PUBLIC_API", "https://app.octobrowser.net"
     )
-    OCTO_LOCAL_API = os.environ.get(
+    OCTO_LOCAL_API_BASE = os.environ.get(
+        "OCTO_LOCAL_API_BASE"
+    ) or os.environ.get(
         "OCTO_LOCAL_API", "http://127.0.0.1:58888"
     )
 
@@ -28,10 +36,14 @@ class OctoBrowser:
         session=None,
     ):
         self.public_api = (
-            public_api or OCTO_PUBLIC_API or "https://app.octobrowser.net"
+            public_api
+            or OCTO_PUBLIC_API_BASE
+            or "https://app.octobrowser.net"
         ).rstrip("/")
         self.local_api = (
-            local_api or OCTO_LOCAL_API or "http://127.0.0.1:58888"
+            local_api
+            or OCTO_LOCAL_API_BASE
+            or "http://127.0.0.1:58888"
         ).rstrip("/")
         self.api_token = OCTO_API_TOKEN if api_token is None else api_token
         self.session = session or requests.Session()

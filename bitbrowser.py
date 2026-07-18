@@ -29,6 +29,10 @@ def _use_adspower():
     return _selected_provider() in {"adspower", "ads_power", "ads"}
 
 
+def _use_octobrowser():
+    return _selected_provider() in {"octo", "octobrowser", "octo_browser"}
+
+
 class BitBrowser:
     provider_name = "bitbrowser"
 
@@ -36,6 +40,9 @@ class BitBrowser:
         if cls is BitBrowser and _use_adspower():
             from adspower import AdsPower
             return AdsPower(api_base=api_base)
+        if cls is BitBrowser and _use_octobrowser():
+            from octobrowser import OctoBrowser
+            return OctoBrowser()
         return super().__new__(cls)
 
     def __init__(self, api_base=None):

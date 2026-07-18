@@ -234,7 +234,8 @@ def _write_env_file(path, updates):
     lines = []
     seen = set()
     if os.path.isfile(path):
-        lines = open(path, encoding="utf-8").read().splitlines()
+        with open(path, encoding="utf-8") as source:
+            lines = source.read().splitlines()
     out = []
     for line in lines:
         s = line.strip()
@@ -332,10 +333,26 @@ def _fingerprint_provider():
     ).strip().lower()
 
 
+def _octo_api_base(canonical_key, legacy_key, default):
+    return (
+        _read_config_val(canonical_key, "")
+        or _read_config_val(legacy_key, default)
+        or default
+    ).rstrip("/")
+
+
 def _test_bitbrowser():
     """Test selected fingerprint browser local API."""
     provider = _fingerprint_provider()
-    if provider in {"adspower", "ads_power", "ads"}:
+    if provider in {"octo", "octobrowser", "octo_browser"}:
+        api = _octo_api_base(
+            "OCTO_LOCAL_API_BASE",
+            "OCTO_LOCAL_API",
+            "http://127.0.0.1:58888",
+        )
+        name = "Octo Browser"
+        paths = ("/api/update",)
+    elif provider in {"adspower", "ads_power", "ads"}:
         api = _read_config_val("ADSPOWER_API", "http://127.0.0.1:50325").rstrip("/")
         name = "AdsPower"
         paths = ("/status", "/")
@@ -684,7 +701,14 @@ def index():
 @app.get("/api/status")
 def api_status():
     provider = _fingerprint_provider()
-    if provider in {"adspower", "ads_power", "ads"}:
+    if provider in {"octo", "octobrowser", "octo_browser"}:
+        bb = _octo_api_base(
+            "OCTO_LOCAL_API_BASE",
+            "OCTO_LOCAL_API",
+            "http://127.0.0.1:58888",
+        )
+        provider_label = "octo"
+    elif provider in {"adspower", "ads_power", "ads"}:
         bb = _read_config_val("ADSPOWER_API", "http://127.0.0.1:50325")
         provider_label = "adspower"
     else:
@@ -717,9 +741,18 @@ def api_env_get():
     for g in schema.ENV_SCHEMA:
         items = []
         for it in g["items"]:
+            value = cur.get(it["key"], "")
+            legacy_key = {
+                "OCTO_PUBLIC_API_BASE": "OCTO_PUBLIC_API",
+                "OCTO_LOCAL_API_BASE": "OCTO_LOCAL_API",
+            }.get(it["key"])
+            if not value and legacy_key:
+                value = cur.get(legacy_key, "")
+            if it["key"] == "OCTO_API_TOKEN" and value:
+                value = "********"
             items.append({
                 "key": it["key"],
-                "value": cur.get(it["key"], ""),
+                "value": value,
                 "required": it.get("required", False),
                 "secret": it.get("secret", False),
                 "help": it.get("help", ""),
@@ -738,6 +771,8 @@ async def api_env_set(request: Request):
     # 只接受 schema 里声明的 key，避免写入垃圾
     allowed = set(schema.env_keys())
     updates = {k: ("" if v is None else str(v)) for k, v in updates.items() if k in allowed}
+    if updates.get("OCTO_API_TOKEN") == "********":
+        updates.pop("OCTO_API_TOKEN")
     if not os.path.isfile(ENV_PATH) and os.path.isfile(ENV_EXAMPLE):
         # 首次保存：以模板为底
         import shutil
