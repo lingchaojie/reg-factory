@@ -26,17 +26,20 @@ from common.ipmart_proxy import requests_proxy_url
 DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GRAPH_FOLDERS = ["inbox", "junkemail"]
 
-# Microsoft 端点(login.microsoftonline.com / graph.microsoft.com)不像 ChatGPT 受地域封锁，
-# 不需要走代理；而 Clash 出口节点对 MS 的 TLS 握手常 SSLEOFError(冷连接闪断)。故取码/换 token
-# 一律【直连】(显式禁用代理 + trust_env=False，绕开 HTTP(S)_PROXY 环境变量)，浏览器仍走代理。
-# 实测：直连打 MS 端点干净(HTTP 400 即可达)，经代理则首发 SSLEOFError。
+# Microsoft OAuth and Graph traffic uses the explicit or inherited account
+# lease when present. Without a lease, trust_env=False keeps legacy mailbox
+# reads independent of ambient HTTP(S)_PROXY settings.
 _MS_NO_PROXY = {"http": None, "https": None}
 
 
-def _ms_session(env=None, session_factory=requests.Session):
+def _ms_session(
+    env=None, session_factory=requests.Session, account_lease=None
+):
     session = session_factory()
     session.trust_env = False
-    lease = lease_from_env(os.environ if env is None else env)
+    lease = account_lease
+    if lease is None:
+        lease = lease_from_env(os.environ if env is None else env)
     if lease is None:
         session.proxies = _MS_NO_PROXY
     else:
@@ -49,9 +52,14 @@ def _safe_error(exc):
     return type(exc).__name__ if exc is not None else "unknown error"
 
 
-def _get_access_token(refresh_token, client_id=DEFAULT_CLIENT_ID, scope="https://graph.microsoft.com/Mail.Read"):
-    # 直连打 token 端点(绕代理)；直连仍偶发瞬时抖动，轻量重试 3 次兜底。业务错误(非200)不重试。
-    sess = _ms_session()
+def _get_access_token(
+    refresh_token,
+    client_id=DEFAULT_CLIENT_ID,
+    scope="https://graph.microsoft.com/Mail.Read",
+    account_lease=None,
+):
+    # Keep token refresh on the same account route as mailbox reads.
+    sess = _ms_session(account_lease=account_lease)
     last_err = None
     for attempt in range(3):
         try:
@@ -81,7 +89,7 @@ def _get_access_token(refresh_token, client_id=DEFAULT_CLIENT_ID, scope="https:/
     return None
 
 
-def fetch_messages(access_token, folder, top=10):
+def fetch_messages(access_token, folder, top=10, account_lease=None):
     """拉取某文件夹最新邮件，返回 [{subject, from, body, received}]"""
     headers = {"Authorization": f"Bearer {access_token}"}
     url = (
@@ -89,8 +97,8 @@ def fetch_messages(access_token, folder, top=10):
         f"?$top={top}&$orderby=receivedDateTime desc"
         f"&$select=subject,from,body,bodyPreview,receivedDateTime"
     )
-    # 直连打 graph(绕代理)；直连仍偶发瞬时抖动，连接类错误快速重试 3 次。
-    sess = _ms_session()
+    # Keep Graph reads on the same explicit or inherited account route.
+    sess = _ms_session(account_lease=account_lease)
     r = None
     for attempt in range(3):
         try:
@@ -135,12 +143,15 @@ def get_code_by_token(
     max_wait=120,
     poll=5,
     received_after=None,
+    account_lease=None,
 ):
     """轮询 inbox+junk，匹配发件人/主题后用正则提取验证码。返回 code 字符串或 None。
     sender_contains / subject_contains 任一命中即视为目标邮件（宽松匹配，二者满足其一）。
     received_after: epoch 秒；只接收**该时刻之后**到达的邮件。resend 后传"重发时刻"，避免取到
       已被 OpenAI 作废的旧码(resend 会令旧码失效、收件箱里却还躺着→取旧码必报"不正确")。"""
-    token = _get_access_token(refresh_token, client_id)
+    token = _get_access_token(
+        refresh_token, client_id, account_lease=account_lease
+    )
     if not token:
         return None
 
@@ -160,7 +171,9 @@ def get_code_by_token(
     start = time.time()
     while time.time() - start < max_wait:
         for folder in GRAPH_FOLDERS:
-            for m in fetch_messages(token, folder, top=10):
+            for m in fetch_messages(
+                token, folder, top=10, account_lease=account_lease
+            ):
                 subj = (m["subject"] or "").lower()
                 frm = (m["from"] or "").lower()
                 hit_sender = any(s.lower() in frm for s in sender_contains) if sender_contains else False
@@ -181,7 +194,9 @@ def get_code_by_token(
         print(f"  [mail] waiting for code (inbox+junk)... ({elapsed}s/{max_wait}s)")
         # token 可能在长轮询中过期，过半时刷新一次
         if elapsed > max_wait // 2 and elapsed % (poll * 4) < poll:
-            nt = _get_access_token(refresh_token, client_id)
+            nt = _get_access_token(
+                refresh_token, client_id, account_lease=account_lease
+            )
             if nt:
                 token = nt
         time.sleep(poll)
@@ -200,16 +215,21 @@ def get_link_by_token(
     must_contain=None,
     max_wait=120,
     poll=5,
+    account_lease=None,
 ):
     """轮询 inbox+junk，匹配邮件后提取链接（可用 must_contain 过滤目标链接，如 'verify_email'）。"""
-    token = _get_access_token(refresh_token, client_id)
+    token = _get_access_token(
+        refresh_token, client_id, account_lease=account_lease
+    )
     if not token:
         return None
     pat = re.compile(link_regex)
     start = time.time()
     while time.time() - start < max_wait:
         for folder in GRAPH_FOLDERS:
-            for m in fetch_messages(token, folder, top=10):
+            for m in fetch_messages(
+                token, folder, top=10, account_lease=account_lease
+            ):
                 subj = (m["subject"] or "").lower()
                 frm = (m["from"] or "").lower()
                 hit = (any(s.lower() in frm for s in sender_contains) if sender_contains else False) or \

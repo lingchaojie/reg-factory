@@ -9,6 +9,9 @@ from common.ipmart_proxy import IPMartProxyError, ProxyLease
 
 
 HTTP_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+IPMART_BITBROWSER_ERROR = (
+    "BitBrowser profile creation failed with IPMart account proxy"
+)
 ACCOUNT_PROXY_ENV_KEYS = (
     "ACCOUNT_PROXY_SOURCE", "ACCOUNT_PROXY_TYPE", "ACCOUNT_PROXY_HOST",
     "ACCOUNT_PROXY_PORT", "ACCOUNT_PROXY_USERNAME", "ACCOUNT_PROXY_PASSWORD",

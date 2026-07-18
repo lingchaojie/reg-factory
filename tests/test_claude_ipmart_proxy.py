@@ -1,5 +1,10 @@
 import unittest
+import os
+import sys
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock
 
 import register
 from common.ipmart_proxy import ProxyLease
@@ -75,6 +80,103 @@ class ClaudeIPMartProxyTests(unittest.TestCase):
         )
         self.assertIs(result, env)
         self.assertEqual(env, {"HTTP_PROXY": "http://127.0.0.1:7897"})
+
+    def test_profile_failure_hides_credentialed_client_text(self):
+        bb = Mock()
+        leaked = (
+            "http://account-res-US-sid-00000042:proxy-secret@"
+            "gateway.example:8080 account-res-US-sid-{sid}"
+        )
+        bb.create_browser.side_effect = RuntimeError(leaked)
+
+        with self.assertRaises(RuntimeError) as caught:
+            register.create_claude_profile(bb, "claude-1", make_lease())
+
+        rendered = str(caught.exception)
+        self.assertEqual(
+            rendered,
+            "BitBrowser profile creation failed with IPMart account proxy",
+        )
+        for secret in (
+            "account-res-US-sid-00000042",
+            "proxy-secret",
+            "account-res-US-sid-{sid}",
+            leaked,
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_profile_failure_without_lease_keeps_useful_error(self):
+        bb = Mock()
+        bb.create_browser.side_effect = RuntimeError("window quota exceeded")
+        with self.assertRaisesRegex(RuntimeError, "window quota exceeded"):
+            register.create_claude_profile(bb, "claude-1", None)
+
+
+class StandaloneClaudeLeaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_each_concurrent_account_passes_its_own_lease_to_mailbox_flow(self):
+        leases = [
+            make_lease(),
+            ProxyLease(
+                "http",
+                "gateway.example",
+                8080,
+                "account-res-US-sid-00000043",
+                "other-secret",
+                "00000043",
+                "203.0.113.9",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            emails_path = os.path.join(tmp, "emails.txt")
+            with open(emails_path, "w", encoding="utf-8") as stream:
+                stream.write("a@outlook.com----Pass1!----rt-a\n")
+                stream.write("b@outlook.com----Pass2!----rt-b\n")
+
+            registration = AsyncMock(return_value=None)
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "register.py",
+                    "--count",
+                    "2",
+                    "--concurrency",
+                    "2",
+                    "--emails",
+                    emails_path,
+                    "--node",
+                    "none",
+                ],
+            ), patch.object(
+                register, "lease_from_env", return_value=None
+            ), patch.object(
+                register,
+                "settings_from_env",
+                return_value=SimpleNamespace(enabled=True),
+            ), patch.object(
+                register, "prepare_claude_network"
+            ), patch.object(
+                register, "configure_claude_proxy"
+            ), patch.object(
+                register, "BitBrowser", return_value=Mock()
+            ), patch.object(
+                register, "acquire_proxy", side_effect=leases
+            ), patch.object(
+                register,
+                "create_claude_profile",
+                side_effect=["profile-a", "profile-b"],
+            ), patch.object(
+                register, "register", registration
+            ), patch.object(
+                register.asyncio, "sleep", new=AsyncMock()
+            ):
+                await register.main()
+
+        calls_by_email = {
+            call.args[1]: call for call in registration.await_args_list
+        }
+        self.assertIs(calls_by_email["a@outlook.com"].kwargs["account_lease"], leases[0])
+        self.assertIs(calls_by_email["b@outlook.com"].kwargs["account_lease"], leases[1])
 
 
 if __name__ == "__main__":

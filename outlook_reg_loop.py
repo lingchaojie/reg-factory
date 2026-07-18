@@ -31,6 +31,7 @@ from datetime import datetime
 
 import config  # noqa: F401 - load .env before reading proxy settings
 from common.account_proxy import (
+    IPMART_BITBROWSER_ERROR,
     bitbrowser_proxy_fields,
     lease_from_env,
     strip_http_proxy_env,
@@ -385,6 +386,15 @@ def _bb_call(path, body):
 
 
 def bb_create_for_outlook_reg(name, lease=None):
+    try:
+        return _bb_create_for_outlook_reg(name, lease)
+    except Exception:
+        if lease is not None:
+            raise RuntimeError(IPMART_BITBROWSER_ERROR) from None
+        raise
+
+
+def _bb_create_for_outlook_reg(name, lease=None):
     """Mirror bs_register_step1.bb_create_ephemeral so we share the working
     fingerprint config (proxyType=noproxy + IP-derived locale; routes through
     Clash via TUN). Standalone's hardcoded coreVersion=130 returns 502 on
@@ -848,6 +858,9 @@ def main():
                 failed += 1
                 append_no_graph_account(email, password)  # 号有效但没抽到 RT：单独存待补
                 log(f"registered but graph RT missing; saved to outlook_no_graph.txt: {email}", "WARN")
+                if inherited_lease is not None:
+                    log("inherited account round has no Graph-ready mailbox; exit")
+                    break
                 time.sleep(args.sleep)
                 continue
             fname = write_record({

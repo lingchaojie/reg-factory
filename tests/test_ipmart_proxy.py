@@ -59,6 +59,11 @@ class IPMartProxyTests(unittest.TestCase):
                 with self.assertRaises(ipmart_proxy.IPMartProxyError):
                     ipmart_proxy.settings_from_env(env)
 
+    def test_max_attempts_defaults_to_three_when_missing(self):
+        env = dict(self.env)
+        env.pop("IPMART_MAX_ATTEMPTS")
+        self.assertEqual(ipmart_proxy.settings_from_env(env).max_attempts, 3)
+
     def test_generate_sid_is_eight_digits_and_preserves_leading_zeroes(self):
         self.assertEqual(ipmart_proxy.generate_sid(lambda _limit: 42), "00000042")
 
@@ -161,6 +166,20 @@ class IPMartProxyTests(unittest.TestCase):
                 sleep=lambda _seconds: None,
             )
         self.assertEqual(len(session.calls), 3)
+
+    def test_configured_attempt_limit_above_three_is_honored(self):
+        session = FakeSession([FakeResponse(status_code=502) for _ in range(5)])
+        sids = iter(f"{number:08d}" for number in range(42, 47))
+        with self.assertRaises(ipmart_proxy.IPMartProxyError):
+            ipmart_proxy.acquire_proxy(
+                env=dict(self.env, IPMART_MAX_ATTEMPTS="5"),
+                usage_path=self.usage_path,
+                session_factory=lambda: session,
+                sid_factory=lambda: next(sids),
+                reserve=False,
+                sleep=lambda _seconds: None,
+            )
+        self.assertEqual(len(session.calls), 5)
 
     def test_verify_rejects_changed_exit_through_the_same_proxy(self):
         lease = ipmart_proxy.ProxyLease(

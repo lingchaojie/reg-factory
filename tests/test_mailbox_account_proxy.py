@@ -1,4 +1,5 @@
 import unittest
+import os
 from unittest.mock import patch
 
 import requests
@@ -46,6 +47,28 @@ class ParseErrorSession:
         return ParseErrorResponse()
 
 
+class TokenResponse:
+    status_code = 200
+
+    def json(self):
+        return {"access_token": "access-token"}
+
+
+class MessagesResponse:
+    status_code = 200
+
+    def json(self):
+        return {"value": []}
+
+
+class SuccessfulSession(FakeSession):
+    def post(self, *_args, **_kwargs):
+        return TokenResponse()
+
+    def get(self, *_args, **_kwargs):
+        return MessagesResponse()
+
+
 def make_lease():
     return ProxyLease(
         "http",
@@ -80,7 +103,22 @@ class MailboxAccountProxyTests(unittest.TestCase):
         self.assertFalse(session.trust_env)
         self.assertEqual(session.proxies, {"http": None, "https": None})
 
+    def test_ms_session_accepts_an_explicit_task_local_lease(self):
+        fake = FakeSession()
+        lease = make_lease()
+        session = mailbox._ms_session(
+            account_lease=lease, session_factory=lambda: fake
+        )
+        self.assertEqual(
+            session.proxies,
+            {
+                "http": requests_proxy_url(lease),
+                "https": requests_proxy_url(lease),
+            },
+        )
+
     def test_claude_magic_link_helper_delegates_to_lease_aware_mailbox(self):
+        lease = make_lease()
         with patch(
             "common.mailbox.get_link_by_token",
             return_value="https://claude.ai/magic-link#abc",
@@ -90,7 +128,11 @@ class MailboxAccountProxyTests(unittest.TestCase):
             side_effect=AssertionError("legacy token request used"),
         ) as legacy_post:
             result = register.get_magic_link_by_token(
-                "a@outlook.com", "refresh-token", client_id="cid", max_wait=60
+                "a@outlook.com",
+                "refresh-token",
+                client_id="cid",
+                max_wait=60,
+                account_lease=lease,
             )
         self.assertEqual(result, "https://claude.ai/magic-link#abc")
         get_link.assert_called_once_with(
@@ -103,8 +145,74 @@ class MailboxAccountProxyTests(unittest.TestCase):
             must_contain="claude.ai/magic-link#",
             max_wait=60,
             poll=5,
+            account_lease=lease,
         )
         legacy_post.assert_not_called()
+
+    def test_link_polling_propagates_explicit_lease_to_refresh_and_reads(self):
+        lease = make_lease()
+        message = {
+            "subject": "Sign in",
+            "from": "hello@anthropic.com",
+            "body": "https://claude.ai/magic-link#abc",
+            "received": "",
+        }
+        with patch.object(
+            mailbox, "_get_access_token", return_value="access-token"
+        ) as get_token, patch.object(
+            mailbox, "fetch_messages", return_value=[message]
+        ) as fetch:
+            result = mailbox.get_link_by_token(
+                "a@outlook.com",
+                "refresh-token",
+                link_regex=r"https://claude\.ai/magic-link#[A-Za-z]+",
+                sender_contains=("anthropic",),
+                account_lease=lease,
+            )
+
+        self.assertEqual(result, "https://claude.ai/magic-link#abc")
+        get_token.assert_called_once_with(
+            "refresh-token", mailbox.DEFAULT_CLIENT_ID, account_lease=lease
+        )
+        self.assertTrue(fetch.call_args_list)
+        for call in fetch.call_args_list:
+            self.assertIs(call.kwargs["account_lease"], lease)
+
+    def test_token_refresh_uses_default_os_environ_lease(self):
+        lease = make_lease()
+        fake = SuccessfulSession()
+        real_ms_session = mailbox._ms_session
+
+        def session_from_default_env(**kwargs):
+            return real_ms_session(session_factory=lambda: fake, **kwargs)
+
+        with patch.dict(
+            os.environ, account_proxy.lease_to_env(lease), clear=True
+        ), patch.object(
+            mailbox, "_ms_session", side_effect=session_from_default_env
+        ):
+            token = mailbox._get_access_token("refresh-token")
+
+        self.assertEqual(token, "access-token")
+        self.assertEqual(fake.proxies["https"], requests_proxy_url(lease))
+
+    def test_mailbox_read_uses_default_os_environ_lease(self):
+        lease = make_lease()
+        fake = SuccessfulSession()
+        real_ms_session = mailbox._ms_session
+
+        def session_from_default_env(**kwargs):
+            return real_ms_session(session_factory=lambda: fake, **kwargs)
+
+        with patch.dict(
+            os.environ, account_proxy.lease_to_env(lease), clear=True
+        ), patch.object(
+            mailbox, "_ms_session", side_effect=session_from_default_env
+        ):
+            messages = mailbox.fetch_messages("access-token", "inbox")
+
+        self.assertEqual(messages, [])
+        self.assertEqual(fake.proxies["https"], requests_proxy_url(lease))
 
     def test_graph_network_errors_do_not_print_proxy_credentials(self):
         with patch.object(

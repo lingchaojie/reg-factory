@@ -21,7 +21,11 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 from common import emails as email_pool
-from common.account_proxy import strip_account_proxy_env, strip_http_proxy_env
+from common.account_proxy import (
+    HTTP_PROXY_ENV_KEYS,
+    strip_account_proxy_env,
+    strip_http_proxy_env,
+)
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -175,10 +179,11 @@ def platform_child_env(platform, base_env):
         and env.get("ACCOUNT_PROXY_SOURCE") == "ipmart"
     ):
         strip_account_proxy_env(env)
-        clash_proxy = (env.get("CLASH_PROXY") or "").strip()
-        if clash_proxy:
-            env["HTTP_PROXY"] = env["HTTPS_PROXY"] = clash_proxy
-            env["http_proxy"] = env["https_proxy"] = clash_proxy
+        if not any((env.get(key) or "").strip() for key in HTTP_PROXY_ENV_KEYS):
+            clash_proxy = (env.get("CLASH_PROXY") or "").strip()
+            if clash_proxy:
+                env["HTTP_PROXY"] = env["HTTPS_PROXY"] = clash_proxy
+                env["http_proxy"] = env["https_proxy"] = clash_proxy
     return env
 
 

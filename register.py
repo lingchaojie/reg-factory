@@ -31,6 +31,7 @@ except Exception:
     proxy_switch = None
 from common import human_mouse as _hm
 from common.account_proxy import (
+    IPMART_BITBROWSER_ERROR,
     bitbrowser_proxy_fields,
     lease_from_env,
     strip_http_proxy_env,
@@ -171,7 +172,12 @@ def create_claude_profile(bb, name, account_lease=None):
     proxy_fields = (
         bitbrowser_proxy_fields(account_lease) if account_lease else {}
     )
-    return bb.create_browser(name=name, **proxy_fields)
+    try:
+        return bb.create_browser(name=name, **proxy_fields)
+    except Exception:
+        if account_lease is not None:
+            raise RuntimeError(IPMART_BITBROWSER_ERROR) from None
+        raise
 
 # web2api 验证服务地址
 WEB2API_BASE = "http://127.0.0.1:9000"
@@ -1620,6 +1626,7 @@ def get_magic_link_by_token(
     refresh_token,
     client_id="9e5f94bc-e8a4-4e73-b8be-63364c29d753",
     max_wait=90,
+    account_lease=None,
 ):
     from common.mailbox import get_link_by_token
 
@@ -1633,6 +1640,7 @@ def get_magic_link_by_token(
         must_contain="claude.ai/magic-link#",
         max_wait=max_wait,
         poll=5,
+        account_lease=account_lease,
     )
 
 
@@ -3201,7 +3209,13 @@ async def _get_and_verify_phone(page, max_attempts=2):
     return False
 
 
-async def register(profile_id, email="", email_password="", email_token=""):
+async def register(
+    profile_id,
+    email="",
+    email_password="",
+    email_token="",
+    account_lease=None,
+):
     """Run one registration. Returns sessionKey on success, None on failure."""
     bb = BitBrowser()
     start_time = time.time()
@@ -3409,7 +3423,12 @@ async def register(profile_id, email="", email_password="", email_token=""):
             magic_link = None
             if email_token:
                 print("  trying token API method...")
-                magic_link = get_magic_link_by_token(email, email_token, max_wait=60)
+                magic_link = get_magic_link_by_token(
+                    email,
+                    email_token,
+                    max_wait=60,
+                    account_lease=account_lease,
+                )
             if not magic_link:
                 outlook_page = await context.new_page()
                 magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
@@ -3434,7 +3453,12 @@ async def register(profile_id, email="", email_password="", email_token=""):
                     print(f"  resend error: {e}")
                 await asyncio.sleep(3)
                 if email_token:
-                    magic_link = get_magic_link_by_token(email, email_token, max_wait=60)
+                    magic_link = get_magic_link_by_token(
+                        email,
+                        email_token,
+                        max_wait=60,
+                        account_lease=account_lease,
+                    )
                 if not magic_link:
                     outlook_page = await context.new_page()
                     magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
@@ -4001,7 +4025,13 @@ async def main():
                 except Exception as e:
                     print(f"  [proxy] window update failed: {e}")
             try:
-                sk = await register(profile_id, email, email_password, email_token)
+                sk = await register(
+                    profile_id,
+                    email,
+                    email_password,
+                    email_token,
+                    account_lease=account_lease,
+                )
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "OK" if sk else "FAIL", "sk": sk})
             except Exception as e:

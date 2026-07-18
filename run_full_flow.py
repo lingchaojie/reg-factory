@@ -46,7 +46,11 @@ try:
 except Exception:
     pass
 
-from common.account_proxy import lease_to_env, strip_http_proxy_env
+from common.account_proxy import (
+    HTTP_PROXY_ENV_KEYS,
+    lease_to_env,
+    strip_http_proxy_env,
+)
 from common.ipmart_proxy import (
     IPMartProxyError,
     acquire_proxy,
@@ -207,9 +211,13 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
     """跑一轮 A+B。返回 Stage B 的 exit code（0=成功）；没拿到邮箱返回 1。"""
     t0 = time.time()
     round_env = dict(env)
+    original_http_proxy_env = {
+        key: round_env[key] for key in HTTP_PROXY_ENV_KEYS if key in round_env
+    }
     account_lease = None
     ipmart_settings = settings_from_env(round_env)
-    if ipmart_settings.enabled and not args.dry_run:
+    needs_account_lease = not args.skip_email or "claude" in args.platforms
+    if ipmart_settings.enabled and needs_account_lease and not args.dry_run:
         try:
             account_lease = acquire(env=round_env)
         except IPMartProxyError as exc:
@@ -239,7 +247,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         # emails.txt 里可能没记密码，用快照里的
         password = password or args.password
 
-    if account_lease is not None:
+    if account_lease is not None and "claude" in args.platforms:
         try:
             verify(
                 account_lease,
@@ -251,9 +259,15 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             return 1, email
 
     # Stage B
+    platform_env = round_env
+    if account_lease is not None and any(
+        platform != "claude" for platform in args.platforms
+    ):
+        platform_env = dict(round_env)
+        platform_env.update(original_http_proxy_env)
     print("=" * 64)
     rc = stage_platforms(
-        args, round_env, email, password, token, client_id
+        args, platform_env, email, password, token, client_id
     )
     print("=" * 64)
     dt = time.time() - t0

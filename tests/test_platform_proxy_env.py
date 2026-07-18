@@ -43,10 +43,25 @@ class PlatformProxyEnvTests(unittest.TestCase):
         for key in ACCOUNT_PROXY_KEYS:
             self.assertEqual(env[key], self.env[key])
 
-    def test_chatgpt_and_grok_restore_existing_clash_behavior(self):
+    def test_chatgpt_and_grok_preserve_exact_original_http_routes(self):
         for platform in ("chatgpt", "grok"):
             with self.subTest(platform=platform):
                 env = register_three_platforms.platform_child_env(platform, self.env)
+                for key in HTTP_PROXY_KEYS:
+                    self.assertEqual(env[key], "http://stale.invalid")
+                for key in ACCOUNT_PROXY_KEYS:
+                    self.assertNotIn(key, env)
+
+    def test_chatgpt_and_grok_fall_back_to_clash_without_original_route(self):
+        base_env = {
+            key: value for key, value in self.env.items()
+            if key not in HTTP_PROXY_KEYS
+        }
+        for platform in ("chatgpt", "grok"):
+            with self.subTest(platform=platform):
+                env = register_three_platforms.platform_child_env(
+                    platform, base_env
+                )
                 for key in HTTP_PROXY_KEYS:
                     self.assertEqual(env[key], "http://127.0.0.1:7897")
                 for key in ACCOUNT_PROXY_KEYS:
@@ -124,7 +139,7 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         for platform in ("chatgpt", "grok"):
             for key in HTTP_PROXY_KEYS:
                 self.assertEqual(
-                    captured[platform][key], "http://127.0.0.1:7897"
+                    captured[platform][key], "http://stale.invalid"
                 )
             for key in ACCOUNT_PROXY_KEYS:
                 self.assertNotIn(key, captured[platform])
