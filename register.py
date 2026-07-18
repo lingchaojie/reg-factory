@@ -8,6 +8,7 @@ Usage: python register.py [--count N]
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import random
@@ -42,6 +43,8 @@ from common.ipmart_proxy import (
     acquire_proxy,
     settings_from_env,
 )
+from common.claude_email_accounts import ClaudeEmailAccount
+from common.ninemail_mailbox import NineMallMailboxClient
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -61,6 +64,10 @@ from config import (
     CAPSOLVER_API_KEY,
     EZCAPTCHA_API_KEY,
     EZCAPTCHA_API_BASE,
+    NINEMALL_API_BASE,
+    NINEMALL_API_PASSWORD,
+    NINEMALL_HTTP_TIMEOUT,
+    NINEMALL_POLL_INTERVAL,
 )
 
 # single registration timeout (seconds)
@@ -1647,6 +1654,53 @@ def get_magic_link_by_token(
     )
 
 
+def build_ninemail_client():
+    return NineMallMailboxClient(
+        base_url=NINEMALL_API_BASE,
+        api_password=NINEMALL_API_PASSWORD,
+        http_timeout=NINEMALL_HTTP_TIMEOUT,
+        poll_interval=NINEMALL_POLL_INTERVAL,
+    )
+
+
+async def fetch_claude_magic_link(
+    context,
+    account,
+    max_wait,
+    received_after=None,
+    account_lease=None,
+    ninemail_client=None,
+):
+    if account.provider == "NINEMALL":
+        client = ninemail_client or build_ninemail_client()
+        return await asyncio.to_thread(
+            client.poll_magic_link,
+            account,
+            max_wait,
+            received_after,
+        )
+    link = None
+    if account.refresh_token:
+        fetch_token_link = functools.partial(
+            get_magic_link_by_token,
+            account.email,
+            account.refresh_token,
+            client_id=account.client_id or "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+            max_wait=max_wait,
+            account_lease=account_lease,
+        )
+        link = await asyncio.to_thread(fetch_token_link)
+    if link:
+        return link
+    outlook_page = await context.new_page()
+    try:
+        return await get_magic_link_outlook_pw(
+            outlook_page, account.email, account.password, max_wait=max_wait
+        )
+    finally:
+        await outlook_page.close()
+
+
 # ---- 多语言按钮匹配（BitBrowser 节点地区不同，Claude 登录界面语言可能是 英/日/中/繁/韩/西/法/德）----
 CONTINUE_EMAIL_LABELS = [
     # 具体"用邮箱继续"优先，避免误点 Continue with Google/Apple
@@ -1792,7 +1846,7 @@ async def get_magic_link_outlook_pw(page, email, password, max_wait=90):
                         continue
                 link = await _find_in_current_folder()
                 if link:
-                    print(f"  magic link ({fname}): {link[:80]}")
+                    print(f"  magic link found ({fname})")
                     return link
 
             elapsed = int(time.time() - start)
@@ -3416,6 +3470,7 @@ async def register(
             await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
             await asyncio.sleep(1)
 
+            magic_requested_at = time.time()
             if not await click_continue_email(page):
                 print("  [warn] continue-email button not found in any language")
             check_timeout()
@@ -3423,55 +3478,50 @@ async def register(
             # poll magic link from outlook inbox
             print("\n[4/6] get magic link...")
             # 优先用 OAuth token 方式（快，不需要浏览器）
-            magic_link = None
-            if email_token:
-                print("  trying token API method...")
-                magic_link = get_magic_link_by_token(
-                    email,
-                    email_token,
-                    max_wait=60,
-                    account_lease=account_lease,
-                )
-            if not magic_link:
-                outlook_page = await context.new_page()
-                magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
+            account = ClaudeEmailAccount(
+                provider="OUTLOOK",
+                email=email,
+                password=email_password,
+                client_id="",
+                refresh_token=email_token,
+            )
+            magic_link = await fetch_claude_magic_link(
+                context,
+                account,
+                max_wait=60,
+                received_after=magic_requested_at,
+                account_lease=account_lease,
+            )
 
             # 如果没收到，重新发一次
             if not magic_link:
                 print("  magic link not received, resending...")
-                if email_token:
-                    await outlook_page.close() if 'outlook_page' in dir() else None
-                else:
-                    await outlook_page.close()
                 # 回到 Claude 登录页重新发
+                resend_requested_at = time.time()
                 try:
                     await page.goto(CLAUDE_LOGIN_URL, timeout=30000)
                     await asyncio.sleep(5)
                     await solve_turnstile(page, max_wait=30)
                     await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
                     await asyncio.sleep(1)
+                    resend_requested_at = time.time()
                     await click_continue_email(page)
                     print("  resent magic link")
                 except Exception as e:
                     print(f"  resend error: {e}")
                 await asyncio.sleep(3)
-                if email_token:
-                    magic_link = get_magic_link_by_token(
-                        email,
-                        email_token,
-                        max_wait=60,
-                        account_lease=account_lease,
-                    )
-                if not magic_link:
-                    outlook_page = await context.new_page()
-                    magic_link = await get_magic_link_outlook_pw(outlook_page, email, email_password, max_wait=60)
+                magic_link = await fetch_claude_magic_link(
+                    context,
+                    account,
+                    max_wait=60,
+                    received_after=resend_requested_at,
+                    account_lease=account_lease,
+                )
 
             if not magic_link:
-                await outlook_page.close()
                 raise Exception("magic link timeout, no email received")
 
-            await outlook_page.close()
-            print(f"  link: {magic_link[:80]}...")
+            print("  magic link found")
             # open magic link
             try:
                 await page.goto(magic_link, timeout=60000)
@@ -3798,19 +3848,24 @@ async def register(
                         print(f"  re-login email: {email}")
                         await human_type(page, 'input[type="email"], input[name="email"], input[id="email"]', email)
                         await asyncio.sleep(1)
+                        relogin_requested_at = time.time()
                         await click_continue_email(page)
                         print("  clicked continue")
 
                         # 获取新 magic link（等几秒让新邮件到达，避免读到旧的）
                         print("  getting new magic link (waiting 10s for new email)...")
                         await asyncio.sleep(10)
-                        re_outlook = await context.new_page()
-                        re_magic = await get_magic_link_outlook_pw(re_outlook, email, email_password, max_wait=60)
-                        await re_outlook.close()
+                        re_magic = await fetch_claude_magic_link(
+                            context,
+                            account,
+                            max_wait=60,
+                            received_after=relogin_requested_at,
+                            account_lease=account_lease,
+                        )
                         if not re_magic:
                             print("  re-login: magic link not received")
                             break
-                        print(f"  re-login magic link: {re_magic[:80]}...")
+                        print("  re-login magic link found")
                         await page.goto(re_magic, timeout=30000)
                         await asyncio.sleep(5)
                         print(f"  re-login URL: {page.url}")
