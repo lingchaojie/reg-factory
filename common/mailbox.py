@@ -25,6 +25,8 @@ from common.ipmart_proxy import requests_proxy_url
 
 DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GRAPH_FOLDERS = ["inbox", "junkemail"]
+INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
+JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
 
 # Microsoft OAuth and Graph traffic uses the explicit or inherited account
 # lease when present. Without a lease, trust_env=False keeps legacy mailbox
@@ -496,12 +498,12 @@ async def fetch_from_broker(email, password, sender_hint, subject_hint, regex, k
                 data = await resp.json()
         val = data.get("value")
         if val:
-            print(f"  [broker] got {kind}: {val[:50]}")
+            print(f"  [broker] got {kind}")
         else:
-            print(f"  [broker] no {kind} ({data.get('error', 'timeout')})")
+            print(f"  [broker] no {kind}")
         return val
-    except Exception as e:
-        print(f"  [broker] fetch error: {e}")
+    except Exception as exc:
+        print(f"  [broker] fetch error: {_safe_error(exc)}")
         return None
 
 
@@ -548,9 +550,6 @@ async def get_code_outlook_pw(
         except Exception:
             pass
         await _dismiss_inbox_popup(page)   # 关掉通知权限/引导弹窗
-
-    INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
-    JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
 
     start = time.time()
     while time.time() - start < max_wait:

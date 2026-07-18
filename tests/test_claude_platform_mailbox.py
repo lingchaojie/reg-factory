@@ -1,7 +1,11 @@
+import asyncio
 import unittest
+from unittest.mock import AsyncMock, Mock, call, patch
 
+from common import claude_platform_mailbox
 from common.claude_platform_mailbox import (
     ClaudePlatformMessage,
+    ClaudePlatformVerification,
     extract_claude_platform_verification,
 )
 
@@ -171,6 +175,147 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
 
                 self.assertIsNone(result)
 
+    def test_graph_poll_returns_both_artifacts_and_forwards_account_route(self):
+        lease = object()
+        received_after = 2_000_000_000.0
+        graph_message = {
+            "subject": "Your Claude Platform verification code is 482731",
+            "from": "no-reply@anthropic.com",
+            "body": (
+                '<html><body><p>Use this login code to sign in.</p>'
+                '<a href="https://platform.claude.com/magic-link?code=graph-secret">'
+                "Continue</a></body></html>"
+            ),
+            "received": "2033-05-18T03:33:25Z",
+        }
+
+        with patch("common.mailbox._get_access_token", return_value="access-token") as token, patch(
+            "common.mailbox.fetch_messages",
+            side_effect=([graph_message], []),
+        ) as fetch, patch("builtins.print") as output:
+            result = claude_platform_mailbox.get_claude_platform_verification_by_token(
+                "person@example.com",
+                "refresh-secret",
+                "client-guid",
+                max_wait=1,
+                received_after=received_after,
+                account_lease=lease,
+            )
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(
+            result.magic_link,
+            "https://platform.claude.com/magic-link?code=graph-secret",
+        )
+        token.assert_called_once_with(
+            "refresh-secret", "client-guid", account_lease=lease
+        )
+        self.assertEqual(
+            fetch.call_args_list,
+            [
+                call("access-token", "inbox", top=10, account_lease=lease),
+                call("access-token", "junkemail", top=10, account_lease=lease),
+            ],
+        )
+        rendered = " ".join(str(item) for item in output.call_args_list)
+        for secret in (
+            "482731",
+            "graph-secret",
+            "refresh-secret",
+            "client-guid",
+            "person@example.com",
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_graph_poll_rejects_stale_artifact_using_received_after(self):
+        stale = {
+            "subject": "Your Claude verification code is 482731",
+            "from": "no-reply@anthropic.com",
+            "body": "Use this login code to sign in.",
+            "received": "2020-01-01T00:00:00Z",
+        }
+        clock = iter((0.0, 0.0, 2.0, 2.0))
+
+        with patch("common.mailbox._get_access_token", return_value="token"), patch(
+            "common.mailbox.fetch_messages", side_effect=([stale], [])
+        ), patch.object(claude_platform_mailbox.time, "time", side_effect=clock), patch.object(
+            claude_platform_mailbox.time, "sleep"
+        ), patch("builtins.print"):
+            result = claude_platform_mailbox.get_claude_platform_verification_by_token(
+                "person@example.com",
+                "refresh-secret",
+                "client-guid",
+                max_wait=1,
+                received_after=2_000_000_000.0,
+            )
+
+        self.assertIsNone(result)
+
+    def test_browser_folder_scan_uses_shared_extractor_for_both_artifacts(self):
+        page = Mock()
+        page.evaluate = AsyncMock(
+            side_effect=(
+                True,
+                {
+                    "subject": "Your Claude Platform verification code is 482731",
+                    "body": (
+                        "Use this login code. "
+                        "https://platform.claude.com/magic-link?code=browser-secret"
+                    ),
+                },
+            )
+        )
+
+        with patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(
+                claude_platform_mailbox._scan_claude_platform_folder(
+                    page, received_after=0.0
+                )
+            )
+
+        self.assertEqual(result.code, "482731")
+        self.assertEqual(
+            result.magic_link,
+            "https://platform.claude.com/magic-link?code=browser-secret",
+        )
+
+    def test_outlook_password_poll_scans_shared_inbox_and_junk_names(self):
+        page = Mock()
+        page.goto = AsyncMock()
+        verification = ClaudePlatformVerification(code="482731", received_at=2_000_000_001.0)
+
+        with patch("common.mailbox._outlook_login", new=AsyncMock(return_value=True)) as login, patch(
+            "common.mailbox._click_folder", new=AsyncMock()
+        ) as click_folder, patch.object(
+            claude_platform_mailbox,
+            "_scan_claude_platform_folder",
+            new=AsyncMock(side_effect=(None, verification)),
+        ) as scan, patch.object(claude_platform_mailbox.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(
+                claude_platform_mailbox.get_claude_platform_verification_outlook_pw(
+                    page,
+                    "person@example.com",
+                    "mail-pass",
+                    max_wait=1,
+                    received_after=2_000_000_000.0,
+                )
+            )
+
+        from common import mailbox
+
+        self.assertEqual(result, verification)
+        login.assert_awaited_once_with(page, "person@example.com", "mail-pass")
+        self.assertEqual(
+            click_folder.await_args_list,
+            [call(page, mailbox.INBOX_NAMES), call(page, mailbox.JUNK_NAMES)],
+        )
+        self.assertEqual(
+            scan.await_args_list,
+            [
+                call(page, received_after=2_000_000_000.0),
+                call(page, received_after=2_000_000_000.0),
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()
