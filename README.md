@@ -55,7 +55,7 @@
 
 ## 1. 前置条件
 
-### ① 指纹浏览器（二选一）
+### ① 指纹浏览器（三选一）
 
 **选项 A：BitBrowser（默认）**
 - 安装并**启动**比特浏览器客户端，确保本地 API 在线（默认 `http://127.0.0.1:54345`）。
@@ -64,6 +64,12 @@
 **选项 B：AdsPower**
 - 安装并**启动** AdsPower 客户端，开启 Local API（默认 `http://127.0.0.1:50325`）。
 - 在 `.env` 设置 `FINGERPRINT_BROWSER=adspower`，并按本机 AdsPower 配置填写 `ADSPOWER_API_KEY`（启用鉴权时必填）。
+
+**选项 C：Octo Browser**
+- 需要 Octo Browser **Base 或更高套餐**的 API 访问权限，以及主账号（master-account）的 API token；将 token 填入 `OCTO_API_TOKEN`，不要提交到仓库。
+- 安装并保持 Octo 客户端运行。创建、更新、列出和删除 profile 走 Public API（默认 `https://app.octobrowser.net`）；启动和停止 profile 走本机 Local API（默认 `http://127.0.0.1:58888`）。
+- 在 `.env` 设置 `FINGERPRINT_BROWSER=octo`。兼容 provider 别名 `octobrowser` 和 `octo_browser`；默认仍是 `bitbrowser`。
+- 本适配不实现 Octo one-time profile 模式；使用普通 profile，并沿用现有的创建、启动、关闭和清理生命周期。
 
 客户端要保持运行——脚本通过本地 API 创建/打开/关闭浏览器窗口。
 
@@ -210,7 +216,7 @@ cp .env.example .env
 |---|---|---|
 | `CLASH_SECRET` | Clash Verge External Controller 的 secret | 走节点时必填 |
 | `CLASH_API` | Clash 控制面地址（默认 `http://127.0.0.1:9097`） | 否 |
-| `CLASH_PROXY` | Clash 混合端口代理（默认 `http://127.0.0.1:7897`） | 否 |
+| `CLASH_PROXY` | Clash 混合端口代理（默认 `http://127.0.0.1:7897`）；IPMart 关闭时仅在端口可达才使用，否则自动直连 | 否 |
 | `CLASH_GROUP` | 切换出口的代理组名（默认 `GLOBAL`） | 否 |
 | `IPMART_ENABLED` | 每账号使用一个 IPMart 固定网关 SID 租约；`1` 启用，默认 `0` | 否 |
 | `IPMART_PROXY_HOST` | IPMart 控制台显示的固定网关主机名 | 启用 IPMart 时 |
@@ -219,11 +225,14 @@ cp .env.example .env
 | `IPMART_PROXY_PASSWORD` | IPMart 控制台显示的代理密码；WebUI 按密钥遮挡 | 启用 IPMart 时 |
 | `IPMART_MAX_ATTEMPTS` | 获取或验证失败时的正整数尝试上限（默认 `3`，不硬性限制为 3） | 否 |
 | `IPMART_IP_CHECK_URL` | 真实出口 IP 校验地址（默认 ipify JSON API） | 否 |
-| `FINGERPRINT_BROWSER` | 指纹浏览器 provider：`bitbrowser` / `adspower`（默认 `bitbrowser`） | 否 |
+| `FINGERPRINT_BROWSER` | 指纹浏览器 provider：`bitbrowser` / `adspower` / `octo`（兼容 `octobrowser`、`octo_browser`；默认 `bitbrowser`） | 否 |
 | `BITBROWSER_API` | 比特浏览器本地 API（默认 `http://127.0.0.1:54345`） | 否 |
 | `ADSPOWER_API` | AdsPower 本地 API（默认 `http://127.0.0.1:50325`） | 使用 AdsPower 时 |
 | `ADSPOWER_API_KEY` | AdsPower Local API 鉴权 key（未启用鉴权可留空） | 否 |
 | `ADSPOWER_GROUP_ID` | AdsPower 新建 profile 的分组 ID（默认 `0`） | 否 |
+| `OCTO_API_TOKEN` | Octo Browser 主账号 API token；Public API 请求必填 | 使用 Octo 时 |
+| `OCTO_PUBLIC_API` | Octo Public API（默认 `https://app.octobrowser.net`）；也兼容优先级更高的 `OCTO_PUBLIC_API_BASE` | 否 |
+| `OCTO_LOCAL_API` | Octo Local API（默认 `http://127.0.0.1:58888`）；也兼容优先级更高的 `OCTO_LOCAL_API_BASE` | 否 |
 | `SMS_TOKEN` | 接码平台 firefox.fun 的 token | 需手机号时必填 |
 | `HERO_SMS_API_KEY` | 备用接码 hero-sms.com 的 api_key | 否 |
 | `CAPSOLVER_API_KEY` | CapSolver 打码 key（Grok 注册过 Turnstile 用它） | Grok 必填 |
@@ -297,7 +306,7 @@ python run_full_flow.py --platforms chatgpt --email-confirm-before-register  # O
 python run_full_flow.py --skip-email --email a@outlook.com --password xxx
 python run_full_flow.py --dry-run             # 只打印将执行的命令
 ```
-> 自动注入 `HTTP(S)_PROXY` 与 `CLASH_API/SECRET/GROUP` 给子进程。
+> `IPMART_ENABLED=0` 时会在启动前探测 `CLASH_PROXY`：端口可达才自动注入既有 Clash 路由；未配置、格式无效或不可达时会清除 `HTTP(S)_PROXY` 并直连。`--proxy ""` 可显式强制直连。
 > `--import-c2a` 逐层透传到 `register_chatgpt.py`，只对 chatgpt 平台生效，需先配 `CHATGPT2API_URL/KEY`。
 > `--email-confirm-before-register` 会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
 
@@ -327,11 +336,11 @@ python run_full_flow.py --platforms claude --dry-run
 python run_full_flow.py --platforms claude --rounds 1
 ```
 
-启用后，每个候选 SID 都在本地生成并渲染进控制台用户名模板。同一个已验证的 SID 租约贯穿本轮 **Outlook BitBrowser、OAuth token 提取、Microsoft Graph 邮箱读取和 Claude BitBrowser**。正常首候选成功时恰好发起两次专用 IP 校验请求：获取租约时一次，进入 Claude 前再一次；失败或出口重复才会按 `IPMART_MAX_ATTEMPTS` 更换 SID 重试。出口变化会终止本轮。
+启用后，每个候选 SID 都在本地生成并渲染进控制台用户名模板。同一个已验证的 SID 租约贯穿本轮 **Outlook → Microsoft Graph token 提取 → 邮箱读取 → Claude**，包括这些步骤所用的当前指纹浏览器 provider。正常首候选成功时恰好发起两次专用 IP 校验请求：获取租约时一次，进入 Claude 前再一次；失败或出口重复才会按 `IPMART_MAX_ATTEMPTS` 更换 SID 重试。出口变化会终止本轮。
 
 IPMart 的粘性时长由控制台/套餐决定，常见范围为 5-30 分钟；一轮 Outlook → Claude 必须在同一 SID 的有效期内完成。出口 IP 会记录到本地 `ipmart_proxy_usage.jsonl`，防止后续账号重复使用；严格去重只支持由一个 `run_full_flow.py` 编排进程顺序运行，不要同时启动多个独立编排器。
 
-这项迁移只覆盖默认 Outlook → Claude 边界：启用 IPMart 后该链路不需要 Clash，也不会使用继承的 HTTP 代理。ChatGPT 和 Grok 不在这次迁移内，继续保持原有代理行为。
+`IPMART_ENABLED=1` 是 fail-closed：默认 Outlook → Graph → mailbox → Claude 链路必须取得并验证同一个 IPMart 账号租约；若获取或复检失败，本轮终止，不会回退到 Clash 或直连。ChatGPT 和 Grok 不在这次迁移内，继续保持原有代理行为。
 
 ### 仅三平台注册（已有邮箱池 emails.txt）
 ```bash

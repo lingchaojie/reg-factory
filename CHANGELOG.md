@@ -1,5 +1,18 @@
 ﻿# 更新日志
 
+## 2026-07-19 — Octo Browser provider 与 Clash/直连预检
+
+**新增**
+- 新增 Octo Browser 指纹浏览器适配：设置 `FINGERPRINT_BROWSER=octo`（兼容 `octobrowser`、`octo_browser`）即可使用；默认 provider 仍为 BitBrowser。
+- Octo 的 profile 创建、更新、列出和删除使用 Public API，profile 启动和停止使用运行中客户端的 Local API。需 Base 或更高套餐 API 权限和主账号 token；配置通过 `OCTO_API_TOKEN`、`OCTO_PUBLIC_API`、`OCTO_LOCAL_API` 提供，不含明文凭据。
+- `IPMART_ENABLED=0` 时新增 Clash 端口预检：仅在 `CLASH_PROXY` 可达时走既有 Clash 路由，否则清除代理环境并直连；`--proxy ""` 可显式强制直连。
+
+**边界**
+- `IPMART_ENABLED=1` 的 Outlook → Graph → mailbox → Claude 链路维持同一 IPMart 租约且 fail-closed；ChatGPT、Grok 保持既有路由行为。
+- Octo 适配不实现 one-time profile 模式，使用既有普通 profile 生命周期。
+
+---
+
 ## 2026-07-19 — Claude 专用 NINEMALL 邮箱渠道
 
 - Claude 默认使用 NINEMALL 四列账号顺序（`email----password----client_id----refresh_token`）；`EMAIL_PROVIDER=OUTLOOK` 保留旧 Outlook 顺序和兼容流程。
