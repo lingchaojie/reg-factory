@@ -10,8 +10,9 @@ mailbox_broker.py — 共享取码服务（一号三用并行流水线的核心�
 不同 email 之间并行。idle reaper 自动回收空闲会话。
 
 端点:
-    POST /fetch    {email,password,sender_hint[],subject_hint[],regex,kind:"code"|"link",timeout}
-                   -> {ok:bool, value:str|None, error?:str}
+    POST /fetch    {email,password,sender_hint[],subject_hint[],regex,
+                    kind:"code"|"link"|"claude_platform",timeout}
+                   -> {ok:bool, value:str|object|None, error?:str}
     POST /release  {email}  -> 关闭并删除该号 BitBrowser 会话
     GET  /health   -> {ok, sessions:[email...]}
 
@@ -21,6 +22,7 @@ mailbox_broker.py — 共享取码服务（一号三用并行流水线的核心�
 
 import argparse
 import asyncio
+import math
 import re
 import sys
 import time
@@ -33,10 +35,24 @@ from playwright.async_api import async_playwright
 
 from bitbrowser import BitBrowser
 from common.browser import inject_stealth, create_browser_with_retry
-from common.mailbox import _outlook_login, _click_folder, _scan_current_folder
+from common.mailbox import (
+    _outlook_login,
+    _click_folder,
+    _scan_current_folder,
+    INBOX_NAMES,
+    JUNK_NAMES,
+)
 
-INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
-JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
+
+def _masked_email(email):
+    local, separator, domain = str(email or "").partition("@")
+    if not separator:
+        return "***"
+    return f"{local[:2]}***@{domain}"
+
+
+def _safe_error(exc):
+    return type(exc).__name__ if exc is not None else "unknown error"
 
 # magic-link 提取 JS（移植自 register.py get_magic_link_outlook_pw 的 _find_in_current_folder）
 _LINK_JS = """
@@ -102,6 +118,7 @@ class Session:
         self.lock = asyncio.Lock()
         self.last_used = time.time()
         self.seen = set()          # 已返回过的值，防两平台抢同一封
+        self.platform_seen = set()
         self.logged_in = False
         self.just_created = False  # 本次 ensure_session 是否触发了新登录(用于规避基线 race)
 
@@ -134,7 +151,8 @@ class Broker:
             if not s:
                 s = Session(email, password)
                 self.sessions[email] = s
-            print(f"  [broker] creating Outlook session for {email}")
+            display_email = _masked_email(email)
+            print(f"  [broker] creating Outlook session for {display_email}")
             try:
                 pid = create_browser_with_retry(self.bb, f"mbx_{int(time.time())}")
                 if not pid:
@@ -168,10 +186,13 @@ class Broker:
                     pass
                 s.logged_in = True
                 s.just_created = True
-                print(f"  [broker] session ready: {email}")
+                print(f"  [broker] session ready: {display_email}")
                 return s
-            except Exception as e:
-                print(f"  [broker] session init failed for {email}: {e}")
+            except Exception as exc:
+                print(
+                    f"  [broker] session init failed for {display_email}: "
+                    f"{_safe_error(exc)}"
+                )
                 await self._close_session(email)
                 raise
 
@@ -209,13 +230,108 @@ class Broker:
         except Exception:
             return 0
 
-    async def fetch(self, email, password, sender_hint, subject_hint, regex, kind, timeout):
+    async def _scan_platform_artifact(
+        self,
+        page,
+        received_after=None,
+        seen_ids=None,
+        deadline=None,
+    ):
+        from common.claude_platform_mailbox import _scan_claude_platform_folder
+
+        result = await _scan_claude_platform_folder(
+            page,
+            received_after=received_after,
+            deadline=deadline,
+            seen_ids=seen_ids,
+        )
+        if not result:
+            return None
+        return {
+            "magic_link": result.magic_link,
+            "code": result.code,
+            "received_at": result.received_at,
+        }
+
+    async def _fetch_platform(
+        self,
+        session,
+        folders,
+        timeout,
+        received_after,
+        display_email,
+    ):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        first_pass = True
+        while first_pass or time.monotonic() < deadline:
+            first_pass = False
+            for key, names in folders:
+                await _click_folder(session.page, names)
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(2.0, remaining))
+                value = await self._scan_platform_artifact(
+                    session.page,
+                    received_after=received_after,
+                    seen_ids=session.platform_seen,
+                    deadline=deadline if timeout > 0 else None,
+                )
+                if not value:
+                    continue
+                fallback_identity = (
+                    str(value.get("magic_link") or ""),
+                    str(value.get("code") or ""),
+                    float(value.get("received_at") or 0.0),
+                )
+                if fallback_identity in session.seen:
+                    continue
+                session.seen.add(fallback_identity)
+                session.last_used = time.time()
+                print(
+                    f"  [broker] {display_email} claude_platform "
+                    f"artifact found ({key})"
+                )
+                return value
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(6.0, remaining))
+        print(
+            f"  [broker] {display_email} claude_platform timeout "
+            "(no current email arrived)"
+        )
+        return None
+
+    async def fetch(
+        self,
+        email,
+        password,
+        sender_hint,
+        subject_hint,
+        regex,
+        kind,
+        timeout,
+        received_after=None,
+    ):
+        display_email = _masked_email(email)
         s = await self.ensure_session(email, password)
         async with s.lock:
             s.last_used = time.time()
             pat = re.compile(regex) if kind == "code" else None
             hints = [h.lower() for h in (tuple(sender_hint) + tuple(subject_hint)) if h]
             folders = [("inbox", INBOX_NAMES), ("junk", JUNK_NAMES)]
+            if kind == "claude_platform":
+                if received_after is None:
+                    return None
+                if not hasattr(s, "platform_seen"):
+                    s.platform_seen = set()
+                return await self._fetch_platform(
+                    s,
+                    folders,
+                    timeout,
+                    received_after,
+                    display_email,
+                )
 
             # 基线：记录每个文件夹"当前"匹配邮件数。注册脚本是先触发发码/发链接、再调 /fetch，
             # 故此刻收件箱里的匹配邮件都是【旧的】(MS 欢迎/安全码、上一轮旧验证码)，全部计入基线并忽略。
@@ -224,7 +340,7 @@ class Broker:
                 await _click_folder(s.page, names)
                 await asyncio.sleep(1.5)
                 baseline[key] = await self._count_matching(s.page, hints)
-            print(f"  [broker] {email} baseline {kind} counts: {baseline}")
+            print(f"  [broker] {display_email} baseline {kind} counts: {baseline}")
 
             # 规避基线 race：broker 登录 Outlook 要 20~30s，注册脚本是"先触发发码、再调 /fetch"，
             # 等 broker 登进来数基线时，本轮验证码/链接往往【已经到达】并被计入基线 → 死等"数量增加"必然超时。
@@ -236,12 +352,26 @@ class Broker:
                     await asyncio.sleep(2)
                     if kind == "link":
                         val = await self._scan_link(s.page)
+                    elif kind == "claude_platform":
+                        val = await self._scan_platform_artifact(s.page)
                     else:
                         val = await _scan_current_folder(s.page, pat, tuple(sender_hint), tuple(subject_hint))
-                    if val and val not in s.seen:
-                        s.seen.add(val)
+                    seen_value = (
+                        (
+                            str(val.get("magic_link") or ""),
+                            str(val.get("code") or ""),
+                            float(val.get("received_at") or 0.0),
+                        )
+                        if kind == "claude_platform" and isinstance(val, dict)
+                        else val
+                    )
+                    if val and seen_value not in s.seen:
+                        s.seen.add(seen_value)
                         s.last_used = time.time()
-                        print(f"  [broker] {email} {kind} (first-scan after fresh login, {key}) -> {val[:60]}")
+                        print(
+                            f"  [broker] {display_email} {kind} artifact found "
+                            f"(first-scan after fresh login, {key})"
+                        )
                         return val
 
             start = time.time()
@@ -255,22 +385,37 @@ class Broker:
                     # 有新邮件到达 -> 取顶部(列表时间倒序，第一封=最新)那封提码/链接
                     if kind == "link":
                         val = await self._scan_link(s.page)
+                    elif kind == "claude_platform":
+                        val = await self._scan_platform_artifact(s.page)
                     else:
                         val = await _scan_current_folder(s.page, pat, tuple(sender_hint), tuple(subject_hint))
-                    if val and val not in s.seen:
-                        s.seen.add(val)
+                    seen_value = (
+                        (
+                            str(val.get("magic_link") or ""),
+                            str(val.get("code") or ""),
+                            float(val.get("received_at") or 0.0),
+                        )
+                        if kind == "claude_platform" and isinstance(val, dict)
+                        else val
+                    )
+                    if val and seen_value not in s.seen:
+                        s.seen.add(seen_value)
                         s.last_used = time.time()
-                        print(f"  [broker] {email} {kind} (fresh, {key} {baseline[key]}->{cur}) -> {val[:60]}")
+                        print(
+                            f"  [broker] {display_email} {kind} artifact found "
+                            f"(fresh, {key} {baseline[key]}->{cur})"
+                        )
                         return val
                     # 取到空/已 seen：抬高基线，避免同一封反复触发
                     baseline[key] = cur
                 elapsed = int(time.time() - start)
-                print(f"  [broker] {email} waiting NEW {kind} ({elapsed}s/{timeout}s)")
+                print(f"  [broker] {display_email} waiting NEW {kind} ({elapsed}s/{timeout}s)")
                 await asyncio.sleep(6)
-            print(f"  [broker] {email} {kind} timeout (no new email arrived)")
+            print(f"  [broker] {display_email} {kind} timeout (no new email arrived)")
             return None
 
     async def _close_session(self, email):
+        display_email = _masked_email(email)
         s = self.sessions.pop(email, None)
         if not s:
             return
@@ -289,7 +434,7 @@ class Broker:
                 self.bb.delete_browser(s.pid)
             except Exception:
                 pass
-        print(f"  [broker] released session: {email}")
+        print(f"  [broker] released session: {display_email}")
 
     async def reaper(self):
         while True:
@@ -298,7 +443,7 @@ class Broker:
             stale = [e for e, s in list(self.sessions.items())
                      if now - s.last_used > self.idle_timeout and not s.lock.locked()]
             for e in stale:
-                print(f"  [broker] idle reap: {e}")
+                print(f"  [broker] idle reap: {_masked_email(e)}")
                 await self._close_session(e)
 
 
@@ -318,12 +463,50 @@ async def h_fetch(request):
     subject_hint = body.get("subject_hint") or ("code", "verify", "verification", "confirm")
     regex = body.get("regex") or r"\b(\d{6})\b"
     kind = body.get("kind") or "code"
-    timeout = int(body.get("timeout") or 150)
     try:
-        val = await broker.fetch(email, password, sender_hint, subject_hint, regex, kind, timeout)
+        timeout = float(
+            150 if body.get("timeout") in (None, "") else body.get("timeout")
+        )
+    except (TypeError, ValueError, OverflowError):
+        return web.json_response(
+            {"ok": False, "error": "invalid timeout"},
+            status=400,
+        )
+    if not math.isfinite(timeout) or timeout <= 0:
+        return web.json_response(
+            {"ok": False, "error": "invalid timeout"},
+            status=400,
+        )
+    received_after = None
+    if kind == "claude_platform":
+        try:
+            received_after = float(body.get("received_after"))
+        except (TypeError, ValueError, OverflowError):
+            return web.json_response(
+                {"ok": False, "error": "invalid received_after"},
+                status=400,
+            )
+        if not math.isfinite(received_after) or received_after < 0:
+            return web.json_response(
+                {"ok": False, "error": "invalid received_after"},
+                status=400,
+            )
+    try:
+        val = await broker.fetch(
+            email,
+            password,
+            sender_hint,
+            subject_hint,
+            regex,
+            kind,
+            timeout,
+            received_after,
+        )
         return web.json_response({"ok": bool(val), "value": val})
-    except Exception as e:
-        return web.json_response({"ok": False, "value": None, "error": str(e)})
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "value": None, "error": _safe_error(exc)}
+        )
 
 
 async def h_release(request):

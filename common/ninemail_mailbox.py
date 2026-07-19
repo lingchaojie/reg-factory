@@ -8,6 +8,8 @@ import time
 
 import requests
 
+from common.claude_platform_mailbox import extract_claude_platform_verification
+
 
 @dataclass(frozen=True)
 class NineMallMessage:
@@ -302,6 +304,52 @@ class NineMallMailboxClient:
                 return link
             if not self._sleep_bounded(
                 self.poll_interval, deadline, cancel_event
+            ):
+                break
+        return None
+
+    def poll_claude_platform_verification(
+        self,
+        account,
+        max_wait,
+        received_after=None,
+        *,
+        cancel_event=None,
+    ):
+        try:
+            wait_budget = float(max_wait)
+        except (TypeError, ValueError):
+            raise ValueError("max_wait must be positive") from None
+        if wait_budget <= 0:
+            raise ValueError("max_wait must be positive")
+        deadline = self.clock() + wait_budget
+        while not self._stopped(deadline, cancel_event):
+            messages = []
+            for folder in ("INBOX", "Junk"):
+                if self._stopped(deadline, cancel_event):
+                    return None
+                try:
+                    messages.extend(self.fetch_folder(
+                        account,
+                        folder,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    ))
+                except NineMallMailboxError as exc:
+                    if not exc.retryable:
+                        raise
+                if self._stopped(deadline, cancel_event):
+                    return None
+            result = extract_claude_platform_verification(
+                messages,
+                received_after=received_after,
+            )
+            if result:
+                return result
+            if not self._sleep_bounded(
+                self.poll_interval,
+                deadline,
+                cancel_event,
             ):
                 break
         return None

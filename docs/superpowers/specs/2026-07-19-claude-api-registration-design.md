@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-19
 
-**Status:** Approved for implementation planning
+**Status:** Implemented; final lifecycle and durability review incorporated
 
 ## Goal
 
@@ -97,9 +97,15 @@ Claude Platform: mail_used_claude_api.txt / mail_error_claude_api.txt
 ```
 
 The two namespaces allow the same address to be reserved independently by the
-two platform flows. Within one namespace, existing locking and sticky terminal
-states still prevent duplicate concurrent use. The new files must be ignored
-by Git.
+two platform flows. Every source read, reservation, release, and terminal-state
+write runs under a per-root interprocess advisory lock as well as an in-process
+thread lock. Ledger updates are written to a private temporary file, fsynced,
+and atomically replaced. A shared `claude` + `claude_api` reservation is one
+transaction: a credential-free journal records only each ledger filename and
+its pre-transaction size, and recovery truncates or removes every partially
+updated ledger before another process may select an address. Sticky terminal
+states still prevent duplicate use. Lock, journal, and state files must be
+ignored by Git.
 
 OUTLOOK reads the existing `emails.txt` source and uses
 `emails_used_claude_api.txt` / `emails_error_claude_api.txt` for the new
@@ -185,7 +191,8 @@ mailbox calls exactly as it is for the current Claude flow.
 ## Registration State Machine
 
 1. Reserve one account in the `claude_api` state namespace.
-2. Acquire and verify any configured account-scoped proxy lease.
+2. Start one monotonic account deadline, then acquire and verify any configured
+   account-scoped proxy lease within it.
 3. Create a temporary browser profile and open
    `https://platform.claude.com/`.
 4. Confirm the email login page is present.
@@ -208,9 +215,24 @@ mailbox calls exactly as it is for the current Claude flow.
     element jointly confirm entry to Claude Platform.
 15. Export the authenticated session and mark the `claude_api` reservation
     successful.
-16. On any failure or cancellation, close workers and browser resources, then
-    mark a sanitized error or release a reservation according to the existing
-    lifecycle rules.
+16. On any failure or cancellation, stop the current owner and clean up browser
+    resources before changing the reservation ledger. Synchronous profile
+    create/open/close/delete calls are serialized by one daemon owner so a
+    timed-out call cannot race cleanup. Profile deletion is submitted only
+    after profile close has completed successfully. A cancellation-resistant
+    Playwright operation retains ownership until it confirms completion; if
+    either async ownership or cleanup remains unconfirmed, keep the reservation
+    reserved and publish neither success nor error.
+
+The single account deadline covers proxy acquisition, profile creation,
+profile open, CDP connection, mail verification, onboarding, and session
+export. Each phase receives only the remaining time. The inner page state
+machine leaves a small settle margin inside that same deadline so its progress
+marker can be converted to a contextual terminal code rather than being
+overwritten by a generic outer timeout. Mail, code-confirmation, and console
+phases therefore preserve `mail_timeout`, `verification_rejected`, and
+`console_not_reached` respectively. Cleanup has a separately bounded safety
+budget; it never authorizes a concurrent delete or a false ledger terminal.
 
 If no personal option is available, or the console cannot be reached without
 creating a non-personal organization, the flow fails with
@@ -224,11 +246,15 @@ Save all authenticated cookies needed by Claude Platform under:
 cookies/claude_api/
 ```
 
-Use one deterministic, email-associated full-cookie JSON artifact per account,
-following the repository's existing safe filename conventions. Store the
-source email and non-secret metadata needed to locate the session, but do not
-copy the mailbox password, client ID, refresh token, NINEMALL API password,
-verification code, or magic link into the session index or logs.
+Use one unique, email-key-associated full-cookie JSON artifact per successful
+save, following the repository's existing safe filename conventions. Write a
+private temporary file, fsync it, atomically rename it, and only then publish
+its index record under an interprocess lock. On index failure, remove the new
+cookie artifact so the index cannot publish a missing reference. Store only a
+one-way email key and non-secret filename metadata; do not copy the source
+email, mailbox password, client ID, refresh token, NINEMALL API password,
+verification code, magic link, or cookie value into the session index or logs.
+On POSIX, newly written cookie and index files are mode `0600`.
 
 Do not assume Claude Platform uses the Claude.ai `sessionKey` cookie. Success
 is based on the authenticated console state and the exported cookie set. The
@@ -247,13 +273,18 @@ The generated command forwards email, password, refresh token, client ID,
 timeout, proxy context, and mailbox-provider configuration without printing
 secrets.
 
-A run containing only `claude_api` is a NINEMALL-eligible Claude-family run. In
-a run containing both `claude` and `claude_api`, the orchestrator reserves one
-source account and opens one purpose-specific state transaction for each child
-task. Each child marks only its own ledger, so one child may succeed while the
-other fails without corrupting or consuming the other's state. Mixed runs
-containing ChatGPT or Grok preserve the current legacy mailbox routing rules
-and must not accidentally route those platforms through NINEMALL.
+For `register_three_platforms.py --from-pool`, a `claude_api` run uses the
+currently selected provider, whether NINEMALL or OUTLOOK, and reserves its
+purpose-specific ledger. In a run containing both `claude` and `claude_api`,
+the orchestrator atomically reserves one source account for both purposes.
+Pure OUTLOOK `claude` retains its legacy `tri` pool contract so the existing
+Claude.ai flow remains unchanged.
+Each child marks only its own ledger, so one child may succeed while the other
+fails without corrupting or consuming the other's state. `run_full_flow.py`
+bypasses its mailbox-registration Stage A only for a NINEMALL Claude-family-only
+run; explicit OUTLOOK keeps the existing Stage A behavior. Mixed runs containing
+ChatGPT or Grok preserve the current legacy `tri` mailbox routing and must not
+route those platforms through NINEMALL.
 
 The existing `claude` option, default behavior, and result format remain
 unchanged. `claude_api` emits the same high-level success marker expected by the
@@ -279,7 +310,10 @@ Logs may include provider, folder, retry number, page-state name, and masked
 email address. Logs and exceptions must not include mailbox passwords, client
 IDs, refresh tokens, API passwords, request bodies, full API responses,
 verification codes, magic links, session cookies, or credential-bearing proxy
-URLs.
+URLs. Orchestrators also mask complete email addresses found in relayed child
+output. A run containing `claude_api` returns a nonzero status for child launch
+failure, nonzero child exit, or a missing semantic success marker; legacy runs
+without `claude_api` retain their prior exit convention.
 
 ## Testing
 

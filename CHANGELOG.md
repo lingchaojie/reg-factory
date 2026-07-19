@@ -14,6 +14,18 @@
 
 ---
 
+## 2026-07-19 — Claude Platform 个人账户注册
+
+- 新增 `register_claude_api.py` 独立入口，以及 `run_full_flow.py` / `register_three_platforms.py` 的 `claude_api` 选择；WebUI 增加“Claude API 注册”卡片并对密码、refresh token、client ID 的字段和命令预览统一脱敏。
+- Claude 家族专用流程在启动前选择 NINEMALL，并严格匹配 Anthropic/Claude 新邮件、解析 magic link 与数字验证码两类验证产物；选定后超时也不会回退 OUTLOOK。包含 ChatGPT 或 Grok 的混合流程在启动前直接选择 OUTLOOK，不会先尝试 NINEMALL，因此不是 NINEMALL 失败后的回退。
+- Claude Platform 与 Claude 网页号使用独立台账：`mail_used_claude_api.txt`、`mail_error_claude_api.txt`、`emails_used_claude_api.txt`、`emails_error_claude_api.txt`；登录会话保存到 `cookies/claude_api/`。
+- 邮箱台账增加跨进程锁、fsync 原子写入与双用途事务回滚；并发进程不会重复取得同一邮箱，也不会在部分写入后留下单边预留。
+- Claude Platform 的账号时限覆盖代理获取、profile 创建/打开、CDP 连接与注册状态机；同步浏览器 API 由守护 owner 串行执行，只有确认 close 完成后才允许 delete，未确认清理时不写成功/失败终态。
+- 会话 cookie 与索引采用耐中断发布，编排器转发日志会遮蔽完整邮箱；包含 `claude_api` 的子进程失败会传播为非零退出状态。
+- 当前范围仅选择 Claude Platform 个人账户：不创建组织，不创建 API Key，也不执行充值、付费或支付操作。
+
+---
+
 ## 2026-07-19 — Claude 专用 NINEMALL 邮箱渠道
 
 - Claude 默认使用 NINEMALL 四列账号顺序（`email----password----client_id----refresh_token`）；`EMAIL_PROVIDER=OUTLOOK` 保留旧 Outlook 顺序和兼容流程。

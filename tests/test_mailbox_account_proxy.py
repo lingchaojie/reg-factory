@@ -54,6 +54,11 @@ class TokenResponse:
         return {"access_token": "access-token"}
 
 
+class RejectedTokenResponse:
+    status_code = 400
+    text = "client-guid refresh-secret microsoft-detail"
+
+
 class MessagesResponse:
     status_code = 200
 
@@ -251,6 +256,66 @@ class MailboxAccountProxyTests(unittest.TestCase):
             result = mailbox.fetch_messages("access-token", "inbox")
         self.assertEqual(result, [])
         self._assert_credentials_not_printed(printer)
+
+    def test_token_http_error_does_not_print_microsoft_response_body(self):
+        session = FakeSession()
+        session.post = lambda *_args, **_kwargs: RejectedTokenResponse()
+
+        with patch.object(mailbox, "_ms_session", return_value=session), patch(
+            "builtins.print"
+        ) as printer:
+            result = mailbox._get_access_token("refresh-secret", "client-guid")
+
+        self.assertIsNone(result)
+        rendered = " ".join(str(item) for item in printer.call_args_list)
+        self.assertIn("400", rendered)
+        self.assertNotIn("microsoft-detail", rendered)
+        self.assertNotIn("refresh-secret", rendered)
+        self.assertNotIn("client-guid", rendered)
+
+    def test_token_deadline_clamps_timeout_and_prevents_retry_sleep(self):
+        now = [100.0]
+        calls = []
+
+        class ExpiringSession(FakeSession):
+            def post(self, *_args, **kwargs):
+                calls.append(kwargs["timeout"])
+                now[0] += kwargs["timeout"]
+                raise requests.Timeout("refresh-secret")
+
+        with patch.object(mailbox, "_ms_session", return_value=ExpiringSession()), patch.object(
+            mailbox.time, "monotonic", side_effect=lambda: now[0]
+        ), patch.object(mailbox.time, "sleep") as sleep, patch("builtins.print"):
+            result = mailbox._get_access_token(
+                "refresh-secret", "client-guid", deadline=100.1
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 0.1)
+        sleep.assert_not_called()
+
+    def test_message_deadline_clamps_timeout_and_prevents_retry_sleep(self):
+        now = [100.0]
+        calls = []
+
+        class ExpiringSession(FakeSession):
+            def get(self, *_args, **kwargs):
+                calls.append(kwargs["timeout"])
+                now[0] += kwargs["timeout"]
+                raise requests.Timeout("access-token")
+
+        with patch.object(mailbox, "_ms_session", return_value=ExpiringSession()), patch.object(
+            mailbox.time, "monotonic", side_effect=lambda: now[0]
+        ), patch.object(mailbox.time, "sleep") as sleep, patch("builtins.print"):
+            result = mailbox.fetch_messages(
+                "access-token", "inbox", deadline=100.1
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(len(calls), 1)
+        self.assertLessEqual(calls[0], 0.1)
+        sleep.assert_not_called()
 
     def _assert_credentials_not_printed(self, printer):
         rendered = " ".join(str(call) for call in printer.call_args_list)

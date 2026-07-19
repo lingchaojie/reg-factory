@@ -222,7 +222,7 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
             selected = register_three_platforms.next_pool_account(args)
         self.assertEqual(selected[0], "legacy@example.com")
         store.assert_not_called()
-        legacy.assert_called_once_with("tri")
+        legacy.assert_called_once_with("tri", display="masked")
 
     def test_mixed_platform_claude_child_forces_outlook_provider(self):
         args = platform_args(["claude", "chatgpt"])
@@ -259,7 +259,7 @@ class ClaudeNineMallEntrypointTests(unittest.TestCase):
             selected = register_three_platforms.next_pool_account(args)
         self.assertEqual(selected[0], "legacy@example.com")
         store.assert_not_called()
-        legacy.assert_called_once_with("tri")
+        legacy.assert_called_once_with("tri", display="masked")
 
     def test_full_flow_pure_claude_bypasses_stage_email(self):
         args = argparse.Namespace(platforms=["claude"])
@@ -683,7 +683,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(events)
         process = ControllableAsyncProcess(stdout, events)
@@ -712,7 +712,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(
             events, RuntimeError("post-spawn failure")
@@ -737,7 +737,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         stdout = ControllableAsyncStdout(
             events, RuntimeError("post-spawn failure")
@@ -1019,7 +1019,7 @@ class ClaudeChildLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = []
         store = FakeStore(self.account, events)
         reserved = register_three_platforms._ReservedPoolAccount(
-            self.account, store
+            self.account, {"claude": store}
         )
         process = NormalAsyncProcess(events)
 

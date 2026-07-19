@@ -54,6 +54,7 @@ from common.account_proxy import (
 from common.claude_email_accounts import (
     ClaudeEmailAccountStore,
     normalize_email_provider,
+    reserve_shared_claude_account,
 )
 from common.ipmart_proxy import (
     IPMartProxyError,
@@ -66,11 +67,16 @@ from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_sync_process,
 )
+from common.log_redaction import (
+    mask_email_text as _mask_email_text,
+    masked_email as _masked_email,
+)
 
 # 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
 CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
 PROXY_DEFAULT = os.environ.get("CLASH_PROXY", "http://127.0.0.1:7897")
+CLAUDE_FAMILY = {"claude", "claude_api"}
 
 
 class PlatformLaunchError(RuntimeError):
@@ -78,7 +84,7 @@ class PlatformLaunchError(RuntimeError):
 
 
 class _ReservedStageAccount(tuple):
-    def __new__(cls, account, store):
+    def __new__(cls, account, stores):
         values = (
             account.email,
             account.password,
@@ -87,7 +93,7 @@ class _ReservedStageAccount(tuple):
         )
         instance = super().__new__(cls, values)
         instance.account = account
-        instance.store = store
+        instance.stores = dict(stores)
         instance.active = True
         instance.owned_processes = set()
         return instance
@@ -100,12 +106,15 @@ class _ReservedStageAccount(tuple):
             self.owned_processes.discard(id(process))
 
     def release(self):
-        if self.active:
-            self.active = False
-            if self.owned_processes:
-                return False
-            return self.store.release(self.account)
-        return False
+        if not self.active:
+            return False
+        if self.owned_processes:
+            return False
+        released = False
+        for store in self.stores.values():
+            released = store.release(self.account) or released
+        self.active = False
+        return released
 
 
 def _release_stage_account(account):
@@ -205,7 +214,11 @@ def stage_email(args, env):
                 break
             line = proc.stdout.readline()
             if line:
-                print(f"  [outlook] {line}", end="", flush=True)
+                print(
+                    f"  [outlook] {_mask_email_text(line)}",
+                    end="",
+                    flush=True,
+                )
             now = time.time()
             if now - last_check >= 2:
                 last_check = now
@@ -213,7 +226,11 @@ def stage_email(args, env):
                 fresh = [t for t in cur if t[0] not in before]
                 if fresh:
                     new_email = fresh[-1]
-                    log(f"检测到新邮箱：{new_email[0]} —— 停止 Stage A 循环", "A")
+                    log(
+                        f"检测到新邮箱：{_masked_email(new_email[0])} "
+                        "—— 停止 Stage A 循环",
+                        "A",
+                    )
                     break
             if now > deadline:
                 log(f"Stage A 总超时 {args.email_total_timeout}s 仍无新号", "A")
@@ -230,11 +247,13 @@ def stage_email(args, env):
     return new_email
 
 
-def is_ninemail_claude_only(args, env=None):
+def is_ninemail_claude_family_only(args, env=None):
     env = os.environ if env is None else env
+    selected = set(args.platforms)
     return (
         normalize_email_provider(env.get("EMAIL_PROVIDER")) == "NINEMALL"
-        and set(args.platforms) == {"claude"}
+        and bool(selected)
+        and selected <= CLAUDE_FAMILY
     )
 
 
@@ -244,12 +263,25 @@ def acquire_stage_account(
     stage_email_fn=stage_email,
     store_factory=ClaudeEmailAccountStore,
 ):
-    if is_ninemail_claude_only(args, env):
-        store = store_factory(provider="NINEMALL")
+    if getattr(args, "dry_run", False):
+        return stage_email_fn(args, env)
+    if is_ninemail_claude_family_only(args, env):
+        purposes = tuple(dict.fromkeys(
+            platform for platform in args.platforms
+            if platform in CLAUDE_FAMILY
+        ))
+        if len(purposes) > 1:
+            result = reserve_shared_claude_account("NINEMALL", purposes)
+            if result is None:
+                return None
+            account, stores = result
+            return _ReservedStageAccount(account, stores)
+        purpose = purposes[0]
+        store = store_factory(provider="NINEMALL", purpose=purpose)
         account = store.reserve_one()
         if account is None:
             return None
-        return _ReservedStageAccount(account, store)
+        return _ReservedStageAccount(account, {purpose: store})
     return stage_email_fn(args, env)
 
 
@@ -263,7 +295,11 @@ def stage_platforms(
     client_id="",
     process_owner=None,
 ):
-    log(f"Stage B 平台注册：{email}  platforms={','.join(args.platforms)}", "B")
+    log(
+        f"Stage B 平台注册：{_masked_email(email)}  "
+        f"platforms={','.join(args.platforms)}",
+        "B",
+    )
     # token 由 Stage A 注册时抽 Graph 写入 emails.txt；有真 token 走 Graph API 直收码(免浏览器)，
     # 没有(抽取失败回退 fresh/空)则下游退化到浏览器/broker 取码。
     cmd = [
@@ -335,7 +371,10 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
     }
     account_lease = None
     ipmart_settings = settings_from_env(round_env)
-    needs_account_lease = not args.skip_email or "claude" in args.platforms
+    needs_account_lease = (
+        not args.skip_email
+        or any(platform in CLAUDE_FAMILY for platform in args.platforms)
+    )
     if ipmart_settings.enabled and needs_account_lease and not args.dry_run:
         try:
             account_lease = acquire(env=round_env)
@@ -359,7 +398,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         email, password = args.email.strip(), args.password.strip()
         token = (getattr(args, "token", "") or "").strip()
         client_id = (getattr(args, "client_id", "") or "").strip()
-        log(f"跳过邮箱注册，直接用 {email}", "A")
+        log(f"跳过邮箱注册，直接用 {_masked_email(email)}", "A")
     else:
         got = acquire_stage_account(
             args,
@@ -377,7 +416,9 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
 
     completed = False
     try:
-        if account_lease is not None and "claude" in args.platforms:
+        if account_lease is not None and any(
+            platform in CLAUDE_FAMILY for platform in args.platforms
+        ):
             try:
                 verify(
                     account_lease,
@@ -391,7 +432,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
         # Stage B
         platform_env = round_env
         if account_lease is not None and any(
-            platform != "claude" for platform in args.platforms
+            platform not in CLAUDE_FAMILY for platform in args.platforms
         ):
             platform_env = dict(round_env)
             platform_env.update(original_http_proxy_env)
@@ -412,7 +453,7 @@ def run_once(args, env, acquire=acquire_proxy, verify=verify_proxy):
             _release_stage_account(reserved_account)
         print("=" * 64)
         dt = time.time() - t0
-        log(f"本轮结束  email={email}  Stage B exit={rc}  用时 {dt:.0f}s",
+        log(f"本轮结束  email={_masked_email(email)}  Stage B exit={rc}  用时 {dt:.0f}s",
             "OK" if rc == 0 else "WARN")
         completed = True
         return rc, email
@@ -441,7 +482,7 @@ def main():
                     help="循环注册轮数；1=只跑一次(默认)，0=无限循环(Ctrl+C 停)")
     ap.add_argument("--round-sleep", type=int, default=5, help="每轮之间间隔(s)")
     # Stage B
-    ap.add_argument("--platforms", nargs="+", choices=["claude", "chatgpt", "grok"],
+    ap.add_argument("--platforms", nargs="+", choices=["claude", "claude_api", "chatgpt", "grok"],
                     default=["claude"], help="默认只跑 claude（最稳）；grok 已知死结")
     ap.add_argument("--node", default="auto", help="claude/grok 走的 Clash 节点")
     ap.add_argument("--platform-timeout", type=int, default=600)

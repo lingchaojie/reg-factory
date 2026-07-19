@@ -40,12 +40,38 @@ class PlatformProxyEnvTests(unittest.TestCase):
             "https_proxy": "http://stale.invalid",
         }
 
-    def test_claude_child_has_no_environment_http_proxy(self):
-        env = register_three_platforms.platform_child_env("claude", self.env)
-        for key in HTTP_PROXY_KEYS:
-            self.assertNotIn(key, env)
-        for key in ACCOUNT_PROXY_KEYS:
-            self.assertEqual(env[key], self.env[key])
+    def test_claude_family_children_keep_lease_without_http_proxy(self):
+        for platform in ("claude", "claude_api"):
+            with self.subTest(platform=platform):
+                env = register_three_platforms.platform_child_env(
+                    platform, self.env
+                )
+                for key in HTTP_PROXY_KEYS:
+                    self.assertNotIn(key, env)
+                for key in ACCOUNT_PROXY_KEYS:
+                    self.assertEqual(env[key], self.env[key])
+
+    def test_claude_family_keeps_ninemail_only_without_other_platforms(self):
+        base_env = dict(self.env, EMAIL_PROVIDER="NINEMALL")
+        platforms = ["claude", "claude_api"]
+
+        for platform in platforms:
+            with self.subTest(platform=platform):
+                env = register_three_platforms.platform_child_env(
+                    platform, base_env, platforms
+                )
+                self.assertEqual(env["EMAIL_PROVIDER"], "NINEMALL")
+
+    def test_mixed_run_forces_outlook_for_both_claude_family_children(self):
+        base_env = dict(self.env, EMAIL_PROVIDER="NINEMALL")
+        platforms = ["claude", "claude_api", "chatgpt"]
+
+        for platform in ("claude", "claude_api"):
+            with self.subTest(platform=platform):
+                env = register_three_platforms.platform_child_env(
+                    platform, base_env, platforms
+                )
+                self.assertEqual(env["EMAIL_PROVIDER"], "OUTLOOK")
 
     def test_chatgpt_and_grok_preserve_exact_original_http_routes(self):
         for platform in ("chatgpt", "grok"):
@@ -261,7 +287,7 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
 
     async def capture_launch_envs(self, parallel):
         args = argparse.Namespace(
-            platforms=["claude", "chatgpt", "grok"],
+            platforms=["claude", "claude_api", "chatgpt", "grok"],
             parallel=parallel,
             timeout=600,
             node="auto",
@@ -320,10 +346,11 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         return order, captured
 
     def assert_platform_envs(self, captured):
-        for key in HTTP_PROXY_KEYS:
-            self.assertNotIn(key, captured["claude"])
-        for key in ACCOUNT_PROXY_KEYS:
-            self.assertEqual(captured["claude"][key], self.env[key])
+        for platform in ("claude", "claude_api"):
+            for key in HTTP_PROXY_KEYS:
+                self.assertNotIn(key, captured[platform])
+            for key in ACCOUNT_PROXY_KEYS:
+                self.assertEqual(captured[platform][key], self.env[key])
         for platform in ("chatgpt", "grok"):
             for key in HTTP_PROXY_KEYS:
                 self.assertEqual(
@@ -340,16 +367,16 @@ class PlatformLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reversed_sequential_order_runs_claude_first_with_lease(self):
         order, captured = await self.capture_launch_order(
-            ["chatgpt", "grok", "claude"], False, self.env
+            ["chatgpt", "claude_api", "grok", "claude"], False, self.env
         )
-        self.assertEqual(order, ["claude", "chatgpt", "grok"])
+        self.assertEqual(order, ["claude_api", "claude", "chatgpt", "grok"])
         self.assert_platform_envs(captured)
 
     async def test_reversed_parallel_order_prioritizes_claude_and_keeps_envs(self):
         order, captured = await self.capture_launch_order(
-            ["chatgpt", "grok", "claude"], True, self.env
+            ["chatgpt", "claude_api", "grok", "claude"], True, self.env
         )
-        self.assertEqual(order, ["claude", "chatgpt", "grok"])
+        self.assertEqual(order, ["claude_api", "claude", "chatgpt", "grok"])
         self.assert_platform_envs(captured)
 
     async def test_no_lease_sequential_order_stays_exactly_as_requested(self):

@@ -25,6 +25,8 @@ from common.ipmart_proxy import requests_proxy_url
 
 DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GRAPH_FOLDERS = ["inbox", "junkemail"]
+INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
+JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
 
 # Microsoft OAuth and Graph traffic uses the explicit or inherited account
 # lease when present. Without a lease, trust_env=False keeps legacy mailbox
@@ -52,16 +54,62 @@ def _safe_error(exc):
     return type(exc).__name__ if exc is not None else "unknown error"
 
 
+def _remaining(deadline):
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _bounded_timeout(default, deadline):
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return default
+    if remaining <= 0:
+        return None
+    return min(float(default), remaining)
+
+
+def _sleep_bounded(seconds, deadline):
+    remaining = _remaining(deadline)
+    duration = float(seconds) if remaining is None else min(float(seconds), remaining)
+    if duration <= 0:
+        return False
+    time.sleep(duration)
+    remaining = _remaining(deadline)
+    return remaining is None or remaining > 0
+
+
+async def _async_sleep_bounded(seconds, deadline=None):
+    remaining = _remaining(deadline)
+    duration = float(seconds) if remaining is None else min(float(seconds), remaining)
+    if duration <= 0:
+        return False
+    await asyncio.sleep(duration)
+    remaining = _remaining(deadline)
+    return remaining is None or remaining > 0
+
+
+def _bounded_timeout_ms(default, deadline):
+    timeout = _bounded_timeout(float(default) / 1000.0, deadline)
+    if timeout is None:
+        return None
+    return max(1, int(timeout * 1000))
+
+
 def _get_access_token(
     refresh_token,
     client_id=DEFAULT_CLIENT_ID,
     scope="https://graph.microsoft.com/Mail.Read",
     account_lease=None,
+    deadline=None,
 ):
     # Keep token refresh on the same account route as mailbox reads.
     sess = _ms_session(account_lease=account_lease)
     last_err = None
     for attempt in range(3):
+        request_timeout = _bounded_timeout(30, deadline)
+        if request_timeout is None:
+            break
         try:
             resp = sess.post(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
@@ -71,17 +119,17 @@ def _get_access_token(
                     "refresh_token": refresh_token,
                     "scope": scope,
                 },
-                timeout=30,
+                timeout=request_timeout,
             )
             if resp.status_code != 200:
-                print(f"  [mail] token refresh failed: {resp.status_code} {resp.text[:120]}")
+                print(f"  [mail] token refresh failed: {resp.status_code}")
                 return None
             return resp.json().get("access_token")
         except (requests.ConnectionError, requests.Timeout) as e:
             last_err = e
-            if attempt < 2:
-                time.sleep(1.5)
+            if attempt < 2 and _sleep_bounded(1.5, deadline):
                 continue
+            break
         except Exception as exc:
             print(f"  [mail] token error: {_safe_error(exc)}")
             return None
@@ -89,7 +137,13 @@ def _get_access_token(
     return None
 
 
-def fetch_messages(access_token, folder, top=10, account_lease=None):
+def fetch_messages(
+    access_token,
+    folder,
+    top=10,
+    account_lease=None,
+    deadline=None,
+):
     """拉取某文件夹最新邮件，返回 [{subject, from, body, received}]"""
     headers = {"Authorization": f"Bearer {access_token}"}
     url = (
@@ -101,12 +155,14 @@ def fetch_messages(access_token, folder, top=10, account_lease=None):
     sess = _ms_session(account_lease=account_lease)
     r = None
     for attempt in range(3):
+        request_timeout = _bounded_timeout(15, deadline)
+        if request_timeout is None:
+            return []
         try:
-            r = sess.get(url, headers=headers, timeout=15)
+            r = sess.get(url, headers=headers, timeout=request_timeout)
             break
         except (requests.ConnectionError, requests.Timeout) as exc:
-            if attempt < 2:
-                time.sleep(1.5)
+            if attempt < 2 and _sleep_bounded(1.5, deadline):
                 continue
             print(
                 f"  [mail] fetch {folder} retries exhausted: "
@@ -250,24 +306,32 @@ def get_link_by_token(
 
 # ========== 浏览器登录取信（refresh_token 失效时的兜底，已验证可用）==========
 
-async def _outlook_login(page, email, password):
+async def _outlook_login(page, email, password, deadline=None):
     """用邮箱密码登录 Outlook。返回是否成功进入邮箱。
     已验证：登录后可能跳 passkey 设置页，直接导航 inbox URL 可绕过。"""
     try:
-        await page.goto("https://login.live.com/", timeout=60000)
-        await asyncio.sleep(3)
+        timeout = _bounded_timeout_ms(60000, deadline)
+        if timeout is None:
+            return False
+        await page.goto("https://login.live.com/", timeout=timeout)
+        if not await _async_sleep_bounded(3, deadline):
+            return False
         ei = page.locator('input[type="email"], input[name="loginfmt"]').first
         if await ei.count() > 0:
             await ei.fill(email)
-            await asyncio.sleep(0.5)
+            if not await _async_sleep_bounded(0.5, deadline):
+                return False
             await page.keyboard.press("Enter")
-            await asyncio.sleep(3)
+            if not await _async_sleep_bounded(3, deadline):
+                return False
         pi = page.locator('input[type="password"], input[name="passwd"]').first
         if await pi.count() > 0:
             await pi.fill(password)
-            await asyncio.sleep(0.5)
+            if not await _async_sleep_bounded(0.5, deadline):
+                return False
             await page.keyboard.press("Enter")
-            await asyncio.sleep(5)
+            if not await _async_sleep_bounded(5, deadline):
+                return False
 
         # 密码提交后会出现若干中间页，逐个处理（轮询几轮，每轮点掉一个）：
         #  - 隐私/服务协议同意页 (Review your privacy / 隐私声明 / Accept and continue): 点 接受/同意/继续
@@ -280,7 +344,8 @@ async def _outlook_login(page, email, password):
                   "OK", "确定", "Next", "下一步", "Got it", "知道了"]
         skip = ["Skip", "跳过", "跳過", "Not now", "稍后", "稍後", "後で", "Maybe later", "今はしない", "暂时跳过"]
         for _ in range(6):
-            await asyncio.sleep(2)
+            if not await _async_sleep_bounded(2, deadline):
+                return False
             # 已经进入邮箱就停
             if "outlook" in (page.url or "") and "live.com/mail" in (page.url or ""):
                 break
@@ -301,7 +366,13 @@ async def _outlook_login(page, email, password):
                     b = page.locator(f'button:has-text("{label}"), input[value="{label}"], a:has-text("{label}")').first
                     if await b.count() > 0:
                         try:
-                            await b.click(timeout=3000); clicked = True; await asyncio.sleep(2); break
+                            click_timeout = _bounded_timeout_ms(3000, deadline)
+                            if click_timeout is None:
+                                return False
+                            await b.click(timeout=click_timeout); clicked = True
+                            if not await _async_sleep_bounded(2, deadline):
+                                return False
+                            break
                         except Exception:
                             pass
             # passkey/设置页优先点跳过
@@ -310,7 +381,13 @@ async def _outlook_login(page, email, password):
                     b = page.locator(f'button:has-text("{label}"), a:has-text("{label}")').first
                     if await b.count() > 0:
                         try:
-                            await b.click(timeout=3000); clicked = True; await asyncio.sleep(2); break
+                            click_timeout = _bounded_timeout_ms(3000, deadline)
+                            if click_timeout is None:
+                                return False
+                            await b.click(timeout=click_timeout); clicked = True
+                            if not await _async_sleep_bounded(2, deadline):
+                                return False
+                            break
                         except Exception:
                             pass
             if not clicked:
@@ -318,15 +395,21 @@ async def _outlook_login(page, email, password):
                     b = page.locator(f'button:has-text("{label}"), input[value="{label}"]').first
                     if await b.count() > 0:
                         try:
-                            await b.click(timeout=3000); clicked = True; await asyncio.sleep(2); break
+                            click_timeout = _bounded_timeout_ms(3000, deadline)
+                            if click_timeout is None:
+                                return False
+                            await b.click(timeout=click_timeout); clicked = True
+                            if not await _async_sleep_bounded(2, deadline):
+                                return False
+                            break
                         except Exception:
                             pass
             if not clicked:
                 # 没有可点的中间页按钮，尝试直接去邮箱
                 break
         return True
-    except Exception as e:
-        print(f"  [mail-pw] login error: {e}")
+    except Exception as exc:
+        print(f"  [mail-pw] login error: {_safe_error(exc)}")
         return False
 
 
@@ -496,12 +579,12 @@ async def fetch_from_broker(email, password, sender_hint, subject_hint, regex, k
                 data = await resp.json()
         val = data.get("value")
         if val:
-            print(f"  [broker] got {kind}: {val[:50]}")
+            print(f"  [broker] got {kind}")
         else:
-            print(f"  [broker] no {kind} ({data.get('error', 'timeout')})")
+            print(f"  [broker] no {kind}")
         return val
-    except Exception as e:
-        print(f"  [broker] fetch error: {e}")
+    except Exception as exc:
+        print(f"  [broker] fetch error: {_safe_error(exc)}")
         return None
 
 
@@ -548,9 +631,6 @@ async def get_code_outlook_pw(
         except Exception:
             pass
         await _dismiss_inbox_popup(page)   # 关掉通知权限/引导弹窗
-
-    INBOX_NAMES = ["收件箱", "Inbox", "受信トレイ"]
-    JUNK_NAMES = ["垃圾邮件", "Junk Email", "Junk", "迷惑メール"]
 
     start = time.time()
     while time.time() - start < max_wait:
