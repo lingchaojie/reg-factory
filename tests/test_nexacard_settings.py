@@ -15,16 +15,53 @@ from nexacard_otp.settings import (
 
 
 class NexaCardSettingsTests(unittest.TestCase):
-    def test_explicit_chrome_path_requires_a_chrome_executable(self):
+    def test_explicit_chrome_path_requires_trusted_google_install_hierarchy(self):
         with tempfile.TemporaryDirectory() as directory:
-            chrome = Path(directory) / "Chrome.EXE"
-            chrome.write_bytes(b"")
-            self.assertEqual(discover_chrome(str(chrome)), chrome)
+            chrome = (
+                Path(directory)
+                / "gOoGlE"
+                / "Chrome"
+                / "APPLICATION"
+                / "Chrome.EXE"
+            )
+            chrome.parent.mkdir(parents=True)
+            chrome.write_bytes(b"MZ")
+            self.assertEqual(discover_chrome(str(chrome)), chrome.resolve())
 
-            edge = Path(directory) / "msedge.exe"
-            edge.write_bytes(b"")
-            with self.assertRaisesRegex(FileNotFoundError, "chrome.exe"):
-                discover_chrome(str(edge))
+    def test_explicit_chrome_rejects_bundled_arbitrary_and_non_chrome_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = (
+                root
+                / "ms-playwright"
+                / "chromium-1234"
+                / "chrome-win"
+                / "chrome.exe",
+                root / "fingerprint-1234" / "chrome.exe",
+                root / "chrome.exe",
+                root / "Google" / "Chrome" / "Application" / "msedge.exe",
+            )
+            for candidate in candidates:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"")
+
+            for candidate in candidates:
+                with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                    FileNotFoundError, "Google Chrome"
+                ):
+                    discover_chrome(str(candidate))
+
+    def test_empty_localappdata_never_probes_relative_workspace_candidate(self):
+        relative_candidate = Path("Google/Chrome/Application/chrome.exe")
+
+        with patch.dict(os.environ, {"LOCALAPPDATA": ""}), patch.object(
+            Path,
+            "is_file",
+            autospec=True,
+            side_effect=lambda candidate: candidate == relative_candidate,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                discover_chrome()
 
     def test_missing_explicit_chrome_path_does_not_fall_back_to_auto_discovery(self):
         with tempfile.TemporaryDirectory() as directory:

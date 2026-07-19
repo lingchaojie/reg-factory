@@ -94,7 +94,8 @@ class GmailCodeReader:
                     exc, "Gmail API is temporarily unavailable"
                 )
 
-        credentials = refresh_credentials_after_unauthorized(credentials)
+        refresh_credentials_after_unauthorized(credentials)
+        credentials = cls._credentials_for(expected_email)
         try:
             return operation(credentials)
         except HttpError as exc:

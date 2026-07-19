@@ -73,23 +73,44 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _trusted_chrome_path(candidate: Path) -> Path | None:
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved.name.casefold() != "chrome.exe" or not resolved.is_file():
+        return None
+    installed_hierarchy = tuple(
+        part.casefold() for part in resolved.parts[-4:-1]
+    )
+    if installed_hierarchy != ("google", "chrome", "application"):
+        return None
+    return resolved
+
+
 def discover_chrome(explicit: str = "") -> Path:
     if explicit:
         configured = Path(explicit)
-        if configured.name.casefold() != "chrome.exe" or not configured.is_file():
+        trusted = _trusted_chrome_path(configured)
+        if trusted is None:
             raise FileNotFoundError(
-                "NEXACARD_CHROME_PATH must name an existing chrome.exe file"
+                "NEXACARD_CHROME_PATH must name an installed Google Chrome chrome.exe"
             )
-        return configured
+        return trusted
 
     candidates = [
         Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
     ]
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        candidates.append(
+            Path(local_app_data) / "Google/Chrome/Application/chrome.exe"
+        )
     for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+        trusted = _trusted_chrome_path(candidate)
+        if trusted is not None:
+            return trusted
     raise FileNotFoundError("Google Chrome executable was not found")
 
 

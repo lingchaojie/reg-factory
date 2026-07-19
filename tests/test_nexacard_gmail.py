@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
@@ -119,6 +119,65 @@ class NexaCardGmailTests(unittest.TestCase):
 
         self.assertIs(captured.exception, failure)
         build.assert_not_called()
+
+    def test_retry_revalidates_replaced_credentials_and_stops_on_email_mismatch(self):
+        initial_credentials = Mock(name="initial-owner-a")
+        replacement_credentials = Mock(name="replacement-owner-b")
+        mismatch = GmailAuthorizationRequired(
+            "authorized Gmail address does not match the configured verification email"
+        )
+        operation = Mock(
+            side_effect=[_gmail_http_error(401, "authError"), "must-not-retry"]
+        )
+
+        with patch(
+            "nexacard_otp.gmail_reader.load_authorized_credentials",
+            side_effect=[initial_credentials, mismatch],
+        ) as validate, patch(
+            "nexacard_otp.gmail_reader.refresh_credentials_after_unauthorized",
+            return_value=replacement_credentials,
+        ) as refresh:
+            with self.assertRaises(GmailAuthorizationRequired) as captured:
+                GmailCodeReader._run_with_auth_retry(
+                    operation, "owner@example.com"
+                )
+
+        self.assertIs(captured.exception, mismatch)
+        self.assertEqual(
+            validate.call_args_list,
+            [call("owner@example.com"), call("owner@example.com")],
+        )
+        refresh.assert_called_once_with(initial_credentials)
+        operation.assert_called_once_with(initial_credentials)
+
+    def test_retry_revalidates_same_owner_then_retries_operation_once(self):
+        initial_credentials = Mock(name="initial-owner-a")
+        refreshed_credentials = Mock(name="refreshed-owner-a")
+        operation = Mock(
+            side_effect=[_gmail_http_error(401, "authError"), "success"]
+        )
+
+        with patch(
+            "nexacard_otp.gmail_reader.load_authorized_credentials",
+            side_effect=[initial_credentials, refreshed_credentials],
+        ) as validate, patch(
+            "nexacard_otp.gmail_reader.refresh_credentials_after_unauthorized",
+            return_value=refreshed_credentials,
+        ) as refresh:
+            result = GmailCodeReader._run_with_auth_retry(
+                operation, "owner@example.com"
+            )
+
+        self.assertEqual(result, "success")
+        self.assertEqual(
+            validate.call_args_list,
+            [call("owner@example.com"), call("owner@example.com")],
+        )
+        refresh.assert_called_once_with(initial_credentials)
+        self.assertEqual(
+            operation.call_args_list,
+            [call(initial_credentials), call(refreshed_credentials)],
+        )
 
     def test_snapshot_paginates_all_ids_and_fetch_later_excludes_a_second_page_id(self):
         raw = _encoded(Path("tests/fixtures/nexacard_verification_code.eml").read_bytes())
