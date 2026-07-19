@@ -8,7 +8,12 @@ from zoneinfo import ZoneInfo
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from nexacard_otp.errors import NexaCardPageError, NexaCardTransientError, OtpLookupTimedOut
-from nexacard_otp.lookup import OtpLookupService, VerificationPage
+from nexacard_otp.lookup import (
+    OtpLookupService,
+    QUERY_MARKER_ADVANCED_SCRIPT,
+    QUERY_MARKER_INSTALL_SCRIPT,
+    VerificationPage,
+)
 from nexacard_otp.models import CardType, LookupInput, OtpRow
 
 
@@ -200,6 +205,25 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
         await reader.search_rows(page, self.lookup_b, self.settings)
         self.assertEqual(trace, ["fill", "marker", "click"])
         self.assertEqual(reader._settle_rows.await_args.kwargs["query_marker"], 11)
+
+    async def test_query_observer_is_limited_to_result_and_loading_roots(self):
+        self.assertNotIn("document.documentElement", QUERY_MARKER_INSTALL_SCRIPT)
+        for selector in (".el-table", "table tbody", ".el-table__empty-block", ".el-pagination", ".el-loading-mask"):
+            self.assertIn(selector, QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("disconnect()", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("resultObserver", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("loadingWasVisible", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("loadingWasVisible", QUERY_MARKER_ADVANCED_SCRIPT)
+        self.assertIn("new MutationObserver(() => { marker.generation += 1; })", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("if (marker.loadingWasVisible && !visible) marker.generation += 1;", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertIn("resultRoots.forEach", QUERY_MARKER_INSTALL_SCRIPT)
+        self.assertNotIn("document.body", QUERY_MARKER_INSTALL_SCRIPT)
+
+    async def test_query_marker_roots_missing_becomes_a_safe_page_error(self):
+        page = _RoutePage()
+        page.evaluate.return_value = None
+        with self.assertRaises(NexaCardPageError):
+            await VerificationPage()._query_marker(page)
 
     async def test_hash_login_route_signals_logout(self):
         page = _RoutePage("https://www.nexacardvcc.com/#/login")

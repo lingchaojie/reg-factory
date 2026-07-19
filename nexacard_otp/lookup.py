@@ -36,14 +36,48 @@ _QUERY_MARKER_KEY = "__nexacardOtpQueryMarker"
 QUERY_MARKER_INSTALL_SCRIPT = f"""
 () => {{
   const key = {_QUERY_MARKER_KEY!r};
-  const root = document.documentElement;
-  let marker = window[key];
-  if (!marker || marker.root !== root) {{
-    marker = {{ root, generation: 0 }};
-    marker.observer = new MutationObserver(() => {{ marker.generation += 1; }});
-    marker.observer.observe(root, {{ childList: true, subtree: true, attributes: true, characterData: true }});
-    window[key] = marker;
+  const previous = window[key];
+  if (previous && previous.observers) {{
+    previous.observers.forEach((observer) => observer.disconnect());
   }}
+  const unique = (nodes) => [...new Set(nodes.filter(Boolean))];
+  const resultRoots = unique([
+    document.querySelector('.el-table'),
+    document.querySelector('table tbody'),
+    document.querySelector('.el-table__empty-block'),
+    document.querySelector('.el-pagination'),
+  ]);
+  const loadingRoots = unique([
+    ...document.querySelectorAll('.el-loading-mask'),
+  ]);
+  if (!resultRoots.length) {{
+    delete window[key];
+    return null;
+  }}
+  const marker = {{ generation: 0, observers: [], loadingWasVisible: false }};
+  const loadingVisible = () => loadingRoots.some((node) => {{
+    if (!node.isConnected) return false;
+    const style = getComputedStyle(node);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }});
+  marker.loadingWasVisible = loadingVisible();
+  const resultObserver = new MutationObserver(() => {{ marker.generation += 1; }});
+  resultRoots.forEach((root) => resultObserver.observe(root, {{
+    childList: true, subtree: true, attributes: true, characterData: true,
+  }}));
+  marker.observers.push(resultObserver);
+  if (loadingRoots.length) {{
+    const loadingObserver = new MutationObserver(() => {{
+      const visible = loadingVisible();
+      if (marker.loadingWasVisible && !visible) marker.generation += 1;
+      marker.loadingWasVisible = visible;
+    }});
+    unique([...loadingRoots, ...loadingRoots.map((node) => node.parentElement)]).forEach((root) => {{
+      loadingObserver.observe(root, {{ childList: true, subtree: true, attributes: true }});
+    }});
+    marker.observers.push(loadingObserver);
+  }}
+  window[key] = marker;
   return marker.generation;
 }}
 """
@@ -55,7 +89,8 @@ QUERY_MARKER_ADVANCED_SCRIPT = f"""
     || Boolean(document.querySelector({USERNAME_INPUT!r}));
   const loadingVisible = loading && getComputedStyle(loading).display !== 'none'
     && getComputedStyle(loading).visibility !== 'hidden';
-  return Boolean(loggedOut || (marker && marker.generation > generation && !loadingVisible));
+  return Boolean(loggedOut || (marker && !marker.loadingWasVisible
+    && marker.generation > generation && !loadingVisible));
 }}
 """
 
