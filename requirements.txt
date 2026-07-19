@@ -5,6 +5,7 @@ curl_cffi
 Appium-Python-Client>=4.0.0
 selenium>=4.0.0
 fastapi
+httpx2
 uvicorn[standard]
 google-api-python-client>=2.100.0
 google-auth-httplib2>=0.2.0
