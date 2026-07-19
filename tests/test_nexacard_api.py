@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -7,8 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
-from nexacard_otp.app import create_app
+from nexacard_otp.app import _service_lifespan, create_app
 from nexacard_otp.errors import (
     GmailAuthorizationRequired,
     GmailTemporarilyUnavailable,
@@ -336,6 +338,96 @@ class NexaCardServiceEntrypointTests(unittest.TestCase):
         run.assert_called_once_with(
             "nexacard_otp.app:app", host="127.0.0.1", port=8811, reload=False
         )
+
+
+class NexaCardLifespanRaceTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _otp_endpoint(app):
+        return next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/otp")
+
+    @staticmethod
+    def _request(app, payload):
+        body = json.dumps(payload).encode("utf-8")
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/otp",
+                "headers": [(b"content-type", b"application/json")],
+                "app": app,
+            },
+            receive,
+        )
+
+    async def test_closing_generation_detaches_before_close_and_later_generation_survives(self):
+        app = create_app()
+        first_close_started = asyncio.Event()
+        release_first_close = asyncio.Event()
+
+        async def close_first_browser():
+            first_close_started.set()
+            await release_first_close.wait()
+
+        browser_one = Mock(login_lock=object())
+        browser_one.close = AsyncMock(side_effect=close_first_browser)
+        browser_two = Mock(login_lock=object())
+        browser_two.close = AsyncMock()
+        service_one = Mock()
+        service_one.lookup = AsyncMock(return_value="111111")
+        service_two = Mock()
+        service_two.lookup = AsyncMock(return_value="222222")
+        lookup_input = Mock()
+        payload = {
+            "card_number": "6500000000000037",
+            "card_type": "NexaCardB",
+            "order_created_at": "2026-07-19T05:30:20+08:00",
+        }
+
+        with patch(
+            "nexacard_otp.app.NativeChromeManager", side_effect=[browser_one, browser_two]
+        ) as browser_type, patch("nexacard_otp.app.GmailCodeReader"), patch(
+            "nexacard_otp.app.NexaCardLogin"
+        ), patch(
+            "nexacard_otp.app.OtpLookupService", side_effect=[service_one, service_two]
+        ) as service_type, patch("nexacard_otp.app.load_settings", return_value=_settings()), patch(
+            "nexacard_otp.app.parse_lookup_input", return_value=lookup_input
+        ):
+            first = _service_lifespan(app)
+            await first.__aenter__()
+            self.assertIs(app.state.lookup_service, service_one)
+
+            first_shutdown = asyncio.create_task(first.__aexit__(None, None, None))
+            await asyncio.wait_for(first_close_started.wait(), timeout=1)
+            self.assertFalse(hasattr(app.state, "browser"))
+            self.assertFalse(hasattr(app.state, "lookup_service"))
+
+            second = _service_lifespan(app)
+            await second.__aenter__()
+            self.assertIs(app.state.browser, browser_two)
+            self.assertIs(app.state.lookup_service, service_two)
+            response = await self._otp_endpoint(app)(self._request(app, payload))
+            self.assertEqual(response, {"otp": "222222"})
+
+            release_first_close.set()
+            await first_shutdown
+            self.assertIs(app.state.browser, browser_two)
+            self.assertIs(app.state.lookup_service, service_two)
+
+            await second.__aexit__(None, None, None)
+
+        self.assertEqual(browser_type.call_count, 2)
+        self.assertEqual(service_type.call_count, 2)
+        browser_one.close.assert_awaited_once_with()
+        browser_two.close.assert_awaited_once_with()
 
 
 if __name__ == "__main__":

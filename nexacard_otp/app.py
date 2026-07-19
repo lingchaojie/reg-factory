@@ -1,5 +1,6 @@
 """Local, secret-safe HTTP interface for NexaCard OTP lookups."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -59,39 +60,45 @@ def _restore_state_if_unchanged(app: FastAPI, name: str, written, previous) -> N
 @asynccontextmanager
 async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Wire services while respecting state owned by an enclosing lifespan."""
-    previous_browser = _state_value(app, "browser")
-    previous_lookup_service = _state_value(app, "lookup_service")
+    lock: asyncio.Lock = app._nexacard_lifespan_lock
+    previous_browser = _MISSING
+    previous_lookup_service = _MISSING
     owned_browser = _MISSING
     written_browser = _MISSING
     written_lookup_service = _MISSING
     try:
-        if previous_lookup_service is _MISSING:
-            browser = previous_browser
-            if browser is _MISSING:
-                browser = NativeChromeManager()
-                owned_browser = browser
-            reader = GmailCodeReader()
-            login = NexaCardLogin(browser.login_lock, reader)
-            lookup_service = OtpLookupService(browser, login)
-            if previous_browser is _MISSING:
-                app.state.browser = browser
-                written_browser = browser
-            app.state.lookup_service = lookup_service
-            written_lookup_service = lookup_service
+        async with lock:
+            previous_browser = _state_value(app, "browser")
+            previous_lookup_service = _state_value(app, "lookup_service")
+            if previous_lookup_service is _MISSING:
+                browser = previous_browser
+                if browser is _MISSING:
+                    browser = NativeChromeManager()
+                    owned_browser = browser
+                reader = GmailCodeReader()
+                login = NexaCardLogin(browser.login_lock, reader)
+                lookup_service = OtpLookupService(browser, login)
+                if previous_browser is _MISSING:
+                    app.state.browser = browser
+                    written_browser = browser
+                app.state.lookup_service = lookup_service
+                written_lookup_service = lookup_service
         yield
     finally:
-        try:
-            if owned_browser is not _MISSING:
-                await owned_browser.close()
-        finally:
+        # Detach before close: a later lifespan must create a fresh generation,
+        # never borrow a browser that is in the process of shutting down.
+        async with lock:
             _restore_state_if_unchanged(
                 app, "lookup_service", written_lookup_service, previous_lookup_service
             )
             _restore_state_if_unchanged(app, "browser", written_browser, previous_browser)
+        if owned_browser is not _MISSING:
+            await owned_browser.close()
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NexaCard OTP Service", lifespan=_service_lifespan)
+    app._nexacard_lifespan_lock = asyncio.Lock()
 
     @app.exception_handler(Exception)
     async def unexpected_failure(_request: Request, _exception: Exception) -> JSONResponse:
