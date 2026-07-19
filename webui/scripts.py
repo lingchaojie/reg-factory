@@ -14,6 +14,14 @@ positional=True 表示位置参数(不带 --，直接拼值)。
 
 # ============================================================ 入口脚本 schema
 SCRIPTS = [
+    {
+        "id": "nexacard_otp_service",
+        "file": "nexacard_otp_service.py",
+        "category": "NexaCard OTP",
+        "title": "NexaCard OTP 服务",
+        "desc": "启动本机直连 Chrome 的 OTP 查询 HTTP 服务（常驻）。",
+        "args": [],
+    },
     # ---------------------------------------------------------------- 主流程
     {
         "id": "run_full_flow",
@@ -297,6 +305,22 @@ EMBED_PAGES = []
 # group: 分组标题；key: 变量名；required: 是否必填(运行对应功能时)；help: 说明；
 # secret: True 时前端用密码框；default: 模板默认值(仅展示)。
 ENV_SCHEMA = [
+    {"group": "NexaCard OTP", "tests": [{"target": "nexacard", "label": "检测 OTP 服务"}], "items": [
+        {"key": "NEXACARD_ACCOUNT", "required": True, "help": "NexaCard 登录账号"},
+        {"key": "NEXACARD_PASSWORD", "required": True, "secret": True, "help": "NexaCard 登录密码"},
+        {"key": "NEXACARD_VERIFICATION_EMAIL", "required": True, "gmail_oauth": True,
+         "help": "NexaCard 登录验证邮箱；请在右侧完成 Google 鉴权"},
+        {"key": "NEXACARD_HEADLESS", "type": "choice", "choices": ["true", "false"], "default": "true",
+         "help": "默认无头运行；调试时可设为 false"},
+        {"key": "NEXACARD_CHROME_PATH", "help": "留空自动发现本机 Google Chrome"},
+        {"key": "NEXACARD_PAGE_TIMEZONE", "default": "Asia/Shanghai", "help": "页面裸时间和无时区订单时间的解释时区"},
+        {"key": "NEXACARD_OTP_POLL_INTERVAL_SECONDS", "type": "number", "default": 3,
+         "help": "OTP 刷新间隔（秒），必须为正数"},
+        {"key": "NEXACARD_OTP_MAX_ATTEMPTS", "type": "int", "default": 100,
+         "help": "OTP 最大查询次数，必须为正整数"},
+        {"key": "NEXACARD_SERVICE_HOST", "default": "127.0.0.1", "help": "OTP 服务监听地址"},
+        {"key": "NEXACARD_SERVICE_PORT", "type": "int", "default": 8811, "help": "OTP 服务监听端口"},
+    ]},
     {"group": "Claude 邮箱渠道", "items": [
         {"key": "EMAIL_PROVIDER", "type": "choice", "choices": ["NINEMALL", "OUTLOOK"],
          "default": "NINEMALL", "help": "Claude 邮箱渠道；默认 NINEMALL API 取信"},

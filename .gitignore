@@ -69,6 +69,9 @@ recordings/
 claude_node_usage.txt
 ipmart_proxy_usage.jsonl
 
+# NexaCard OTP private OAuth/browser runtime
+nexacard_otp/private/
+
 # 本地调试/运行期门控脚本与代理清单（不进库）
 codex_gated_launch.sh
 proxies_clash.txt
