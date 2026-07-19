@@ -13,9 +13,7 @@ Examples:
 
 import argparse
 import asyncio
-import hashlib
 import os
-import re
 import sys
 from datetime import datetime
 
@@ -37,6 +35,11 @@ from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_async_process,
 )
+from common.log_redaction import (
+    email_log_key as _email_log_key,
+    mask_email_text as _mask_email_text,
+    masked_email as _masked_email,
+)
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -46,29 +49,6 @@ CLAUDE_FAMILY = {"claude", "claude_api"}
 
 class PlatformLaunchError(RuntimeError):
     pass
-
-
-def _masked_email(email):
-    local, separator, domain = str(email or "").partition("@")
-    if not separator:
-        return "***"
-    return f"{local[:2]}***@{domain}"
-
-
-_EMAIL_TEXT_RE = re.compile(
-    r"(?i)\b[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
-)
-
-
-def _mask_email_text(value):
-    return _EMAIL_TEXT_RE.sub(
-        lambda match: _masked_email(match.group(0)), str(value or "")
-    )
-
-
-def _email_log_key(email):
-    normalized = str(email or "").strip().lower().encode("utf-8")
-    return hashlib.sha256(normalized).hexdigest()[:10]
 
 
 class _ReservedPoolAccount(tuple):
@@ -250,7 +230,7 @@ async def run_platform(
         if process_owner is not None:
             process_owner.track_process(proc)
 
-        saw_success = False
+        final_nonempty_line = ""
         with open(log_path, "w", encoding="utf-8", errors="replace") as log:
             assert proc.stdout is not None
             while True:
@@ -258,8 +238,8 @@ async def run_platform(
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace")
-                if "success: 1/1" in text.lower():
-                    saw_success = True
+                if text.strip():
+                    final_nonempty_line = text.strip()
                 display_text = _mask_email_text(text)
                 log.write(display_text)
                 log.flush()
@@ -279,6 +259,7 @@ async def run_platform(
             if process_owner is not None:
                 process_owner.confirm_process_stopped(proc, confirmed)
         raise
+    saw_success = final_nonempty_line.casefold() == "success: 1/1"
     ok = rc == 0 and saw_success
     status = "OK" if ok else f"FAIL(exit={rc}, success_marker={saw_success})"
     print(f"[{platform}] done: {status}")
@@ -293,7 +274,7 @@ def next_pool_account(args):
             if platform in CLAUDE_FAMILY
         ))
         if provider == "OUTLOOK" and purposes == ("claude",):
-            return email_pool.next_email("tri")
+            return email_pool.next_email("tri", display="masked")
         if len(purposes) > 1:
             result = reserve_shared_claude_account(provider, purposes)
             if result is None:
@@ -309,7 +290,7 @@ def next_pool_account(args):
         if account is None:
             return None
         return _ReservedPoolAccount(account, {purpose: store})
-    return email_pool.next_email("tri")
+    return email_pool.next_email("tri", display="masked")
 
 
 def parse_account(args):

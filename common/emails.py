@@ -11,6 +11,8 @@ import os
 import sys
 import threading
 
+from common.log_redaction import masked_email
+
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -38,9 +40,11 @@ def _load_used(platform):
     return used
 
 
-def next_email(platform):
+def next_email(platform, *, display="full"):
     """取下一个未被该平台占用的邮箱，返回 (email, password, refresh_token, client_id) 或 None。
     取出即标记 reserved，防止并发重复。"""
+    if display not in {"full", "masked", "silent"}:
+        raise ValueError("display must be full, masked, or silent")
     with _lock:
         if not os.path.exists(EMAILS_FILE):
             print(f"  [email] {EMAILS_FILE} not found")
@@ -60,7 +64,14 @@ def next_email(platform):
                 client_id = parts[3].strip() if len(parts) >= 4 else ""
                 with open(_used_file(platform), "a", encoding="utf-8") as uf:
                     uf.write(f"{email}----{password}----reserved\n")
-                print(f"  [email] picked for {platform}: {email}")
+                if display == "masked":
+                    shown = masked_email(email)
+                elif display == "silent":
+                    shown = None
+                elif display == "full":
+                    shown = email
+                if shown is not None:
+                    print(f"  [email] picked for {platform}: {shown}")
                 return email, password, token, client_id
         print(f"  [email] no unused emails left for {platform}")
         return None

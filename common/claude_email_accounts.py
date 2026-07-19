@@ -245,25 +245,31 @@ class ClaudeEmailAccountStore:
                     continue
                 parts = [part.strip() for part in value.split("----")]
                 email = parts[0].lower()
+                legacy_outlook_success = (
+                    self.provider == "OUTLOOK"
+                    and self.purpose == "claude"
+                    and len(parts) == 2
+                )
+                event_status = parts[-1].lower()
                 released = (
                     two_field_events
                     and len(parts) == 2
-                    and parts[1].lower() == "released"
+                    and event_status == "released"
                 ) or (
                     self.provider == "OUTLOOK"
                     and self.purpose == "claude"
                     and len(parts) >= 3
-                    and parts[-1].lower() == "released"
+                    and event_status == "released"
                 )
-                terminal_success = (
+                terminal_success = legacy_outlook_success or (
                     two_field_events
                     and len(parts) == 2
-                    and parts[1].lower() == "ok"
+                    and event_status == "ok"
                 ) or (
                     self.provider == "OUTLOOK"
                     and self.purpose == "claude"
                     and len(parts) >= 3
-                    and parts[-1].lower() == "ok"
+                    and event_status == "ok"
                 )
                 used_events.append((email, released))
                 if terminal_success:
@@ -303,7 +309,15 @@ class ClaudeEmailAccountStore:
                 if not value or value.startswith("#"):
                     continue
                 parts = [part.strip() for part in value.split("----")]
-                if parts[0].lower() == email and parts[-1].lower() == "ok":
+                if parts[0].lower() != email:
+                    continue
+                if (
+                    self.provider == "OUTLOOK"
+                    and self.purpose == "claude"
+                    and len(parts) == 2
+                ):
+                    return True
+                if parts[-1].lower() == "ok":
                     return True
         return False
 

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 import time
@@ -67,6 +66,10 @@ from common.process_lifecycle import (
     process_group_kwargs,
     shutdown_sync_process,
 )
+from common.log_redaction import (
+    mask_email_text as _mask_email_text,
+    masked_email as _masked_email,
+)
 
 # 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
 CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
@@ -77,24 +80,6 @@ CLAUDE_FAMILY = {"claude", "claude_api"}
 
 class PlatformLaunchError(RuntimeError):
     pass
-
-
-def _masked_email(email):
-    local, separator, domain = str(email or "").partition("@")
-    if not separator:
-        return "***"
-    return f"{local[:2]}***@{domain}"
-
-
-_EMAIL_TEXT_RE = re.compile(
-    r"(?i)\b[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
-)
-
-
-def _mask_email_text(value):
-    return _EMAIL_TEXT_RE.sub(
-        lambda match: _masked_email(match.group(0)), str(value or "")
-    )
 
 
 class _ReservedStageAccount(tuple):

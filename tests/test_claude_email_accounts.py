@@ -47,6 +47,32 @@ def _reserve_shared_in_process(root_dir, source_file, start_event, result_queue)
         result_queue.put((type(exc).__name__, str(exc)))
 
 
+def _crash_between_shared_ledger_writes(root_dir, source_file):
+    """Exit the process after the first real shared-ledger publication."""
+    from common.claude_email_accounts import (
+        ClaudeEmailAccountStore,
+        reserve_shared_claude_account,
+    )
+
+    real_append = ClaudeEmailAccountStore._append_state
+    calls = 0
+
+    def crash_after_first(store, path, account, status):
+        nonlocal calls
+        real_append(store, path, account, status)
+        calls += 1
+        if calls == 1:
+            os._exit(47)
+
+    ClaudeEmailAccountStore._append_state = crash_after_first
+    reserve_shared_claude_account(
+        "OUTLOOK",
+        ("claude", "claude_api"),
+        source_file,
+        root_dir,
+    )
+
+
 class ClaudeEmailAccountStoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -209,6 +235,29 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
             "legacy@example.com----MailboxPass2!----ok\n",
         )
 
+    def test_legacy_outlook_success_remains_terminal_after_api_failure(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        account, stores = reserve_shared_claude_account(
+            "OUTLOOK",
+            ("claude", "claude_api"),
+            source,
+            self.root,
+        )
+        with stores["claude"].used_file.open("a", encoding="utf-8") as ledger:
+            ledger.write(f"{account.email}----{account.password}\n")
+        stores["claude_api"].mark_error(account, "registration_error")
+
+        self.assertFalse(stores["claude"].release(account))
+        self.assertFalse(stores["claude_api"].release(account))
+
+        legacy_state = stores["claude"].used_file.read_text(encoding="utf-8")
+        self.assertNotIn("----released", legacy_state)
+        self.assertIsNone(
+            ClaudeEmailAccountStore(
+                "OUTLOOK", source, self.root, purpose="claude"
+            ).reserve_one()
+        )
+
     def test_ninemail_column_order(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")
         store = ClaudeEmailAccountStore("NINEMALL", source, self.root)
@@ -334,6 +383,38 @@ class ClaudeEmailAccountStoreTests(unittest.TestCase):
         for path, original in before.items():
             self.assertEqual(path.read_bytes(), original)
         self.assertFalse((self.root / ".claude_email_pool.journal").exists())
+
+    def test_spawned_crash_between_shared_writes_recovers_transaction(self):
+        source = self.write("emails.txt", OUTLOOK_ROW + "\n")
+        context = multiprocessing.get_context("spawn")
+        worker = context.Process(
+            target=_crash_between_shared_ledger_writes,
+            args=(str(self.root), str(source)),
+        )
+        worker.start()
+        worker.join(timeout=10)
+        self.assertEqual(worker.exitcode, 47)
+        self.assertTrue((self.root / ".claude_email_pool.journal").exists())
+
+        recovered = reserve_shared_claude_account(
+            "OUTLOOK",
+            ("claude", "claude_api"),
+            source,
+            self.root,
+        )
+
+        self.assertIsNotNone(recovered)
+        self.assertFalse((self.root / ".claude_email_pool.journal").exists())
+        for purpose in ("claude", "claude_api"):
+            ledger = ClaudeEmailAccountStore(
+                "OUTLOOK", source, self.root, purpose=purpose
+            ).used_file
+            reservations = [
+                line
+                for line in ledger.read_text(encoding="utf-8").splitlines()
+                if line.endswith("----reserved")
+            ]
+            self.assertEqual(len(reservations), 1)
 
     def test_nonpositive_limit_returns_empty_without_state_writes(self):
         source = self.write("mail.txt", NINEMALL_ROW + "\n")

@@ -96,6 +96,91 @@ def _run_main_with_hung_proxy_acquisition(result_queue):
     result_queue.put(asyncio.run(target.main()))
 
 
+def _run_fetch_with_hung_graph(result_queue):
+    """A Graph timeout must not keep asyncio.run's executor shutdown alive."""
+    import register_claude_api as target
+
+    def hung_graph(*_args, **_kwargs):
+        threading.Event().wait()
+
+    class Context:
+        async def new_page(self):
+            raise AssertionError("browser fallback raced an unconfirmed Graph owner")
+
+    target.get_claude_platform_verification_by_token = hung_graph
+    try:
+        asyncio.run(target.fetch_platform_verification(
+            Context(), account("OUTLOOK"), 0.02, 1234.5
+        ))
+    except BaseException as exc:
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("completed")
+
+
+def _run_cli_loop_with_never_stopping_async_owner(result_queue):
+    """The CLI runner must not await an owner that rejected cancellation."""
+    import register_claude_api as target
+
+    async def resistant_owner():
+        while True:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                continue
+
+    async def probe():
+        try:
+            await target._run_bounded(
+                resistant_owner(),
+                0.02,
+                cancel_grace=0,
+            )
+        except target._OperationUnconfirmed:
+            return "OperationUnconfirmed"
+        return "completed"
+
+    runner = getattr(target, "_run_cli_event_loop", asyncio.run)
+    result_queue.put(runner(probe()))
+
+
+def _run_cli_loop_cleanup_probe(result_queue, cleanup_kind):
+    """Spawn-safe probe for bounded ordinary CLI shutdown finalizers."""
+    import register_claude_api as target
+
+    events = []
+    held_generators = []
+
+    async def ordinary_task():
+        try:
+            await asyncio.Future()
+        finally:
+            events.append("cleanup-started")
+            await asyncio.sleep(0)
+            events.append("cleanup-finished")
+
+    async def ordinary_generator():
+        try:
+            yield "ready"
+        finally:
+            events.append("cleanup-started")
+            await asyncio.sleep(0)
+            events.append("cleanup-finished")
+
+    async def probe():
+        if cleanup_kind == "task":
+            asyncio.create_task(ordinary_task())
+            await asyncio.sleep(0)
+        else:
+            generator = ordinary_generator()
+            held_generators.append(generator)
+            await generator.__anext__()
+        return "completed"
+
+    result = target._run_cli_event_loop(probe())
+    result_queue.put((result, events))
+
+
 def account(provider="NINEMALL"):
     return ClaudeEmailAccount(
         provider,
@@ -320,53 +405,58 @@ class ClaudeApiProviderDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(channel_budgets[channel], overall_budget)
         self.assertLess(elapsed, 0.55)
 
-    async def test_cancellation_resistant_broker_cannot_block_browser_channel(self):
-        expected = ClaudePlatformVerification(code="482731")
+    async def test_cancellation_resistant_broker_stops_channel_fallback(self):
         page = Mock()
         page.close = AsyncMock()
         context = Mock()
         context.new_page = AsyncMock(return_value=page)
+        release = asyncio.Event()
 
         async def broker(*_args, **_kwargs):
-            try:
-                await asyncio.Future()
-            except asyncio.CancelledError:
-                await asyncio.sleep(0.12)
-                return None
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return None
 
-        with patch.dict(
-            register_claude_api.os.environ,
-            {"MAILBOX_BROKER": "http://broker.test"},
-            clear=True,
-        ), patch.object(
-            register_claude_api,
-            "get_claude_platform_verification_by_token",
-            return_value=None,
-        ), patch.object(
-            register_claude_api,
-            "fetch_claude_platform_from_broker",
-            side_effect=broker,
-        ), patch.object(
-            register_claude_api,
-            "get_claude_platform_verification_outlook_pw",
-            new=AsyncMock(return_value=expected),
-        ):
-            started = time.monotonic()
-            result = await asyncio.wait_for(
-                register_claude_api.fetch_platform_verification(
-                    context,
-                    account("OUTLOOK"),
-                    0.15,
-                    1234.5,
+        try:
+            with patch.dict(
+                register_claude_api.os.environ,
+                {"MAILBOX_BROKER": "http://broker.test"},
+                clear=True,
+            ), patch.object(
+                register_claude_api,
+                "get_claude_platform_verification_by_token",
+                return_value=None,
+            ), patch.object(
+                register_claude_api,
+                "fetch_claude_platform_from_broker",
+                side_effect=broker,
+            ), patch.object(
+                register_claude_api,
+                "get_claude_platform_verification_outlook_pw",
+                new=AsyncMock(
+                    return_value=ClaudePlatformVerification(code="482731")
                 ),
-                timeout=0.4,
-            )
-            elapsed = time.monotonic() - started
-        await asyncio.sleep(0.13)
+            ):
+                with self.assertRaises(
+                    register_claude_api._OperationUnconfirmed
+                ):
+                    await asyncio.wait_for(
+                        register_claude_api.fetch_platform_verification(
+                            context,
+                            account("OUTLOOK"),
+                            0.15,
+                            1234.5,
+                        ),
+                        timeout=0.4,
+                    )
+        finally:
+            release.set()
+            await register_claude_api._drain_retained_tasks(0.1)
 
-        self.assertIs(result, expected)
-        context.new_page.assert_awaited_once()
-        self.assertLess(elapsed, 0.14)
+        context.new_page.assert_not_awaited()
 
     async def test_outlook_page_close_failure_does_not_replace_found_artifact(self):
         expected = ClaudePlatformVerification(code="482731")
@@ -1037,6 +1127,66 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
                 release.set()
                 await self.drain_background_tasks()
 
+    async def test_outer_timeout_preserves_nested_daemon_unconfirmed_owner(self):
+        from common.owned_operation import run_daemon_call
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def hung_call():
+            started.set()
+            release.wait()
+
+        async def nested_owner():
+            return await run_daemon_call(
+                hung_call,
+                1.0,
+                name="nested-timeout-owner",
+            )
+
+        try:
+            with self.assertRaises(register_claude_api._OperationUnconfirmed):
+                await register_claude_api._run_owned_async(
+                    nested_owner(),
+                    0.02,
+                    cancel_grace=0.002,
+                )
+            self.assertTrue(started.is_set())
+        finally:
+            release.set()
+
+    async def test_caller_cancel_preserves_nested_daemon_unconfirmed_owner(self):
+        from common.owned_operation import run_daemon_call
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def hung_call():
+            started.set()
+            release.wait()
+
+        registration = asyncio.create_task(
+            register_claude_api._run_owned_async(
+                run_daemon_call(
+                    hung_call,
+                    1.0,
+                    name="nested-cancellation-owner",
+                ),
+                1.0,
+                cancel_grace=0.002,
+            )
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0)
+            registration.cancel()
+            with self.assertRaises(
+                register_claude_api._CancellationUnconfirmed
+            ):
+                await registration
+        finally:
+            release.set()
+
     def test_asyncio_run_does_not_wait_for_hung_profile_executor(self):
         context = multiprocessing.get_context("spawn")
         result_queue = context.Queue()
@@ -1053,6 +1203,90 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             )
             self.assertEqual(process.exitcode, 0)
             self.assertIsNone(result_queue.get(timeout=1))
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
+    def test_asyncio_run_does_not_wait_for_hung_graph_executor(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_fetch_with_hung_graph,
+            args=(result_queue,),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(
+                process.is_alive(),
+                "asyncio.run waited for the cancellation-resistant Graph call",
+            )
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(result_queue.get(timeout=1), "OperationUnconfirmed")
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
+    def test_cli_runner_does_not_wait_for_never_stopping_async_owner(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_cli_loop_with_never_stopping_async_owner,
+            args=(result_queue,),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(
+                process.is_alive(),
+                "CLI runner waited for a cancellation-resistant async owner",
+            )
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(result_queue.get(timeout=1), "OperationUnconfirmed")
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
+    def test_cli_runner_boundedly_drains_ordinary_task_cleanup(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_cli_loop_cleanup_probe,
+            args=(result_queue, "task"),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(
+                result_queue.get(timeout=1),
+                ("completed", ["cleanup-started", "cleanup-finished"]),
+            )
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
+    def test_cli_runner_boundedly_closes_ordinary_async_generators(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_cli_loop_cleanup_probe,
+            args=(result_queue, "generator"),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(
+                result_queue.get(timeout=1),
+                ("completed", ["cleanup-started", "cleanup-finished"]),
+            )
         finally:
             if process.is_alive():
                 process.terminate()
@@ -1157,6 +1391,278 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             finally:
                 release.set()
                 await self.drain_background_tasks()
+
+    async def _assert_nested_owner_retained(
+        self,
+        selected_account,
+        flow,
+        *,
+        expected_exception=None,
+        registration_timeout=0.2,
+        elapsed_bound=0.12,
+    ):
+        started_at = time.monotonic()
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            side_effect=flow,
+        ), patch.object(
+            register_claude_api,
+            "TASK_CANCEL_GRACE",
+            0.002,
+        ), patch.object(
+            register_claude_api,
+            "CLEANUP_OPERATION_TIMEOUT",
+            0.002,
+        ):
+            if expected_exception is None:
+                result = await register_claude_api.register_one(
+                    self.bb,
+                    selected_account,
+                    self.store,
+                    timeout=registration_timeout,
+                )
+            else:
+                with self.assertRaises(expected_exception):
+                    await register_claude_api.register_one(
+                        self.bb,
+                        selected_account,
+                        self.store,
+                        timeout=registration_timeout,
+                    )
+                result = None
+
+        self.assertIsNone(result)
+        self.assertLess(time.monotonic() - started_at, elapsed_bound)
+        self.browser.close.assert_not_awaited()
+        self.bb.close_browser.assert_not_called()
+        self.bb.delete_browser.assert_not_called()
+        self.store.mark_used.assert_not_called()
+        self.store.mark_error.assert_not_called()
+        self.store.release.assert_not_called()
+
+    async def test_cancellation_resistant_context_new_page_retains_all_owners(self):
+        selected = ClaudeEmailAccount(
+            "OUTLOOK", "person@example.com", "mail-pass", "", ""
+        )
+        release = asyncio.Event()
+
+        async def resistant_new_page():
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return Mock()
+
+        self.context.new_page = AsyncMock(side_effect=resistant_new_page)
+
+        async def flow(_page, context, *_args, **_kwargs):
+            return await register_claude_api.fetch_platform_verification(
+                context, selected, 0.02, 1234.5
+            )
+
+        try:
+            with patch.dict(register_claude_api.os.environ, {}, clear=True):
+                await self._assert_nested_owner_retained(selected, flow)
+        finally:
+            release.set()
+            await self.drain_background_tasks()
+
+    async def test_cancellation_resistant_outlook_poll_retains_all_owners(self):
+        selected = ClaudeEmailAccount(
+            "OUTLOOK", "person@example.com", "mail-pass", "", ""
+        )
+        release = asyncio.Event()
+        poll_started = asyncio.Event()
+        mailbox_page = Mock()
+        mailbox_page.close = AsyncMock()
+        self.context.new_page = AsyncMock(return_value=mailbox_page)
+
+        async def resistant_poll(*_args, **_kwargs):
+            poll_started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+            return None
+
+        async def flow(_page, context, *_args, **_kwargs):
+            fetch = asyncio.create_task(
+                register_claude_api.fetch_platform_verification(
+                    context, selected, 1.0, 1234.5
+                )
+            )
+            await poll_started.wait()
+            fetch.cancel()
+            return await fetch
+
+        try:
+            with patch.dict(
+                register_claude_api.os.environ, {}, clear=True
+            ), patch.object(
+                register_claude_api,
+                "get_claude_platform_verification_outlook_pw",
+                side_effect=resistant_poll,
+            ):
+                await self._assert_nested_owner_retained(
+                    selected,
+                    flow,
+                    expected_exception=(
+                        register_claude_api._CancellationUnconfirmed
+                    ),
+                )
+            mailbox_page.close.assert_not_called()
+        finally:
+            release.set()
+            await self.drain_background_tasks()
+
+    async def test_cancellation_resistant_outlook_page_close_retains_all_owners(self):
+        selected = ClaudeEmailAccount(
+            "OUTLOOK", "person@example.com", "mail-pass", "", ""
+        )
+        release = asyncio.Event()
+        mailbox_page = Mock()
+
+        async def resistant_close():
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        mailbox_page.close = AsyncMock(side_effect=resistant_close)
+        self.context.new_page = AsyncMock(return_value=mailbox_page)
+
+        async def flow(_page, context, *_args, **_kwargs):
+            return await register_claude_api.fetch_platform_verification(
+                context, selected, 0.04, 1234.5
+            )
+
+        try:
+            with patch.dict(
+                register_claude_api.os.environ, {}, clear=True
+            ), patch.object(
+                register_claude_api,
+                "get_claude_platform_verification_outlook_pw",
+                new=AsyncMock(
+                    return_value=ClaudePlatformVerification(code="482731")
+                ),
+            ):
+                await self._assert_nested_owner_retained(selected, flow)
+        finally:
+            release.set()
+            await self.drain_background_tasks()
+
+    async def test_cancellation_resistant_graph_call_retains_all_owners(self):
+        selected = account("OUTLOOK")
+        release = threading.Event()
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+
+        def resistant_graph(*_args, **_kwargs):
+            release.wait()
+
+        async def flow(_page, context, *_args, **_kwargs):
+            return await register_claude_api.fetch_platform_verification(
+                context, selected, 0.02, 1234.5
+            )
+
+        self.context.new_page = AsyncMock(
+            side_effect=AssertionError(
+                "browser fallback raced an unconfirmed Graph owner"
+            )
+        )
+        try:
+            with patch.dict(
+                register_claude_api.os.environ, {}, clear=True
+            ), patch.object(
+                register_claude_api,
+                "get_claude_platform_verification_by_token",
+                side_effect=resistant_graph,
+            ):
+                await self._assert_nested_owner_retained(selected, flow)
+            self.context.new_page.assert_not_awaited()
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join(timeout=0.5)
+
+    async def test_cancellation_resistant_session_persist_retains_all_owners(self):
+        import common.claude_platform_session as session
+
+        release = threading.Event()
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+
+        def resistant_persist(*_args, **_kwargs):
+            release.wait()
+            return "late-session.json"
+
+        context = Mock()
+        context.cookies = AsyncMock(return_value=[{
+            "name": "session",
+            "value": "cookie",
+            "domain": ".claude.com",
+        }])
+
+        async def flow(*_args, **_kwargs):
+            return await register_claude_api.save_claude_platform_session(
+                context,
+                self.account.email,
+                operation_timeout=0.02,
+            )
+
+        try:
+            with patch.object(
+                session,
+                "_persist_claude_platform_session",
+                side_effect=resistant_persist,
+            ):
+                await self._assert_nested_owner_retained(self.account, flow)
+        finally:
+            release.set()
+            timer.cancel()
+            timer.join(timeout=0.5)
+
+    async def test_outer_account_deadline_retains_nested_session_owner(self):
+        import common.claude_platform_session as session
+
+        release = threading.Event()
+
+        def resistant_persist(*_args, **_kwargs):
+            release.wait()
+            return "late-session.json"
+
+        context = Mock()
+        context.cookies = AsyncMock(return_value=[{
+            "name": "session",
+            "value": "cookie",
+            "domain": ".claude.com",
+        }])
+
+        async def flow(*_args, **_kwargs):
+            return await register_claude_api.save_claude_platform_session(
+                context,
+                self.account.email,
+                operation_timeout=1.0,
+            )
+
+        try:
+            with patch.object(
+                session,
+                "_persist_claude_platform_session",
+                side_effect=resistant_persist,
+            ):
+                await self._assert_nested_owner_retained(
+                    self.account,
+                    flow,
+                    registration_timeout=0.03,
+                    elapsed_bound=0.1,
+                )
+        finally:
+            release.set()
 
     async def test_stuck_code_is_classified_before_emergency_timeout(self):
         page = FakePlatformPage(code_submit_target_state="code")
@@ -1345,6 +1851,84 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
         self.store.release.assert_not_called()
         self.store.mark_error.assert_not_called()
         self.assert_cleanup_stopped_before_delete()
+
+    async def test_cancellation_during_success_cleanup_marks_used_before_reraising(self):
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+
+        async def delayed_close():
+            close_started.set()
+            await close_release.wait()
+
+        self.browser.close.side_effect = delayed_close
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ):
+            registration = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=90
+                )
+            )
+            await close_started.wait()
+            registration.cancel()
+            close_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await registration
+
+        self.store.mark_used.assert_called_once_with(self.account)
+        self.store.release.assert_not_called()
+        self.store.mark_error.assert_not_called()
+        self.bb.delete_browser.assert_called_once_with("profile-a")
+
+    async def test_ledger_failure_never_replaces_cleanup_cancellation(self):
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+        self.store.mark_used.side_effect = OSError("ledger-secret")
+
+        async def delayed_close():
+            close_started.set()
+            await close_release.wait()
+
+        self.browser.close.side_effect = delayed_close
+        output = io.StringIO()
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(return_value="cookies/session.json"),
+        ), redirect_stdout(output):
+            registration = asyncio.create_task(
+                register_claude_api.register_one(
+                    self.bb, self.account, self.store, timeout=90
+                )
+            )
+            await close_started.wait()
+            registration.cancel()
+            close_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await registration
+
+        self.store.mark_used.assert_called_once_with(self.account)
+        self.store.release.assert_not_called()
+        self.assertIn("ledger_finalize_failed", output.getvalue())
+        self.assertNotIn("ledger-secret", output.getvalue())
+
+    async def test_ledger_failure_never_replaces_original_launch_exception(self):
+        self.bb.create_browser.side_effect = RuntimeError("original failure")
+        self.store.release.side_effect = OSError("ledger failure")
+        output = io.StringIO()
+
+        with redirect_stdout(output), self.assertRaisesRegex(
+            RuntimeError, "original failure"
+        ):
+            await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=90
+            )
+
+        self.store.release.assert_called_once_with(self.account)
+        self.assertIn("ledger_finalize_failed", output.getvalue())
+        self.assertNotIn("ledger failure", output.getvalue())
 
     async def test_hung_browser_close_is_bounded_and_later_cleanup_runs(self):
         close_started = asyncio.Event()

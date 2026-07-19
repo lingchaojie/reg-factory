@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -921,7 +922,7 @@ class ClaudeAPIEntrypointTests(unittest.TestCase):
             selected = register_three_platforms.next_pool_account(args)
 
         self.assertEqual(selected, legacy)
-        next_email.assert_called_once_with("tri")
+        next_email.assert_called_once_with("tri", display="masked")
 
     def test_full_flow_outlook_claude_api_retains_stage_a_mail_creation(self):
         args = platform_args(["claude_api"])
@@ -1827,6 +1828,63 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_partial_dual_outlook_run_keeps_legacy_success_terminal(self):
+        source = self.root / "emails.txt"
+        source.write_text(
+            "legacy@example.com----MailboxPass2!----refresh-old----client-old\n",
+            encoding="utf-8",
+        )
+        account, stores = reserve_shared_claude_account(
+            "OUTLOOK",
+            ("claude", "claude_api"),
+            source_file=source,
+            root_dir=self.root,
+        )
+        reserved = register_three_platforms._ReservedPoolAccount(
+            account, stores
+        )
+
+        async def fake_run(
+            platform, _command, _run_id, _child_env, process_owner=None
+        ):
+            if platform == "claude":
+                with stores["claude"].used_file.open(
+                    "a", encoding="utf-8"
+                ) as ledger:
+                    ledger.write(f"{account.email}----{account.password}\n")
+                return platform, True, 0, "claude.log"
+            stores["claude_api"].mark_error(
+                account, "registration_error"
+            )
+            return platform, False, 1, "claude_api.log"
+
+        with patch.dict(
+            os.environ, {"EMAIL_PROVIDER": "OUTLOOK"}
+        ), patch.object(
+            register_three_platforms,
+            "run_platform",
+            side_effect=fake_run,
+        ), patch.object(register_three_platforms, "broker_release"):
+            results = await register_three_platforms.process_account(
+                reserved,
+                self.args(),
+                {"EMAIL_PROVIDER": "OUTLOOK"},
+            )
+
+        self.assertFalse(results[-1][1])
+        legacy_state = stores["claude"].used_file.read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("----released", legacy_state)
+        self.assertIsNone(
+            ClaudeEmailAccountStore(
+                "OUTLOOK",
+                source,
+                self.root,
+                purpose="claude",
+            ).reserve_one()
+        )
+
     async def test_orchestrator_output_never_prints_mailbox_secrets(self):
         account, stores = self.reserve()
         reserved = register_three_platforms._ReservedPoolAccount(account, stores)
@@ -1866,6 +1924,45 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
             run_full_flow._mask_email_text(line),
             "registered pe***@example.com successfully\n",
         )
+
+    def test_relayed_child_output_masks_unicode_punctuation_and_punycode(self):
+        addresses = (
+            "o'hara+标签@例子.公司",
+            "δοκιμή+tag@παράδειγμα.δοκιμή",
+            "puny.code%tag@xn--fsqu00a.xn--55qx5d",
+            "e\u0301@example.com",
+            '"quoted.local"@example.com',
+        )
+        line = "registered <" + ">, <".join(addresses) + ">\n"
+
+        for masker in (
+            register_three_platforms._mask_email_text,
+            run_full_flow._mask_email_text,
+        ):
+            masked = masker(line)
+            for address in addresses:
+                self.assertNotIn(address, masked)
+            self.assertIn("@例子.公司", masked)
+            self.assertIn("@xn--fsqu00a.xn--55qx5d", masked)
+
+    async def test_process_success_marker_must_be_exact_and_final(self):
+        cases = (
+            ("print('prefix success: 1/1 suffix')", False),
+            ("print('success: 1/1'); print('later output')", False),
+            ("print('progress'); print('success: 1/1')", True),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            register_three_platforms, "LOG_DIR", temp_dir
+        ), patch.object(
+            register_three_platforms, "ROOT", str(self.root)
+        ):
+            for index, (script, expected) in enumerate(cases):
+                result = await register_three_platforms.run_platform(
+                    "claude_api",
+                    [sys.executable, "-u", "-c", script],
+                    f"marker-{index}",
+                )
+                self.assertEqual(result[1], expected)
 
 
 if __name__ == "__main__":

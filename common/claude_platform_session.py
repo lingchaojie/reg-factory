@@ -1,12 +1,19 @@
 from datetime import datetime
 from pathlib import Path
-import asyncio
 import hashlib
 import json
 import os
 import uuid
 
 from common.interprocess_lock import InterprocessFileLock
+from common.owned_operation import run_daemon_call
+
+
+DEFAULT_SESSION_PERSIST_TIMEOUT = 30.0
+
+
+class _IndexPublicationUnconfirmed(OSError):
+    """The index replace is visible but its directory sync was not confirmed."""
 
 
 def _email_key(email):
@@ -59,6 +66,10 @@ def _replace_index(index, record):
             _write_fsynced(temporary, payload)
             os.replace(temporary, index)
             committed = True
+            try:
+                _fsync_directory(index.parent)
+            except OSError as exc:
+                raise _IndexPublicationUnconfirmed(str(exc)) from None
         finally:
             if not committed:
                 temporary.unlink(missing_ok=True)
@@ -86,6 +97,10 @@ def _persist_claude_platform_session(platform_cookies, email, output_dir):
             "email_key": email_key,
             "cookie_file": path.name,
         })
+    except _IndexPublicationUnconfirmed:
+        # The new index is already visible. Keep its cookie target so the
+        # current filesystem state can never contain a dangling reference.
+        raise
     except Exception:
         temporary.unlink(missing_ok=True)
         if final_created:
@@ -101,6 +116,8 @@ async def save_claude_platform_session(
     context,
     email,
     output_dir="cookies/claude_api",
+    *,
+    operation_timeout=DEFAULT_SESSION_PERSIST_TIMEOUT,
 ):
     cookies = await context.cookies()
     platform_cookies = [
@@ -109,9 +126,12 @@ async def save_claude_platform_session(
     if not platform_cookies:
         raise RuntimeError("console_not_reached")
 
-    return await asyncio.to_thread(
-        _persist_claude_platform_session,
-        platform_cookies,
-        email,
-        output_dir,
+    return await run_daemon_call(
+        lambda: _persist_claude_platform_session(
+            platform_cookies,
+            email,
+            output_dir,
+        ),
+        operation_timeout,
+        name="claude-api-session-owner",
     )

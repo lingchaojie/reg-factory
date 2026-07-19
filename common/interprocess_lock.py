@@ -1,6 +1,7 @@
 """Small cross-platform advisory file lock used by durable local ledgers."""
 
 from pathlib import Path
+import errno
 import os
 import threading
 import time
@@ -8,6 +9,22 @@ import time
 
 _THREAD_LOCKS = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
+
+
+_WINDOWS_LOCK_CONTENTION_ERRNOS = {
+    errno.EACCES,
+    errno.EAGAIN,
+    getattr(errno, "EDEADLK", errno.EACCES),
+}
+_WINDOWS_LOCK_CONTENTION_WINERRORS = {32, 33, 36}
+
+
+def _is_windows_lock_contention(error):
+    return (
+        getattr(error, "errno", None) in _WINDOWS_LOCK_CONTENTION_ERRNOS
+        or getattr(error, "winerror", None)
+        in _WINDOWS_LOCK_CONTENTION_WINERRORS
+    )
 
 
 def _thread_lock(path):
@@ -45,7 +62,9 @@ class InterprocessFileLock:
                             self._handle.fileno(), msvcrt.LK_NBLCK, 1
                         )
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if not _is_windows_lock_contention(exc):
+                            raise
                         time.sleep(self.poll_interval)
             else:
                 import fcntl

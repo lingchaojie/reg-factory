@@ -32,6 +32,13 @@ from common.claude_platform_mailbox import (
 from common.claude_platform_session import save_claude_platform_session
 from common.ipmart_proxy import IPMartProxyError, acquire_proxy, settings_from_env
 from common.ninemail_mailbox import NineMallMailboxClient, NineMallMailboxError
+from common.owned_operation import (
+    CancellationUnconfirmed as _CancellationUnconfirmed,
+    OperationUnconfirmed as _OperationUnconfirmed,
+    record_current_owner_unconfirmed,
+    run_daemon_call,
+    task_owner_unconfirmed,
+)
 from config import (
     EMAIL_PROVIDER,
     NINEMALL_API_BASE,
@@ -74,14 +81,6 @@ class ClaudeApiRegistrationError(RuntimeError):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
-
-
-class _OperationUnconfirmed(asyncio.TimeoutError):
-    """A timed-out operation may still own browser/profile resources."""
-
-
-class _CancellationUnconfirmed(asyncio.CancelledError):
-    """Cancellation returned before the owned async operation stopped."""
 
 
 class _SerialCallWorker:
@@ -358,40 +357,47 @@ async def _cancel_task_bounded(task, cancel_grace):
     try:
         done, _pending = await asyncio.wait({task}, timeout=grace)
         if task in done:
+            outcome = _task_owner_outcome(task)
             _consume_background_task(task)
-            return True
+            return outcome is None, outcome
         task.cancel()
         done, _pending = await asyncio.wait({task}, timeout=grace)
         if task in done:
+            outcome = _task_owner_outcome(task)
             _consume_background_task(task)
-            return True
+            return outcome is None, outcome
     except asyncio.CancelledError:
         task.cancel()
         _retain_background_task(task)
         raise
     _retain_background_task(task)
-    return False
+    return False, None
+
+
+def _task_owner_outcome(task):
+    outcome = task_owner_unconfirmed(task)
+    if outcome is not None or task.cancelled():
+        return outcome
+    try:
+        error = task.exception()
+    except BaseException:
+        return task_owner_unconfirmed(task)
+    if isinstance(error, (_OperationUnconfirmed, _CancellationUnconfirmed)):
+        return error
+    return None
+
+
+def _raise_current_owner_unconfirmed(outcome):
+    record_current_owner_unconfirmed(outcome)
+    raise outcome
 
 
 async def _run_bounded(awaitable, timeout, *, cancel_grace=None):
-    if cancel_grace is None:
-        cancel_grace = TASK_CANCEL_GRACE
-    try:
-        task = asyncio.ensure_future(awaitable)
-    except BaseException:
-        _close_unawaited(awaitable)
-        raise
-    try:
-        done, _pending = await asyncio.wait(
-            {task}, timeout=max(0.0, float(timeout))
-        )
-    except asyncio.CancelledError:
-        await _cancel_task_bounded(task, cancel_grace)
-        raise
-    if task in done:
-        return task.result()
-    await _cancel_task_bounded(task, cancel_grace)
-    raise asyncio.TimeoutError
+    return await _run_owned_async(
+        awaitable,
+        timeout,
+        cancel_grace=cancel_grace,
+    )
 
 
 async def _run_owned_async(awaitable, timeout, *, cancel_grace=None):
@@ -408,34 +414,41 @@ async def _run_owned_async(awaitable, timeout, *, cancel_grace=None):
         try:
             return await _cancel_task_bounded(task, cancel_grace)
         except asyncio.CancelledError:
+            if _task_owner_outcome(task) is not None:
+                _raise_current_owner_unconfirmed(
+                    _CancellationUnconfirmed()
+                )
             if task.done():
                 _consume_background_task(task)
                 raise
-            raise _CancellationUnconfirmed from None
+            _raise_current_owner_unconfirmed(_CancellationUnconfirmed())
 
     try:
         done, _pending = await asyncio.wait(
             {task}, timeout=max(0.0, float(timeout))
         )
     except asyncio.CancelledError:
-        confirmed = await cancel_owner()
+        confirmed, _nested_outcome = await cancel_owner()
         if not confirmed:
-            raise _CancellationUnconfirmed from None
+            _raise_current_owner_unconfirmed(_CancellationUnconfirmed())
         raise
     if task in done:
-        return task.result()
-    confirmed = await cancel_owner()
+        outcome = _task_owner_outcome(task)
+        if outcome is not None:
+            _consume_background_task(task)
+            _raise_current_owner_unconfirmed(outcome)
+        try:
+            return task.result()
+        except (_OperationUnconfirmed, _CancellationUnconfirmed) as exc:
+            _raise_current_owner_unconfirmed(exc)
+    confirmed, _nested_outcome = await cancel_owner()
     if not confirmed:
-        raise _OperationUnconfirmed
+        _raise_current_owner_unconfirmed(_OperationUnconfirmed())
     raise asyncio.TimeoutError
 
 
 async def _run_sync_call_daemon(operation, timeout, name):
-    worker = _SerialCallWorker(name)
-    try:
-        return await worker.wait(worker.submit(operation), timeout)
-    finally:
-        worker.stop()
+    return await run_daemon_call(operation, timeout, name=name)
 
 
 async def _drain_retained_tasks(timeout=RETAINED_TASK_DRAIN_TIMEOUT):
@@ -452,6 +465,98 @@ async def _drain_retained_tasks(timeout=RETAINED_TASK_DRAIN_TIMEOUT):
     )
     for task in done:
         _consume_background_task(task)
+
+
+def _live_retained_tasks(loop):
+    return {
+        task
+        for task in _RETAINED_BACKGROUND_TASKS
+        if not task.done() and task.get_loop() is loop
+    }
+
+
+async def _drain_cli_tasks(loop, timeout):
+    """Cancel and boundedly drain ordinary tasks at CLI shutdown."""
+    current = asyncio.current_task(loop=loop)
+    deadline = loop.time() + max(0.0, float(timeout))
+    while True:
+        retained = _live_retained_tasks(loop)
+        tasks = {
+            task
+            for task in asyncio.all_tasks(loop)
+            if task is not current and not task.done() and task not in retained
+        }
+        if not tasks:
+            return True
+        for task in tasks:
+            task.cancel()
+        remaining = max(0.0, deadline - loop.time())
+        if remaining <= 0:
+            for task in tasks:
+                _retain_background_task(task)
+            return False
+        done, pending = await asyncio.wait(tasks, timeout=remaining)
+        for task in done:
+            _consume_background_task(task)
+        if pending:
+            for task in pending:
+                _retain_background_task(task)
+            return False
+
+
+async def _shutdown_asyncgens_bounded(loop, timeout):
+    shutdown_task = loop.create_task(loop.shutdown_asyncgens())
+    done, _pending = await asyncio.wait(
+        {shutdown_task}, timeout=max(0.0, float(timeout))
+    )
+    if shutdown_task in done:
+        _consume_background_task(shutdown_task)
+        return
+    shutdown_task.cancel()
+    _retain_background_task(shutdown_task)
+
+
+async def _finish_cli_event_loop(loop):
+    ordinary_tasks_stopped = await _drain_cli_tasks(
+        loop, RETAINED_TASK_DRAIN_TIMEOUT
+    )
+    if ordinary_tasks_stopped and not _live_retained_tasks(loop):
+        await _shutdown_asyncgens_bounded(
+            loop, RETAINED_TASK_DRAIN_TIMEOUT
+        )
+
+
+def _run_cli_event_loop(awaitable):
+    """Run the CLI without an unbounded join of unconfirmed async owners.
+
+    ``asyncio.run`` cancels and then awaits every pending task at shutdown.  A
+    task retained by ``_run_bounded`` has already rejected bounded
+    cancellation, so awaiting it again can keep the process alive forever.
+    Closing the CLI loop is the final ownership boundary: the mailbox remains
+    reserved and the browser profile remains undeleted for operator recovery.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(awaitable)
+    finally:
+        try:
+            loop.run_until_complete(_finish_cli_event_loop(loop))
+        except BaseException:
+            # Shutdown diagnostics must not replace main's return or exception.
+            pass
+        pending = {
+            task for task in asyncio.all_tasks(loop) if not task.done()
+        }
+        for task in pending:
+            if task not in _RETAINED_BACKGROUND_TASKS:
+                task.cancel()
+            # The process is the final boundary for a retained owner.  Avoid a
+            # misleading destruction warning when the closed loop is collected.
+            if hasattr(task, "_log_destroy_pending"):
+                task._log_destroy_pending = False
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 async def _await_by_deadline(awaitable, deadline):
@@ -664,11 +769,12 @@ async def run_claude_platform_flow(
 
     progress["phase"] = "session"
     try:
-        return await _await_by_deadline(
+        return await _await_external_by_deadline(
             save_claude_platform_session(
                 context,
                 account.email,
                 output_dir,
+                operation_timeout=_remaining(deadline),
             ),
             deadline,
         )
@@ -687,22 +793,6 @@ def build_ninemail_client():
     )
 
 
-async def confirm_worker_stopped(worker, cancel_event):
-    cancel_event.set()
-    while not worker.done():
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel_event.set()
-        except BaseException:
-            break
-    if worker.done():
-        try:
-            worker.result()
-        except BaseException:
-            pass
-
-
 async def fetch_platform_verification(
     context,
     account,
@@ -714,19 +804,18 @@ async def fetch_platform_verification(
     if account.provider == "NINEMALL":
         client = ninemail_client or build_ninemail_client()
         cancel_event = threading.Event()
-        worker = asyncio.create_task(asyncio.to_thread(
-            client.poll_claude_platform_verification,
-            account,
+        return await run_daemon_call(
+            lambda: client.poll_claude_platform_verification(
+                account,
+                max_wait,
+                received_after,
+                cancel_event=cancel_event,
+            ),
             max_wait,
-            received_after,
-            cancel_event=cancel_event,
-        ))
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel_event.set()
-            await confirm_worker_stopped(worker, cancel_event)
-            raise
+            name="claude-api-ninemail-owner",
+            on_cancel=cancel_event.set,
+            cancel_grace=TASK_CANCEL_GRACE,
+        )
 
     deadline = _clock() + max(0.0, float(max_wait))
     channels = []
@@ -745,9 +834,8 @@ async def fetch_platform_verification(
         channel_deadline = _clock() + channel_budget
         try:
             if channel == "graph":
-                result = await _await_external_by_deadline(
-                    asyncio.to_thread(
-                        get_claude_platform_verification_by_token,
+                result = await run_daemon_call(
+                    lambda: get_claude_platform_verification_by_token(
                         account.email,
                         account.refresh_token,
                         account.client_id,
@@ -756,7 +844,8 @@ async def fetch_platform_verification(
                         received_after,
                         account_lease,
                     ),
-                    channel_deadline,
+                    channel_budget,
+                    name="claude-api-graph-owner",
                 )
             elif channel == "broker":
                 result = await _await_external_by_deadline(
@@ -770,6 +859,7 @@ async def fetch_platform_verification(
                 )
             else:
                 outlook_page = None
+                outlook_owner_unconfirmed = False
                 try:
                     outlook_page = await _await_external_by_deadline(
                         context.new_page(), channel_deadline
@@ -786,8 +876,17 @@ async def fetch_platform_verification(
                         ),
                         channel_deadline,
                     )
+                except (
+                    _OperationUnconfirmed,
+                    _CancellationUnconfirmed,
+                ):
+                    outlook_owner_unconfirmed = True
+                    raise
                 finally:
-                    if outlook_page is not None:
+                    if (
+                        outlook_page is not None
+                        and not outlook_owner_unconfirmed
+                    ):
                         try:
                             close_awaitable = outlook_page.close()
                             close_remaining = _remaining(deadline)
@@ -798,6 +897,11 @@ async def fetch_platform_verification(
                             else:
                                 _close_unawaited(close_awaitable)
                         except asyncio.CancelledError:
+                            raise
+                        except (
+                            _OperationUnconfirmed,
+                            _CancellationUnconfirmed,
+                        ):
                             raise
                         except BaseException:
                             pass
@@ -817,6 +921,15 @@ def log_flow_error(code, error=None, *, account=None):
     ):
         value = "registration_error"
     print(value)
+
+
+def _finalize_account_safely(action, *args):
+    try:
+        action(*args)
+    except Exception as exc:
+        log_flow_error("ledger_finalize_failed", exc)
+        return False
+    return True
 
 
 async def _cleanup_registration_resources(
@@ -1033,26 +1146,33 @@ async def register_one(
             raise escaped
         return None
 
-    if cancelled is not None:
-        account_store.release(account)
-        raise cancelled
     if cookie_path is not None:
-        account_store.mark_used(account)
-        return cookie_path
+        finalized = _finalize_account_safely(
+            account_store.mark_used, account
+        )
+        if cancelled is not None:
+            raise cancelled
+        return cookie_path if finalized else None
+    if cancelled is not None:
+        _finalize_account_safely(account_store.release, account)
+        raise cancelled
     if escaped is not None:
         if profile_operations.profile_id is None:
-            account_store.release(account)
+            _finalize_account_safely(account_store.release, account)
         else:
-            account_store.mark_error(
+            _finalize_account_safely(
+                account_store.mark_error,
                 account,
                 error_code or "registration_error",
             )
         raise escaped
     if error_code is not None:
         if profile_operations.profile_id is None:
-            account_store.release(account)
+            _finalize_account_safely(account_store.release, account)
         else:
-            account_store.mark_error(account, error_code)
+            _finalize_account_safely(
+                account_store.mark_error, account, error_code
+            )
     return None
 
 
@@ -1262,4 +1382,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    raise SystemExit(_run_cli_event_loop(main()))

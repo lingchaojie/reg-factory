@@ -1,6 +1,6 @@
 # Claude API Personal Registration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Completed steps use checked task boxes.
 
 **Status:** Implemented; final lifecycle, durability, routing, and redaction corrections incorporated on 2026-07-19.
 
@@ -64,7 +64,7 @@
 - Consumes: existing `ClaudeEmailAccount` and `ClaudeEmailAccountStore` parsing and locking.
 - Produces: `ClaudeEmailAccountStore(provider=None, source_file=None, root_dir=None, purpose="claude")`; `reserve_shared_claude_account(provider, purposes, source_file=None, root_dir=None) -> tuple[ClaudeEmailAccount, dict[str, ClaudeEmailAccountStore]] | None`.
 
-- [ ] **Step 1: Write failing namespace and shared-reservation tests**
+- [x] **Step 1: Write failing namespace and shared-reservation tests**
 
 Append tests that prove one source row can be terminal in the Claude.ai ledger and still be reserved for Claude Platform, and that a shared reservation selects an address unblocked in every requested ledger:
 
@@ -113,7 +113,7 @@ Also assert OUTLOOK `purpose="claude_api"` writes
 `emails_used_claude_api.txt` / `emails_error_claude_api.txt` and does not alter
 `emails_used.txt`.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -123,7 +123,7 @@ python -m unittest tests.test_claude_email_accounts -v
 
 Expected: FAIL because `purpose` and `reserve_shared_claude_account` do not exist.
 
-- [ ] **Step 3: Implement explicit state namespaces without breaking positional callers**
+- [x] **Step 3: Implement explicit state namespaces without breaking positional callers**
 
 Keep the first three constructor positions unchanged and add `purpose` last:
 
@@ -243,7 +243,7 @@ emails_error_claude_api.txt
 .claude_email_pool.journal
 ```
 
-- [ ] **Step 4: Run focused and existing account-store tests**
+- [x] **Step 4: Run focused and existing account-store tests**
 
 Run:
 
@@ -253,7 +253,7 @@ python -m unittest tests.test_claude_email_accounts -v
 
 Expected: all account-store tests PASS, including unchanged default Claude.ai filenames.
 
-- [ ] **Step 5: Commit the ledger boundary**
+- [x] **Step 5: Commit the ledger boundary**
 
 ```powershell
 git add common/claude_email_accounts.py tests/test_claude_email_accounts.py .gitignore
@@ -274,7 +274,7 @@ git commit -m "feat: isolate Claude API mailbox state"
 - Consumes: message objects with `sender`, `subject`, `received`, and `body` attributes; existing `NineMallMailboxClient.fetch_folder()`.
 - Produces: `ClaudePlatformVerification(magic_link: str = "", code: str = "", received_at: float = 0.0)`; `extract_claude_platform_verification(messages, received_after=None)`; `NineMallMailboxClient.poll_claude_platform_verification(account, max_wait, received_after=None, *, cancel_event=None)`.
 
-- [ ] **Step 1: Write failing pure-extractor tests**
+- [x] **Step 1: Write failing pure-extractor tests**
 
 Create `tests/test_claude_platform_mailbox.py` with direct-link, SafeLinks,
 code-only, both-artifacts, stale-message, and false-number coverage:
@@ -337,7 +337,7 @@ class ClaudePlatformMailboxTests(unittest.TestCase):
 Add NINEMALL tests showing INBOX/Junk polling returns code-only immediately and
 does not change `poll_magic_link()` behavior.
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run:
 
@@ -347,7 +347,7 @@ python -m unittest tests.test_claude_platform_mailbox tests.test_ninemail_mailbo
 
 Expected: FAIL because the Platform module and polling method do not exist.
 
-- [ ] **Step 3: Implement the pure parser**
+- [x] **Step 3: Implement the pure parser**
 
 Create `common/claude_platform_mailbox.py` with these public types and rules:
 
@@ -463,7 +463,7 @@ def extract_claude_platform_verification(messages, received_after=None):
     return None
 ```
 
-- [ ] **Step 4: Add NINEMALL Platform polling without changing Claude.ai polling**
+- [x] **Step 4: Add NINEMALL Platform polling without changing Claude.ai polling**
 
 Import the pure extractor and add this method to `NineMallMailboxClient`:
 
@@ -515,7 +515,7 @@ def poll_claude_platform_verification(
 Do not log either returned field. Do not edit `_validated_claude_link`,
 `extract_claude_magic_link`, or `poll_magic_link` except for safe imports.
 
-- [ ] **Step 5: Run focused and Claude.ai NINEMALL regression tests**
+- [x] **Step 5: Run focused and Claude.ai NINEMALL regression tests**
 
 Run:
 
@@ -525,7 +525,7 @@ python -m unittest tests.test_claude_platform_mailbox tests.test_ninemail_mailbo
 
 Expected: all tests PASS; existing Claude.ai fragment-token magic-link tests remain green.
 
-- [ ] **Step 6: Commit the artifact parser and NINEMALL adapter**
+- [x] **Step 6: Commit the artifact parser and NINEMALL adapter**
 
 ```powershell
 git add common/claude_platform_mailbox.py common/ninemail_mailbox.py tests/test_claude_platform_mailbox.py tests/test_ninemail_mailbox.py
@@ -547,7 +547,7 @@ git commit -m "feat: read Claude Platform verification mail"
 - Consumes: `ClaudePlatformVerification`, existing `_get_access_token()`, `fetch_messages()`, Outlook login/folder helpers, and broker `/fetch`.
 - Produces: `get_claude_platform_verification_by_token(email, refresh_token, client_id, max_wait=120, poll=5, received_after=None, account_lease=None)`; `get_claude_platform_verification_outlook_pw(page, email, password, max_wait=120, received_after=None)`; `fetch_claude_platform_from_broker(email, password, max_wait=120, received_after=None)`; broker `kind="claude_platform"` returning `{magic_link, code, received_at}`.
 
-- [ ] **Step 1: Write failing Graph and broker tests**
+- [x] **Step 1: Write failing Graph and broker tests**
 
 Add tests that mock Graph messages and assert one polling pass can return either
 artifact, forwards `received_after` and `account_lease`, and never prints the
@@ -576,7 +576,7 @@ def test_broker_platform_kind_returns_structured_artifact(self):
     self.assertEqual(result["code"], "482731")
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -586,7 +586,7 @@ python -m unittest tests.test_claude_platform_mailbox tests.test_claude_api_entr
 
 Expected: FAIL because the three OUTLOOK facade functions and broker kind do not exist.
 
-- [ ] **Step 3: Add one-pass Graph polling**
+- [x] **Step 3: Add one-pass Graph polling**
 
 In `common/claude_platform_mailbox.py`, implement:
 
@@ -638,7 +638,7 @@ def get_claude_platform_verification_by_token(
 Refresh the access token once in the second half of the polling window using
 the same rule as `get_code_by_token`. Log only provider/folder/wait time.
 
-- [ ] **Step 4: Add browser and broker structured scanning**
+- [x] **Step 4: Add browser and broker structured scanning**
 
 Add a browser helper that opens the newest matching Anthropic/Claude message,
 returns its sender/subject/body/links as a `ClaudePlatformMessage`, then applies
@@ -798,7 +798,7 @@ Use `display_email = _masked_email(email)` in `ensure_session()`, `fetch()`,
 `_close_session()`, and their error output; never interpolate the raw address,
 artifact value, password, client ID, or refresh token.
 
-- [ ] **Step 5: Run mailbox and broker regressions**
+- [x] **Step 5: Run mailbox and broker regressions**
 
 Run:
 
@@ -808,7 +808,7 @@ python -m unittest tests.test_claude_platform_mailbox tests.test_mailbox_account
 
 Expected: all tests PASS; existing code/link broker calls still return strings.
 
-- [ ] **Step 6: Commit the OUTLOOK channels**
+- [x] **Step 6: Commit the OUTLOOK channels**
 
 ```powershell
 git add common/claude_platform_mailbox.py common/mailbox.py mailbox_broker.py tests/test_claude_platform_mailbox.py tests/test_claude_api_entrypoints.py
@@ -826,9 +826,9 @@ git commit -m "feat: fetch Claude Platform mail from Outlook"
 
 **Interfaces:**
 - Consumes: `ClaudeEmailAccount`, `ClaudePlatformVerification`, a Playwright page/context, and an async verification fetch callback.
-- Produces: `apply_verification_artifact(page, artifact)`; `select_personal_account(page)`; `is_console_ready(page)`; `save_claude_platform_session(context, email, output_dir="cookies/claude_api")`; `run_claude_platform_flow(page, context, account, fetch_verification, max_wait, output_dir="cookies/claude_api")`.
+- Produces: `apply_verification_artifact(page, artifact)`; `select_personal_account(page)`; `is_console_ready(page)`; `save_claude_platform_session(context, email, output_dir="cookies/claude_api", *, operation_timeout=30.0)`; `run_claude_platform_flow(page, context, account, fetch_verification, max_wait, output_dir="cookies/claude_api")`.
 
-- [ ] **Step 1: Write failing state-machine tests with fake page objects**
+- [x] **Step 1: Write failing state-machine tests with fake page objects**
 
 Cover code-only, link-only, both-artifacts/current-code-screen, one resend,
 personal selection, organization refusal, console success, and false success:
@@ -869,7 +869,7 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
 Test session export with a temporary directory and cookies containing obvious
 mailbox secrets; assert only browser cookies and masked metadata are written.
 
-- [ ] **Step 2: Run the state-machine tests and verify RED**
+- [x] **Step 2: Run the state-machine tests and verify RED**
 
 Run:
 
@@ -879,7 +879,7 @@ python -m unittest tests.test_claude_api_registration -v
 
 Expected: FAIL because `register_claude_api.py` and session helpers do not exist.
 
-- [ ] **Step 3: Implement secret-safe session export**
+- [x] **Step 3: Implement secret-safe session export**
 
 Create `common/claude_platform_session.py`:
 
@@ -907,7 +907,11 @@ def _persist_claude_platform_session(platform_cookies, email, output_dir):
             target / "accounts.jsonl",
             {"email_key": email_key, "cookie_file": path.name},
         )
-    except BaseException:
+    except _IndexPublicationUnconfirmed:
+        # Index replacement is visible. Keep the referenced cookie so the
+        # current filesystem state cannot contain a dangling index record.
+        raise
+    except Exception:
         temporary.unlink(missing_ok=True)
         if final_created:
             path.unlink(missing_ok=True)
@@ -915,7 +919,13 @@ def _persist_claude_platform_session(platform_cookies, email, output_dir):
         raise
     return path
 
-async def save_claude_platform_session(context, email, output_dir="cookies/claude_api"):
+async def save_claude_platform_session(
+    context,
+    email,
+    output_dir="cookies/claude_api",
+    *,
+    operation_timeout=DEFAULT_SESSION_PERSIST_TIMEOUT,
+):
     cookies = await context.cookies()
     platform_cookies = [
         cookie for cookie in cookies
@@ -923,23 +933,28 @@ async def save_claude_platform_session(context, email, output_dir="cookies/claud
     ]
     if not platform_cookies:
         raise RuntimeError("console_not_reached")
-    return await asyncio.to_thread(
-        _persist_claude_platform_session,
-        platform_cookies,
-        email,
-        output_dir,
+    return await run_daemon_call(
+        lambda: _persist_claude_platform_session(
+            platform_cookies, email, output_dir
+        ),
+        operation_timeout,
+        name="claude-api-session-owner",
     )
 ```
 
 `_write_fsynced()` creates private mode-`0600` files, handles short writes, and
 fsyncs before publication. `_replace_index()` holds an interprocess advisory
 lock while it copies the previous index plus one record into a private,
-fsynced temporary file and atomically replaces `accounts.jsonl`. Publish the
-cookie before the record and remove the cookie if the index update fails. Do
-not write raw email, mailbox credentials, artifact values, or cookie values to
-`accounts.jsonl`.
+fsynced temporary file, atomically replaces `accounts.jsonl`, and fsyncs the
+containing directory after replacement. Publish the cookie before the record.
+Remove the cookie when index publication fails before replacement; if the
+replacement is already visible but its directory fsync is unconfirmed, retain
+the referenced cookie and propagate the durability error. Do not write raw
+email, mailbox credentials, artifact values, or cookie values to
+`accounts.jsonl`. Session persistence uses a dedicated daemon owner so an
+unconfirmed write cannot make `asyncio.run()` wait beyond the account deadline.
 
-- [ ] **Step 4: Implement exact page-state helpers**
+- [x] **Step 4: Implement exact page-state helpers**
 
 In `register_claude_api.py`, define:
 
@@ -1030,7 +1045,7 @@ async def is_console_ready(page):
     return False
 ```
 
-- [ ] **Step 5: Implement the orchestration function with one resend**
+- [x] **Step 5: Implement the orchestration function with one resend**
 
 `run_claude_platform_flow()` must record the send timestamp, call the supplied
 fetch callback, apply whichever artifact was returned, retry once only after
@@ -1087,14 +1102,18 @@ async def run_claude_platform_flow(
             await page.wait_for_load_state("domcontentloaded", timeout=60000)
     if not await is_console_ready(page):
         raise ClaudeApiRegistrationError("console_not_reached")
-    return await save_claude_platform_session(
-        context,
-        account.email,
-        output_dir,
+    return await _await_external_by_deadline(
+        save_claude_platform_session(
+            context,
+            account.email,
+            output_dir,
+            operation_timeout=_remaining(deadline),
+        ),
+        deadline,
     )
 ```
 
-- [ ] **Step 6: Run state-machine tests**
+- [x] **Step 6: Run state-machine tests**
 
 Run:
 
@@ -1104,7 +1123,7 @@ python -m unittest tests.test_claude_api_registration -v
 
 Expected: all tests PASS and no test opens a real browser or network connection.
 
-- [ ] **Step 7: Commit the page flow and session exporter**
+- [x] **Step 7: Commit the page flow and session exporter**
 
 ```powershell
 git add common/claude_platform_session.py register_claude_api.py tests/test_claude_api_registration.py
@@ -1123,7 +1142,7 @@ git commit -m "feat: automate Claude Platform personal signup"
 - Consumes: `ClaudeEmailAccountStore(purpose="claude_api")`, NINEMALL and OUTLOOK artifact functions, existing account lease/browser provider/lifecycle helpers.
 - Produces: `fetch_platform_verification(context, account, max_wait, received_after, account_lease=None, ninemail_client=None)`; `register_one(bb, account, account_store, timeout, account_lease=None)`; async `main()` with the repository success marker `success: X/Y`.
 
-- [ ] **Step 1: Write failing provider and lifecycle tests**
+- [x] **Step 1: Write failing provider and lifecycle tests**
 
 Test that NINEMALL calls only `poll_claude_platform_verification`, OUTLOOK uses
 Graph then broker/browser, cancellation sets the NINEMALL event and awaits the
@@ -1149,7 +1168,7 @@ def test_ninemail_failure_output_redacts_credentials(self):
     self.assertNotIn("refresh-secret", text)
 ```
 
-- [ ] **Step 2: Run CLI tests and verify RED**
+- [x] **Step 2: Run CLI tests and verify RED**
 
 Run:
 
@@ -1159,7 +1178,7 @@ python -m unittest tests.test_claude_api_cli -v
 
 Expected: FAIL because provider dispatch and CLI lifecycle are incomplete.
 
-- [ ] **Step 3: Implement strict provider dispatch**
+- [x] **Step 3: Implement strict provider dispatch**
 
 Add this public async facade:
 
@@ -1175,19 +1194,18 @@ async def fetch_platform_verification(
     if account.provider == "NINEMALL":
         client = ninemail_client or build_ninemail_client()
         cancel_event = threading.Event()
-        worker = asyncio.create_task(asyncio.to_thread(
-            client.poll_claude_platform_verification,
-            account,
+        return await run_daemon_call(
+            lambda: client.poll_claude_platform_verification(
+                account,
+                max_wait,
+                received_after,
+                cancel_event=cancel_event,
+            ),
             max_wait,
-            received_after,
-            cancel_event=cancel_event,
-        ))
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel_event.set()
-            await confirm_worker_stopped(worker, cancel_event)
-            raise
+            name="claude-api-ninemail-owner",
+            on_cancel=cancel_event.set,
+            cancel_grace=TASK_CANCEL_GRACE,
+        )
 
     deadline = _clock() + max_wait
     channels = (["graph"] if account.refresh_token else [])
@@ -1204,9 +1222,8 @@ async def fetch_platform_verification(
         channel_deadline = _clock() + channel_budget
         try:
             if channel == "graph":
-                result = await _await_external_by_deadline(
-                    asyncio.to_thread(
-                        get_claude_platform_verification_by_token,
+                result = await run_daemon_call(
+                    lambda: get_claude_platform_verification_by_token(
                         account.email,
                         account.refresh_token,
                         account.client_id,
@@ -1215,7 +1232,8 @@ async def fetch_platform_verification(
                         received_after,
                         account_lease,
                     ),
-                    channel_deadline,
+                    channel_budget,
+                    name="claude-api-graph-owner",
                 )
             elif channel == "broker":
                 result = await _await_external_by_deadline(
@@ -1228,10 +1246,12 @@ async def fetch_platform_verification(
                     channel_deadline,
                 )
             else:
-                outlook_page = await _await_external_by_deadline(
-                    context.new_page(), channel_deadline
-                )
+                outlook_page = None
+                outlook_owner_unconfirmed = False
                 try:
+                    outlook_page = await _await_external_by_deadline(
+                        context.new_page(), channel_deadline
+                    )
                     result = await _await_external_by_deadline(
                         get_claude_platform_verification_outlook_pw(
                             outlook_page,
@@ -1242,14 +1262,21 @@ async def fetch_platform_verification(
                         ),
                         channel_deadline,
                     )
+                except (
+                    _OperationUnconfirmed,
+                    _CancellationUnconfirmed,
+                ):
+                    outlook_owner_unconfirmed = True
+                    raise
                 finally:
-                    close_awaitable = outlook_page.close()
-                    if _remaining(deadline) > 0:
-                        await _await_external_by_deadline(
-                            close_awaitable, deadline
-                        )
-                    else:
-                        _close_unawaited(close_awaitable)
+                    if outlook_page is not None and not outlook_owner_unconfirmed:
+                        close_awaitable = outlook_page.close()
+                        if _remaining(deadline) > 0:
+                            await _await_external_by_deadline(
+                                close_awaitable, deadline
+                            )
+                        else:
+                            _close_unawaited(close_awaitable)
             if result:
                 return result
         except asyncio.TimeoutError:
@@ -1263,8 +1290,29 @@ every channel receives the same `received_after` freshness baseline. A broker
 response is revalidated locally for artifact shape, host/path, finite timestamp,
 and freshness before it is accepted.
 
-Construct the NINEMALL client and confirm cancellation with these concrete
-helpers:
+Every nested mailbox or Playwright await uses an owned bounded wait. If repeated
+cancellation does not confirm that the nested operation stopped, it raises
+`OperationUnconfirmed`/`CancellationUnconfirmed` rather than an ordinary
+timeout. That outcome bypasses channel fallback and terminal ledger updates.
+Graph and NINEMALL synchronous calls use daemon owners, never asyncio's default
+executor. Because asyncio normally collapses a task that raises a
+`CancellationUnconfirmed` subclass into generic cancelled state, each owned
+wait also records its explicit ownership outcome on the task. An outer deadline
+checks that outcome after bounded cancellation: it maps nested unconfirmed
+cancellation to `OperationUnconfirmed`, while caller cancellation remains
+`CancellationUnconfirmed`.
+
+The standalone entry point uses a dedicated `_run_cli_event_loop(main())`
+boundary rather than `asyncio.run(main())`. Python's standard runner cancels
+and then joins every pending task without a timeout; that would hang forever
+when an owned Playwright/mailbox task has already rejected bounded
+cancellation. The CLI runner first cancels and boundedly drains ordinary tasks
+and, when no live owner remains, boundedly closes async generators. It closes
+the loop without rejoining tasks retained as unconfirmed. Their mailbox
+reservations remain reserved and their profiles remain undeleted for operator
+recovery at process exit.
+
+Construct the NINEMALL client with this concrete helper:
 
 ```python
 def build_ninemail_client():
@@ -1275,23 +1323,9 @@ def build_ninemail_client():
         poll_interval=NINEMALL_POLL_INTERVAL,
     )
 
-async def confirm_worker_stopped(worker, cancel_event):
-    cancel_event.set()
-    while not worker.done():
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel_event.set()
-        except BaseException:
-            break
-    if worker.done():
-        try:
-            worker.result()
-        except BaseException:
-            pass
 ```
 
-- [ ] **Step 4: Implement CLI and browser lifecycle**
+- [x] **Step 4: Implement CLI and browser lifecycle**
 
 Support these arguments exactly:
 
@@ -1322,7 +1356,7 @@ browser/profile is not a completed failure: keep the reservation in its
 Start `account_deadline` in the account worker before optional IPMart
 acquisition and pass it into `register_one()`. Use a daemon-backed serialized
 owner for blocking BitBrowser operations so a hung provider call cannot block
-`asyncio.run()` shutdown or race a later close/delete. The lifecycle shape is:
+CLI shutdown or race a later close/delete. The lifecycle shape is:
 
 ```python
 async def register_one(
@@ -1385,7 +1419,11 @@ async def register_one(
             _remaining(deadline),
             cancel_grace=TASK_CANCEL_GRACE,
         )
-    except _CancellationUnconfirmed:
+    except _CancellationUnconfirmed as exc:
+        cancellation = exc
+        async_owner_unconfirmed = True
+    except _OperationUnconfirmed:
+        error_code = "timeout"
         async_owner_unconfirmed = True
     except asyncio.TimeoutError:
         error_code = {
@@ -1394,10 +1432,15 @@ async def register_one(
             "console": "console_not_reached",
             "session": "console_not_reached",
         }.get(progress.get("phase"), "timeout")
+    except asyncio.CancelledError as exc:
+        cancellation = exc
     except (ClaudeApiRegistrationError, NineMallMailboxError) as exc:
         error_code = exc.code
+    except BaseException as exc:
+        escaped = exc
+        error_code = "registration_error"
 
-    cleanup_complete, cancellation = await _shield_registration_cleanup(
+    cleanup_complete, cleanup_cancellation = await _shield_registration_cleanup(
         _cleanup_registration_resources(
             bb,
             browser,
@@ -1407,17 +1450,29 @@ async def register_one(
             operation_timeout=min(CLEANUP_OPERATION_TIMEOUT, timeout),
         )
     )
+    if cancellation is None:
+        cancellation = cleanup_cancellation
     if not cleanup_complete:
-        # Ownership is unresolved: no ok/error/released append is safe.
+        # Ownership is unresolved: preserve cancellation/exception identity,
+        # but never append ok/error/released.
+        if cancellation is not None:
+            raise cancellation
+        if escaped is not None:
+            raise escaped
         return None
-    if cancellation is not None:
-        account_store.release(account)
-        raise cancellation
     if cookie_path is not None:
-        account_store.mark_used(account)
-        return cookie_path
+        finalized = _finalize_account_safely(account_store.mark_used, account)
+        if cancellation is not None:
+            raise cancellation
+        return cookie_path if finalized else None
+    if cancellation is not None:
+        _finalize_account_safely(account_store.release, account)
+        raise cancellation
+    if escaped is not None:
+        _finalize_account_safely(account_store.mark_error, account, error_code)
+        raise escaped
     if error_code is not None:
-        account_store.mark_error(account, error_code)
+        _finalize_account_safely(account_store.mark_error, account, error_code)
     return None
 ```
 
@@ -1467,7 +1522,7 @@ print(f"success: {success_count}/{len(accounts)}")
 
 Exit zero only when every requested account succeeds.
 
-- [ ] **Step 5: Run CLI, proxy, and lifecycle tests**
+- [x] **Step 5: Run CLI, proxy, and lifecycle tests**
 
 Run:
 
@@ -1477,7 +1532,7 @@ python -m unittest tests.test_claude_api_cli tests.test_claude_ipmart_proxy test
 
 Expected: all tests PASS; existing Claude CLI behavior remains green.
 
-- [ ] **Step 6: Commit the executable flow**
+- [x] **Step 6: Commit the executable flow**
 
 ```powershell
 git add register_claude_api.py tests/test_claude_api_cli.py
@@ -1500,7 +1555,7 @@ git commit -m "feat: add Claude API registration CLI"
 - Consumes: standalone CLI, `reserve_shared_claude_account`, existing reserved-process owners, IPMart lease environment.
 - Produces: `claude_api` command construction; Claude-family predicate; per-platform ledger finalization for shared runs.
 
-- [ ] **Step 1: Write failing command and routing tests**
+- [x] **Step 1: Write failing command and routing tests**
 
 Test these exact expectations:
 
@@ -1533,7 +1588,7 @@ def test_claude_family_only_predicate_accepts_both_claude_choices(self):
 Also test that both Claude-family children receive the account lease, while
 ChatGPT/Grok still have account-proxy variables stripped.
 
-- [ ] **Step 2: Run entry-point tests and verify RED**
+- [x] **Step 2: Run entry-point tests and verify RED**
 
 Run:
 
@@ -1543,7 +1598,7 @@ python -m unittest tests.test_claude_api_entrypoints tests.test_claude_ninemail_
 
 Expected: FAIL because `claude_api` is not an allowed platform and the family predicate is absent.
 
-- [ ] **Step 3: Add command construction and choices**
+- [x] **Step 3: Add command construction and choices**
 
 In `register_three_platforms.build_command()` add:
 
@@ -1568,7 +1623,7 @@ if platform == "claude_api":
 Add `claude_api` to both argparse choices. Treat `claude` and `claude_api` as
 Claude-family platforms for IPMart ordering and HTTP-proxy stripping.
 
-- [ ] **Step 4: Generalize purpose-ledger routing without leaking it to mixed platforms**
+- [x] **Step 4: Generalize purpose-ledger routing without leaking it to mixed platforms**
 
 Define:
 
@@ -1642,7 +1697,7 @@ if is_claude_family_only(args.platforms):
         platform for platform in args.platforms if platform in CLAUDE_FAMILY
     ))
     if provider == "OUTLOOK" and purposes == ("claude",):
-        return email_pool.next_email("tri")
+        return email_pool.next_email("tri", display="masked")
     if len(purposes) > 1:
         result = reserve_shared_claude_account(provider, purposes)
         if result is None:
@@ -1655,7 +1710,7 @@ if is_claude_family_only(args.platforms):
             return None
         stores = {purposes[0]: store}
     return _ReservedPoolAccount(account, stores)
-return email_pool.next_email("tri")
+return email_pool.next_email("tri", display="masked")
 ```
 
 Keep `active=True` while any tracked child process remains unconfirmed so a
@@ -1663,10 +1718,11 @@ later confirmed shutdown can retry release. Mask complete email addresses in
 both the parent summary and relayed child output without modifying command
 arguments or account objects. If the run includes `claude_api`, propagate
 launch failure, nonzero child exit, or missing success marker as a nonzero
-orchestrator exit; retain the historical exit convention for runs that do not
-include `claude_api`.
+orchestrator exit. Recognize success only when the final nonempty child-output
+line is exactly `success: 1/1`; a substring mention is not success. Retain the
+historical exit convention for runs that do not include `claude_api`.
 
-- [ ] **Step 5: Generalize full-flow lease and platform environment logic**
+- [x] **Step 5: Generalize full-flow lease and platform environment logic**
 
 Rename `is_ninemail_claude_only()` to
 `is_ninemail_claude_family_only()`. Include `claude_api` when deciding whether
@@ -1709,7 +1765,7 @@ if account_lease is not None and any(
     platform_env.update(original_http_proxy_env)
 ```
 
-- [ ] **Step 6: Run focused orchestrator tests and dry-run commands**
+- [x] **Step 6: Run focused orchestrator tests and dry-run commands**
 
 Run:
 
@@ -1721,7 +1777,7 @@ python run_full_flow.py --platforms claude_api --dry-run
 
 Expected: tests PASS; help exits zero; dry-run prints redacted orchestration and creates no external account or proxy lease.
 
-- [ ] **Step 7: Commit orchestrator integration**
+- [x] **Step 7: Commit orchestrator integration**
 
 ```powershell
 git add register_three_platforms.py run_full_flow.py tests/test_claude_api_entrypoints.py tests/test_claude_ninemail_entrypoints.py tests/test_platform_proxy_env.py tests/test_full_flow_ipmart_proxy.py
@@ -1743,7 +1799,7 @@ git commit -m "feat: orchestrate Claude API registration"
 - Consumes: standalone CLI and orchestrator choices.
 - Produces: WebUI card `register_claude_api`; `claude_api` multi-select choices; documented commands, outputs, and recharge boundary.
 
-- [ ] **Step 1: Write failing WebUI schema and redaction tests**
+- [x] **Step 1: Write failing WebUI schema and redaction tests**
 
 Add:
 
@@ -1768,7 +1824,7 @@ def test_orchestrator_platform_choices_include_claude_api(self):
         self.assertIn("claude_api", platforms["choices"])
 ```
 
-- [ ] **Step 2: Run WebUI tests and verify RED**
+- [x] **Step 2: Run WebUI tests and verify RED**
 
 Run:
 
@@ -1778,7 +1834,7 @@ python -m unittest tests.test_claude_api_entrypoints tests.test_webui_env_reload
 
 Expected: FAIL because WebUI metadata lacks `claude_api`.
 
-- [ ] **Step 3: Add the WebUI card and choices**
+- [x] **Step 3: Add the WebUI card and choices**
 
 Add a `SCRIPTS` entry:
 
@@ -1806,7 +1862,7 @@ Add `claude_api` to both existing multi-select choice lists. Rely on the
 existing `_redact_cmd()` secret metadata; do not add special-case command
 string manipulation.
 
-- [ ] **Step 4: Document commands, state files, and non-goals**
+- [x] **Step 4: Document commands, state files, and non-goals**
 
 Update README examples with:
 
@@ -1821,7 +1877,7 @@ Document NINEMALL dual-artifact behavior, the four new purpose-state files,
 and that API-key creation/recharge are not yet performed. Add one dated
 CHANGELOG section describing the same delivered behavior.
 
-- [ ] **Step 5: Run the complete relevant suite**
+- [x] **Step 5: Run the complete relevant suite**
 
 Run:
 
@@ -1833,7 +1889,7 @@ git diff --check
 
 Expected: all listed tests PASS, compilation exits zero, and `git diff --check` prints nothing.
 
-- [ ] **Step 6: Perform a no-side-effect smoke check**
+- [x] **Step 6: Perform a no-side-effect smoke check**
 
 Run:
 
@@ -1848,14 +1904,14 @@ proxy allocation, browser profile, Anthropic account, API key, or recharge is
 created. `git status` lists only intentional implementation and documentation
 changes.
 
-- [ ] **Step 7: Commit WebUI and documentation**
+- [x] **Step 7: Commit WebUI and documentation**
 
 ```powershell
 git add webui/scripts.py README.md CHANGELOG.md .env.example tests/test_claude_api_entrypoints.py
 git commit -m "docs: expose Claude API registration"
 ```
 
-- [ ] **Step 8: Review the final branch diff**
+- [x] **Step 8: Review the final branch diff**
 
 Run:
 

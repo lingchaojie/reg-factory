@@ -69,6 +69,34 @@ def _crash_session_before_index_replace(output_dir):
     )
 
 
+def _run_session_with_hung_persist(result_queue):
+    """Session persistence must not be owned by asyncio's default executor."""
+    import common.claude_platform_session as session
+
+    def hung_persist(*_args, **_kwargs):
+        threading.Event().wait()
+
+    class Context:
+        async def cookies(self):
+            return [{
+                "name": "session",
+                "value": "cookie",
+                "domain": ".claude.com",
+            }]
+
+    session._persist_claude_platform_session = hung_persist
+    try:
+        asyncio.run(session.save_claude_platform_session(
+            Context(),
+            "person@example.com",
+            operation_timeout=0.02,
+        ))
+    except BaseException as exc:
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("completed")
+
+
 class FakeLocator:
     def __init__(self, page, selector, role=None, name=None, exact=False):
         self.page = page
@@ -559,19 +587,22 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(waits[1], 0)
         self.assertLess(elapsed, 0.24)
 
-    async def test_cancellation_resistant_first_poll_cannot_consume_resend_window(self):
+    async def test_cancellation_resistant_first_poll_propagates_unconfirmed_owner(self):
         page = FakePlatformPage()
         fetch_count = 0
+        release = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.15, release.set)
 
         async def fetch_verification(*_args):
             nonlocal fetch_count
             fetch_count += 1
             if fetch_count == 1:
-                try:
-                    await asyncio.Future()
-                except asyncio.CancelledError:
-                    await asyncio.sleep(0.15)
-                    return None
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return None
             return ClaudePlatformVerification(code="482731")
 
         started = asyncio.get_running_loop().time()
@@ -580,22 +611,22 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
             "save_claude_platform_session",
             new=AsyncMock(return_value="cookies/session.json"),
         ):
-            result = await asyncio.wait_for(
-                register_claude_api.run_claude_platform_flow(
-                    page,
-                    FakeBrowserContext([]),
-                    self.account,
-                    fetch_verification,
-                    0.25,
-                ),
-                timeout=0.5,
-            )
+            with self.assertRaises(register_claude_api._OperationUnconfirmed):
+                await asyncio.wait_for(
+                    register_claude_api.run_claude_platform_flow(
+                        page,
+                        FakeBrowserContext([]),
+                        self.account,
+                        fetch_verification,
+                        0.25,
+                    ),
+                    timeout=0.5,
+                )
         elapsed = asyncio.get_running_loop().time() - started
         await asyncio.sleep(0.16)
 
-        self.assertEqual(result, "cookies/session.json")
-        self.assertEqual(fetch_count, 2)
-        self.assertEqual(page.resend_count, 1)
+        self.assertEqual(fetch_count, 1)
+        self.assertEqual(page.resend_count, 0)
         self.assertLess(elapsed, 0.20)
 
     async def test_received_after_is_captured_before_verification_request(self):
@@ -1149,6 +1180,27 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 for record in records
             ))
 
+    def test_asyncio_run_does_not_wait_for_hung_session_persistence(self):
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_session_with_hung_persist,
+            args=(result_queue,),
+        )
+        process.start()
+        process.join(timeout=1.0)
+        try:
+            self.assertFalse(
+                process.is_alive(),
+                "asyncio.run waited for the session persistence executor",
+            )
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(result_queue.get(timeout=1), "OperationUnconfirmed")
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits are not portable on Windows")
     def test_cookie_and_index_files_are_owner_only(self):
         from common.claude_platform_session import (
@@ -1243,7 +1295,10 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
         context = FakeBrowserContext([
             {"name": "session", "value": "cookie", "domain": ".claude.com"},
         ])
+        import common.claude_platform_session as session
+
         real_write = os.write
+        real_write_fsynced = session._write_fsynced
         write_calls = 0
 
         def partial_then_fail(descriptor, data):
@@ -1253,14 +1308,21 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 return real_write(descriptor, data[:7])
             raise OSError("index write interrupted")
 
+        def fail_only_index_temp(path, payload):
+            if Path(path).name.startswith(".accounts.jsonl."):
+                with patch.object(session.os, "write", side_effect=partial_then_fail):
+                    return real_write_fsynced(path, payload)
+            return real_write_fsynced(path, payload)
+
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "cookies" / "claude_api"
             index, prior_bytes, existing_cookie = self.seed_valid_session_index(
                 output_dir
             )
-            with patch(
-                "common.claude_platform_session.os.write",
-                side_effect=partial_then_fail,
+            with patch.object(
+                session,
+                "_write_fsynced",
+                side_effect=fail_only_index_temp,
             ):
                 with self.assertRaises(OSError):
                     await register_claude_api.save_claude_platform_session(
@@ -1278,14 +1340,29 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
             {"name": "session", "value": "cookie", "domain": ".claude.com"},
         ])
 
+        import common.claude_platform_session as session
+
+        real_write_fsynced = session._write_fsynced
+
+        def fail_only_index_temp(path, payload):
+            if Path(path).name.startswith(".accounts.jsonl."):
+                with patch.object(
+                    session.os,
+                    "fsync",
+                    side_effect=OSError("index fsync interrupted"),
+                ):
+                    return real_write_fsynced(path, payload)
+            return real_write_fsynced(path, payload)
+
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "cookies" / "claude_api"
             index, prior_bytes, existing_cookie = self.seed_valid_session_index(
                 output_dir
             )
-            with patch(
-                "common.claude_platform_session.os.fsync",
-                side_effect=OSError("index fsync interrupted"),
+            with patch.object(
+                session,
+                "_write_fsynced",
+                side_effect=fail_only_index_temp,
             ):
                 with self.assertRaises(OSError):
                     await register_claude_api.save_claude_platform_session(
@@ -1362,6 +1439,79 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cookie_path.exists())
             self.assertEqual(records[-1]["cookie_file"], cookie_path.name)
             self.assertTrue((output_dir / records[-1]["cookie_file"]).exists())
+
+    async def test_each_atomic_replace_is_followed_by_directory_fsync(self):
+        import common.claude_platform_session as session
+
+        context = FakeBrowserContext([{
+            "name": "session", "value": "cookie", "domain": ".claude.com"
+        }])
+        events = []
+        real_replace = session.os.replace
+        real_fsync_directory = session._fsync_directory
+
+        def record_replace(source, destination):
+            events.append(("replace", Path(destination).name))
+            return real_replace(source, destination)
+
+        def record_directory_fsync(path):
+            events.append(("dir_fsync", Path(path).name))
+            return real_fsync_directory(path)
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            with patch.object(
+                session.os, "replace", side_effect=record_replace
+            ), patch.object(
+                session,
+                "_fsync_directory",
+                side_effect=record_directory_fsync,
+            ):
+                await register_claude_api.save_claude_platform_session(
+                    context, self.account.email, output_dir
+                )
+
+        replace_positions = [
+            index for index, event in enumerate(events) if event[0] == "replace"
+        ]
+        self.assertEqual(len(replace_positions), 2)
+        for position in replace_positions:
+            self.assertLess(position + 1, len(events))
+            self.assertEqual(events[position + 1][0], "dir_fsync")
+
+    async def test_index_directory_fsync_failure_never_deletes_published_cookie(self):
+        import common.claude_platform_session as session
+
+        context = FakeBrowserContext([{
+            "name": "session", "value": "cookie", "domain": ".claude.com"
+        }])
+        fsync_calls = 0
+
+        def fail_index_directory_fsync(_path):
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("index directory fsync interrupted")
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "cookies" / "claude_api"
+            with patch.object(
+                session,
+                "_fsync_directory",
+                side_effect=fail_index_directory_fsync,
+            ), self.assertRaisesRegex(OSError, "index directory fsync"):
+                await register_claude_api.save_claude_platform_session(
+                    context, self.account.email, output_dir
+                )
+
+            records = [
+                json.loads(line)
+                for line in (output_dir / "accounts.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            self.assertTrue((output_dir / records[0]["cookie_file"]).is_file())
 
 
 if __name__ == "__main__":
