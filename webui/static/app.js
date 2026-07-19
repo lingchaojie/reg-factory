@@ -255,33 +255,6 @@ $('#btn-stop').onclick = async ()=>{
 };
 
 // ---------------------------------------------------------------- 配置页
-async function loadNexaCardOAuthStatus(email, target){
-  if(!email){
-    target.textContent='请先填写验证邮箱';
-    target.classList.remove('bad');
-    return;
-  }
-  try{
-    const response = await fetch('/api/nexacard/oauth/status?email='+encodeURIComponent(email));
-    if(!response.ok) throw new Error('status request failed');
-    const result = await response.json();
-    const parts = [result.message || result.state || '授权状态未知'];
-    if(result.authorized_email) parts.push(result.authorized_email);
-    if(result.estimated_expires_at){
-      parts.push(`${result.estimated ? '预计' : ''}到期 ${result.estimated_expires_at}`);
-    }
-    target.textContent = parts.join(' · ');
-    const bad = result.state==='reauthorize' || result.state==='mismatch';
-    target.classList.toggle('bad', bad);
-    if(result.state !== 'unknown') target.classList.toggle('unknown', false);
-    else target.classList.add('unknown');
-  }catch(error){
-    target.textContent='暂时无法验证授权状态';
-    target.classList.remove('bad');
-    target.classList.add('unknown');
-  }
-}
-
 function addNexaCardOAuthActions(row, initialEmail){
   if(row.querySelector('.oauth-actions')) return;
   const field = row.querySelector('input[data-env]');
@@ -339,8 +312,8 @@ function addNexaCardOAuthActions(row, initialEmail){
   };
   authorize.addEventListener('click', startAuthorization);
   reauthorize.addEventListener('click', startAuthorization);
-  check.addEventListener('click', ()=>loadNexaCardOAuthStatus(field.value.trim(), status));
-  loadNexaCardOAuthStatus(initialEmail, status);
+  check.addEventListener('click', ()=>NexaCardWebUi.loadOauthStatus(field.value.trim(), status, ()=>field.value.trim()));
+  NexaCardWebUi.loadOauthStatus(initialEmail, status, ()=>field.value.trim());
 }
 
 async function loadEnv(){
@@ -356,11 +329,11 @@ async function loadEnv(){
       </div>`;
     g.items.forEach(it=>{
       const row = document.createElement('div'); row.className='env-item';
-      const type = it.secret ? 'password':'text';
+      const input = NexaCardWebUi.envInputMetadata(it);
       const value = it.value || it.default || '';
       const control = it.type === 'choice'
         ? `<select data-env="${it.key}">${(it.choices||[]).map(c=>`<option value="${c}" ${c===value?'selected':''}>${c}</option>`).join('')}</select>`
-        : `<input type="${type}" data-env="${it.key}" value="${(it.value||'').replace(/"/g,'&quot;')}"
+        : `<input type="${input.type}" data-env="${it.key}"${input.min ? ` min="${input.min}"` : ''}${input.step ? ` step="${input.step}"` : ''} value="${(it.value||'').replace(/"/g,'&quot;')}"
                  placeholder="${it.default? '默认 '+it.default : ''}">`;
       row.innerHTML = `
         <div class="k">${it.key}${it.required?'<span class="req">*</span>':''}</div>
@@ -369,7 +342,7 @@ async function loadEnv(){
           ${it.help?`<div class="ehelp">${it.help}</div>`:''}
         </div>`;
       box.appendChild(row);
-      if(it.gmail_oauth) addNexaCardOAuthActions(row, value);
+      if(NexaCardWebUi.shouldRenderGoogleOauthActions(it)) addNexaCardOAuthActions(row, value);
     });
     // 绑定该组的测试按钮
     box.querySelectorAll('.btn-test').forEach(btn=>{

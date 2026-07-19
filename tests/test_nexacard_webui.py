@@ -31,6 +31,18 @@ class NexaCardWebUITests(unittest.TestCase):
         self.assertEqual(entry["file"], "nexacard_otp_service.py")
         self.assertEqual(entry["args"], [])
 
+    def test_env_api_preserves_gmail_oauth_and_numeric_item_metadata(self):
+        response = TestClient(server.app).get("/api/env")
+        self.assertEqual(response.status_code, 200)
+        group = next(group for group in response.json()["groups"] if group["group"] == "NexaCard OTP")
+        items = {item["key"]: item for item in group["items"]}
+
+        self.assertIs(items["NEXACARD_VERIFICATION_EMAIL"]["gmail_oauth"], True)
+        self.assertIs(items["NEXACARD_ACCOUNT"]["gmail_oauth"], False)
+        self.assertIs(items["NEXACARD_PASSWORD"]["gmail_oauth"], False)
+        self.assertEqual(items["NEXACARD_OTP_POLL_INTERVAL_SECONDS"]["type"], "number")
+        self.assertEqual(items["NEXACARD_OTP_MAX_ATTEMPTS"]["type"], "int")
+
     def test_connectivity_check_uses_configured_local_service(self):
         client = TestClient(server.app)
         with patch.object(
@@ -56,15 +68,14 @@ class NexaCardWebUITests(unittest.TestCase):
         self.assertIn("window.open('about:blank'", script)
         self.assertIn("popup.close()", script)
         self.assertIn("if(!email)", script)
-        self.assertIn("result.state==='reauthorize' || result.state==='mismatch'", script)
-        self.assertIn("result.state !== 'unknown'", script)
+        self.assertIn("NexaCardWebUi.loadOauthStatus", script)
         self.assertNotIn("authorization_url, '_blank'", script)
         self.assertNotIn("innerHTML = `\n    <button type=\"button\" data-oauth-action", script)
 
     def test_oauth_status_controls_are_created_once_per_rendered_email_row(self):
         script = (ROOT / "webui" / "static" / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn("if(it.gmail_oauth)", script)
+        self.assertIn("NexaCardWebUi.shouldRenderGoogleOauthActions(it)", script)
         self.assertIn("row.querySelector('.oauth-actions')", script)
         self.assertIn("addEventListener('click'", script)
 

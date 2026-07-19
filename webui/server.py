@@ -845,6 +845,7 @@ def api_env_get():
                 "value": value,
                 "required": it.get("required", False),
                 "secret": it.get("secret", False),
+                "gmail_oauth": it.get("gmail_oauth", False),
                 "help": it.get("help", ""),
                 "default": it.get("default", ""),
                 "type": it.get("type", "str"),
