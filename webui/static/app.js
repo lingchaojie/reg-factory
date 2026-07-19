@@ -255,6 +255,67 @@ $('#btn-stop').onclick = async ()=>{
 };
 
 // ---------------------------------------------------------------- 配置页
+function addNexaCardOAuthActions(row, initialEmail){
+  if(row.querySelector('.oauth-actions')) return;
+  const field = row.querySelector('input[data-env]');
+  if(!field) return;
+  const actions = document.createElement('div');
+  actions.className='oauth-actions';
+  const status = document.createElement('span');
+  status.className='oauth-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.textContent='尚未检测';
+  const makeButton = (action, label)=>{
+    const button=document.createElement('button');
+    button.type='button';
+    button.dataset.oauthAction=action;
+    button.textContent=label;
+    return button;
+  };
+  const authorize=makeButton('authorize', 'Google 鉴权');
+  const reauthorize=makeButton('reauthorize', '重新鉴权');
+  const check=makeButton('status', '检测状态');
+  actions.append(authorize, reauthorize, check, status);
+  row.querySelector('.v').appendChild(actions);
+
+  const startAuthorization = async ()=>{
+    const email=field.value.trim();
+    if(!email){
+      status.textContent='请先填写验证邮箱';
+      status.classList.remove('bad');
+      return;
+    }
+    // This must happen synchronously in the click handler to retain the user gesture.
+    const popup=window.open('about:blank', '_blank');
+    if(!popup){
+      status.textContent='浏览器阻止了授权窗口，请允许弹窗后重试';
+      status.classList.add('bad');
+      return;
+    }
+    status.textContent='正在启动 Google 授权…';
+    status.classList.remove('bad', 'unknown');
+    try{
+      const response=await fetch('/api/nexacard/oauth/start', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})
+      });
+      const result=await response.json();
+      if(!response.ok || !result.ok || !result.authorization_url) throw new Error('authorization start failed');
+      popup.opener=null;
+      popup.location.replace(result.authorization_url);
+      status.textContent='请在 Google 页面完成授权，然后点击“检测状态”';
+    }catch(error){
+      popup.close();
+      status.textContent='无法启动 Google 授权，请检查本地 OAuth 配置后重试';
+      status.classList.add('bad');
+    }
+  };
+  authorize.addEventListener('click', startAuthorization);
+  reauthorize.addEventListener('click', startAuthorization);
+  check.addEventListener('click', ()=>NexaCardWebUi.loadOauthStatus(field.value.trim(), status, ()=>field.value.trim()));
+  NexaCardWebUi.loadOauthStatus(initialEmail, status, ()=>field.value.trim());
+}
+
 async function loadEnv(){
   const data = await (await fetch('/api/env')).json();
   const wrap = $('#env-groups'); wrap.innerHTML='';
@@ -268,13 +329,13 @@ async function loadEnv(){
       </div>`;
     g.items.forEach(it=>{
       const row = document.createElement('div'); row.className='env-item';
-      const type = it.secret ? 'password':'text';
+      const input = NexaCardWebUi.envInputMetadata(it);
       const value = it.value || it.default || '';
       const control = it.type === 'choice'
         ? `<select data-env="${it.key}">${(it.choices||[]).map(c=>`<option value="${c}" ${c===value?'selected':''}>${c}</option>`).join('')}</select>`
         : it.type === 'bool'
           ? EnvControls.renderBooleanControl(it.key, value)
-          : `<input type="${type}" data-env="${it.key}" value="${(it.value||'').replace(/"/g,'&quot;')}"
+          : `<input type="${input.type}" data-env="${it.key}"${input.min ? ` min="${input.min}"` : ''}${input.step ? ` step="${input.step}"` : ''} value="${(it.value||'').replace(/"/g,'&quot;')}"
                    placeholder="${it.default? '默认 '+it.default : ''}">`;
       row.innerHTML = `
         <div class="k">${it.key}${it.required?'<span class="req">*</span>':''}</div>
@@ -283,6 +344,7 @@ async function loadEnv(){
           ${it.help?`<div class="ehelp">${it.help}</div>`:''}
         </div>`;
       box.appendChild(row);
+      if(NexaCardWebUi.shouldRenderGoogleOauthActions(it)) addNexaCardOAuthActions(row, value);
     });
     // 绑定该组的测试按钮
     box.querySelectorAll('.btn-test').forEach(btn=>{
@@ -314,12 +376,13 @@ async function runTest(target, btn){
 }
 
 $('#btn-save-env').onclick = async ()=>{
-  const env = EnvControls.collectForSave(
-    $$('input[data-env],select[data-env]')
-  );
+  const msg = $('#env-msg');
+  msg.textContent = '';
+  const controls = $$('input[data-env],select[data-env]');
+  if(!NexaCardWebUi.validateEnvControls(controls, msg)) return;
+  const env = EnvControls.collectForSave(controls);
   const r = await (await fetch('/api/env',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({env})})).json();
-  const msg = $('#env-msg');
   msg.textContent = r.ok
     ? ('✓ 已保存 '+r.saved+' 项，新任务立即生效，无需重启')
     : ('保存失败: '+(r.error||''));

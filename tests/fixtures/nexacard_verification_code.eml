@@ -1,0 +1,7 @@
+From: NexaCardVCC <jushihui@mail.jushipay.com>
+To: tester@example.com
+Subject: NexaCard Verification Code
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html><body><div>Enter this code within three minutes.</div><div>123456789</div></body></html>

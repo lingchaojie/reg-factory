@@ -11,6 +11,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 """
 import asyncio
 import contextlib
+import html
 import os
 import shutil
 import subprocess
@@ -45,6 +46,7 @@ from common.network_route import (  # noqa: E402
     RESOLVED_ROUTE_ENV_KEY,
     prepare_clash_or_direct,
 )
+from nexacard_otp.gmail_auth import OAuthCoordinator, get_auth_status  # noqa: E402
 
 
 def _ensure_proxy_env():
@@ -60,6 +62,8 @@ def _ensure_proxy_env():
 
 
 app = FastAPI(title="reg-factory WebUI")
+NEXACARD_OAUTH = OAuthCoordinator()
+SECRET_SENTINEL = "********"
 
 # 运行中的任务：run_id -> {proc, lines:[], done:bool, script, cmd, started}
 RUNS = {}
@@ -103,6 +107,29 @@ def _http_alive(url, timeout=3):
         return True  # 4xx = 服务活着(拒绝裸请求)
     except Exception:
         return False
+
+
+def _nexacard_health_url():
+    """Build the service health URL only for loopback listeners."""
+    host = _read_config_val("NEXACARD_SERVICE_HOST", "127.0.0.1").strip().lower()
+    port_text = _read_config_val("NEXACARD_SERVICE_PORT", "8811").strip()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    rendered_host = f"[{host}]" if host == "::1" else host
+    return f"http://{rendered_host}:{port}/health"
+
+
+def _test_nexacard():
+    url = _nexacard_health_url()
+    if not url:
+        return False, "NexaCard OTP 服务仅支持本地回环监听地址和有效端口"
+    return _http_alive(url), f"NexaCard OTP 服务 {url}"
 
 
 def _k12_url():
@@ -464,6 +491,7 @@ _TESTERS = {
     "smsman": _test_smsman,
     "firefox": _test_firefox,
     "yyds": _test_yyds,
+    "nexacard": _test_nexacard,
 }
 
 
@@ -705,6 +733,62 @@ def index():
     return open(os.path.join(WEBUI, "static", "index.html"), encoding="utf-8").read()
 
 
+def _safe_oauth_error(exc: Exception) -> str:
+    """Expose only fixed, locally generated OAuth validation messages."""
+    message = str(exc).strip()
+    if message in {
+        "a valid verification email is required",
+        "OAuth state is missing or expired",
+        "OAuth state does not match the authorization response",
+        "OAuth state returned by Google does not match the request",
+        "authorized Gmail address does not match the configured verification email",
+        "too many pending OAuth authorizations; try again",
+    }:
+        return message
+    return "Google authorization could not be completed safely"
+
+
+@app.post("/api/nexacard/oauth/start")
+async def nexacard_oauth_start(request: Request):
+    data = await request.json()
+    email = str(data.get("email") or "").strip()
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/nexacard/oauth/callback"
+    try:
+        authorization_url = NEXACARD_OAUTH.start(email, redirect_uri)
+    except (ValueError, FileNotFoundError) as exc:
+        return {"ok": False, "error": _safe_oauth_error(exc)}
+    except Exception:
+        return {"ok": False, "error": "Google authorization could not be started safely"}
+    return {"ok": True, "authorization_url": authorization_url}
+
+
+@app.get("/api/nexacard/oauth/callback", response_class=HTMLResponse)
+async def nexacard_oauth_callback(request: Request):
+    state = request.query_params.get("state", "")
+    try:
+        status = await asyncio.to_thread(NEXACARD_OAUTH.complete, state, str(request.url))
+    except Exception as exc:
+        message = html.escape(_safe_oauth_error(exc))
+        return HTMLResponse(f"<h2>Google 鉴权失败</h2><p>{message}</p>", status_code=400)
+    email = html.escape(status.authorized_email or "")
+    return HTMLResponse(f"<h2>Google 鉴权成功</h2><p>{email}</p>")
+
+
+@app.get("/api/nexacard/oauth/status")
+async def nexacard_oauth_status(email: str = ""):
+    try:
+        status = await asyncio.to_thread(get_auth_status, email.strip().lower())
+    except Exception:
+        return {"state": "unknown", "message": "Gmail authorization status is temporarily unavailable", "authorized_email": None, "estimated_expires_at": None, "estimated": False}
+    return {
+        "state": status.state,
+        "message": status.message,
+        "authorized_email": status.authorized_email,
+        "estimated_expires_at": status.estimated_expires_at.isoformat() if status.estimated_expires_at else None,
+        "estimated": status.estimated,
+    }
+
+
 @app.get("/api/status")
 def api_status():
     provider = _fingerprint_provider()
@@ -755,13 +839,14 @@ def api_env_get():
             }.get(it["key"])
             if not value and legacy_key:
                 value = cur.get(legacy_key, "")
-            if it["key"] == "OCTO_API_TOKEN" and value:
-                value = "********"
+            if it.get("secret") and value:
+                value = SECRET_SENTINEL
             items.append({
                 "key": it["key"],
                 "value": value,
                 "required": it.get("required", False),
                 "secret": it.get("secret", False),
+                "gmail_oauth": it.get("gmail_oauth", False),
                 "help": it.get("help", ""),
                 "default": it.get("default", ""),
                 "type": it.get("type", "str"),
@@ -778,8 +863,17 @@ async def api_env_set(request: Request):
     # 只接受 schema 里声明的 key，避免写入垃圾
     allowed = set(schema.env_keys())
     updates = {k: ("" if v is None else str(v)) for k, v in updates.items() if k in allowed}
-    if updates.get("OCTO_API_TOKEN") == "********":
-        updates.pop("OCTO_API_TOKEN")
+    secret_keys = {
+        item["key"]
+        for group in schema.ENV_SCHEMA
+        for item in group["items"]
+        if item.get("secret")
+    }
+    updates = {
+        key: value
+        for key, value in updates.items()
+        if not (key in secret_keys and value == SECRET_SENTINEL)
+    }
     if not os.path.isfile(ENV_PATH) and os.path.isfile(ENV_EXAMPLE):
         # 首次保存：以模板为底
         import shutil
