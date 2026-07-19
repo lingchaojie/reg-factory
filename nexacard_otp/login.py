@@ -2,15 +2,11 @@ import asyncio
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from google.auth.exceptions import RefreshError
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from .errors import (
-    GmailAuthorizationRequired,
-    GmailTemporarilyUnavailable,
-    NexaCardLoginFailed,
-)
+from .errors import NexaCardLoginFailed
 from .gmail_reader import GmailCodeReader
 from .settings import Settings
 
@@ -32,6 +28,13 @@ VERIFICATION_CODE_INPUT = 'input[placeholder="请输入邮箱验证码"]'
 EMAIL_LOGIN_RADIO = ".el-radio"
 REQUEST_CODE_BUTTON = "button.get-code-btn"
 SUBMIT_BUTTON = "button.submit-btn"
+PROTECTED_CARD_SEARCH = "input[placeholder='请输入卡号']"
+PROBE_STATE_SCRIPT = f"""
+() => Boolean(
+  document.querySelector({USERNAME_INPUT!r})
+  || document.querySelector({PROTECTED_CARD_SEARCH!r})
+)
+"""
 
 
 class NexaCardLogin:
@@ -83,31 +86,41 @@ class NexaCardLogin:
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard page operation failed") from exc
 
-    async def _snapshot_login_message_ids(self) -> frozenset[str]:
+    async def _probe_is_logged_out(self, page: Page) -> bool:
+        """Wait for the SPA guard to render login or protected-page evidence."""
         try:
-            return await self._gmail_reader.snapshot_login_message_ids()
-        except (GmailAuthorizationRequired, RefreshError) as exc:
-            raise NexaCardLoginFailed("NexaCard Gmail authorization is required") from exc
-        except GmailTemporarilyUnavailable as exc:
-            raise NexaCardLoginFailed("NexaCard Gmail is temporarily unavailable") from exc
-        except Exception as exc:
-            raise NexaCardLoginFailed("NexaCard login verification email could not be read") from exc
+            await page.wait_for_function(PROBE_STATE_SCRIPT, timeout=PAGE_TIMEOUT_MS)
+            if await page.locator(USERNAME_INPUT).count() > 0:
+                return True
+            if await page.locator(PROTECTED_CARD_SEARCH).count() > 0:
+                return False
+        except PlaywrightTimeoutError as exc:
+            raise NexaCardLoginFailed("NexaCard authentication check timed out") from exc
+        except PlaywrightError as exc:
+            raise NexaCardLoginFailed("NexaCard page operation failed") from exc
+        raise NexaCardLoginFailed("NexaCard authentication state is unavailable")
+
+    async def _snapshot_login_message_ids(
+        self, expected_email: str
+    ) -> frozenset[str]:
+        return await self._gmail_reader.snapshot_login_message_ids(
+            expected_email=expected_email
+        )
 
     async def _wait_for_login_code(
-        self, sent_after: datetime, excluded_message_ids: frozenset[str]
+        self,
+        sent_after: datetime,
+        excluded_message_ids: frozenset[str],
+        expected_email: str,
     ) -> str:
         try:
             return await self._gmail_reader.wait_for_login_code(
-                sent_after, excluded_message_ids=excluded_message_ids
+                sent_after,
+                excluded_message_ids=excluded_message_ids,
+                expected_email=expected_email,
             )
         except TimeoutError as exc:
             raise NexaCardLoginFailed("NexaCard login verification email timed out") from exc
-        except (GmailAuthorizationRequired, RefreshError) as exc:
-            raise NexaCardLoginFailed("NexaCard Gmail authorization is required") from exc
-        except GmailTemporarilyUnavailable as exc:
-            raise NexaCardLoginFailed("NexaCard Gmail is temporarily unavailable") from exc
-        except Exception as exc:
-            raise NexaCardLoginFailed("NexaCard login verification email could not be read") from exc
 
     async def _perform_login(self, page: Page, settings: Settings) -> None:
         self._require_login_settings(settings)
@@ -124,14 +137,18 @@ class NexaCardLogin:
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard page operation failed") from exc
 
-        excluded_message_ids = await self._snapshot_login_message_ids()
+        excluded_message_ids = await self._snapshot_login_message_ids(
+            settings.verification_email
+        )
         sent_after = datetime.now(timezone.utc)
         try:
             await page.locator(REQUEST_CODE_BUTTON).click(timeout=PAGE_TIMEOUT_MS)
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard page operation failed") from exc
 
-        code = await self._wait_for_login_code(sent_after, excluded_message_ids)
+        code = await self._wait_for_login_code(
+            sent_after, excluded_message_ids, settings.verification_email
+        )
 
         try:
             await page.locator(VERIFICATION_CODE_INPUT).fill(code, timeout=PAGE_TIMEOUT_MS)
@@ -142,15 +159,21 @@ class NexaCardLogin:
         except PlaywrightError as exc:
             raise NexaCardLoginFailed("NexaCard login did not reach an authenticated page") from exc
 
-    async def ensure_authenticated(self, page: Page, settings: Settings) -> bool:
-        if not await self._is_logged_out(page):
+    async def ensure_authenticated(
+        self,
+        page: Page,
+        settings: Settings,
+        *,
+        confirmed_failure: bool = False,
+    ) -> bool:
+        if not confirmed_failure and not await self._is_logged_out(page):
             return False
 
         async with self._login_lock:
             if not settings.account or not settings.password or not settings.verification_email:
                 self._require_login_settings(settings)
             await self._navigate_for_recheck(page)
-            if not await self._is_logged_out(page):
+            if not await self._probe_is_logged_out(page):
                 return False
             await self._perform_login(page, settings)
             return True

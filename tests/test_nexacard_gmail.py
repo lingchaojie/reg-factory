@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -21,6 +22,13 @@ RECEIVED_MS = int(datetime(2026, 7, 19, 4, 54, 10, tzinfo=timezone.utc).timestam
 
 def _encoded(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _gmail_http_error(status: int, reason: str) -> HttpError:
+    content = json.dumps(
+        {"error": {"errors": [{"reason": reason}], "status": "PERMISSION_DENIED"}}
+    ).encode("utf-8")
+    return HttpError(Mock(status=status), content)
 
 
 class NexaCardGmailTests(unittest.TestCase):
@@ -93,6 +101,25 @@ class NexaCardGmailTests(unittest.TestCase):
             maxResults=500,
         )
 
+    def test_snapshot_rejects_a_live_profile_email_mismatch_before_listing_messages(self):
+        failure = GmailAuthorizationRequired(
+            "authorized Gmail address does not match the configured verification email"
+        )
+
+        with patch(
+            "nexacard_otp.gmail_reader.load_authorized_credentials",
+            side_effect=failure,
+        ), patch("nexacard_otp.gmail_reader.build") as build:
+            with self.assertRaises(GmailAuthorizationRequired) as captured:
+                asyncio.run(
+                    GmailCodeReader().snapshot_login_message_ids(
+                        expected_email="owner@example.com"
+                    )
+                )
+
+        self.assertIs(captured.exception, failure)
+        build.assert_not_called()
+
     def test_snapshot_paginates_all_ids_and_fetch_later_excludes_a_second_page_id(self):
         raw = _encoded(Path("tests/fixtures/nexacard_verification_code.eml").read_bytes())
         messages = Mock()
@@ -126,29 +153,77 @@ class NexaCardGmailTests(unittest.TestCase):
         self.assertEqual(messages.list.call_args_list[1].kwargs["pageToken"], "second-page")
         messages.get.assert_called_once_with(userId="me", id="new", format="raw")
 
-    def test_gmail_http_authorization_errors_preserve_cause_for_snapshot_and_fetch(self):
+    def test_gmail_http_auth_specific_403_preserves_cause_for_snapshot_and_fetch(self):
         for method_name in ("snapshot", "fetch"):
-            for status in (401, 403):
-                with self.subTest(method_name=method_name, status=status):
-                    response = Mock(status=status)
-                    error = HttpError(response, b"secret response")
-                    messages = Mock()
-                    messages.list.return_value.execute.side_effect = error
-                    service = Mock()
-                    service.users.return_value.messages.return_value = messages
-                    reader = GmailCodeReader()
+            with self.subTest(method_name=method_name):
+                error = _gmail_http_error(403, "insufficientPermissions")
+                messages = Mock()
+                messages.list.return_value.execute.side_effect = error
+                service = Mock()
+                service.users.return_value.messages.return_value = messages
+                reader = GmailCodeReader()
 
-                    with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
-                        "nexacard_otp.gmail_reader.load_valid_credentials"
-                    ):
-                        with self.assertRaises(GmailAuthorizationRequired) as captured:
-                            if method_name == "snapshot":
-                                asyncio.run(reader.snapshot_login_message_ids())
-                            else:
-                                reader._fetch_once(SENT_AFTER)
+                with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+                    "nexacard_otp.gmail_reader.load_valid_credentials"
+                ):
+                    with self.assertRaises(GmailAuthorizationRequired) as captured:
+                        if method_name == "snapshot":
+                            asyncio.run(reader.snapshot_login_message_ids())
+                        else:
+                            reader._fetch_once(SENT_AFTER)
 
-                    self.assertIs(captured.exception.__cause__, error)
-                    self.assertNotIn("secret response", str(captured.exception))
+                self.assertIs(captured.exception.__cause__, error)
+
+    def test_snapshot_and_fetch_repeated_401_refresh_once_then_require_authorization(self):
+        for method_name in ("snapshot", "fetch"):
+            with self.subTest(method_name=method_name), tempfile.TemporaryDirectory() as directory:
+                credentials = Mock(
+                    to_json=Mock(return_value='{"token":"refreshed"}')
+                )
+                token_path = Path(directory) / "token.json"
+                token_path.write_text("{}", encoding="utf-8")
+                credentials._nexacard_token_digest = sha256(b"{}").hexdigest()
+                messages = Mock()
+                messages.list.return_value.execute.side_effect = [
+                    _gmail_http_error(401, "authError"),
+                    _gmail_http_error(401, "authError"),
+                ]
+                service = Mock()
+                service.users.return_value.messages.return_value = messages
+                with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+                    "nexacard_otp.gmail_reader.load_valid_credentials",
+                    return_value=credentials,
+                ), patch(
+                    "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH",
+                    token_path,
+                ):
+                    with self.assertRaises(GmailAuthorizationRequired):
+                        if method_name == "snapshot":
+                            asyncio.run(GmailCodeReader().snapshot_login_message_ids())
+                        else:
+                            GmailCodeReader()._fetch_once(SENT_AFTER)
+
+                credentials.refresh.assert_called_once()
+                self.assertEqual(messages.list.call_count, 2)
+
+    def test_snapshot_and_fetch_quota_403_are_temporary(self):
+        for method_name in ("snapshot", "fetch"):
+            with self.subTest(method_name=method_name):
+                error = _gmail_http_error(403, "rateLimitExceeded")
+                messages = Mock()
+                messages.list.return_value.execute.side_effect = error
+                service = Mock()
+                service.users.return_value.messages.return_value = messages
+                with patch("nexacard_otp.gmail_reader.build", return_value=service), patch(
+                    "nexacard_otp.gmail_reader.load_valid_credentials"
+                ):
+                    with self.assertRaises(GmailTemporarilyUnavailable) as captured:
+                        if method_name == "snapshot":
+                            asyncio.run(GmailCodeReader().snapshot_login_message_ids())
+                        else:
+                            GmailCodeReader()._fetch_once(SENT_AFTER)
+
+                self.assertIs(captured.exception.__cause__, error)
 
     def test_gmail_http_non_authorization_errors_are_temporary_for_snapshot_and_fetch(self):
         for method_name in ("snapshot", "fetch"):
@@ -195,6 +270,16 @@ class NexaCardGmailTests(unittest.TestCase):
             b"--part\nContent-Type: text/plain; charset=utf-8\n\nUse 1234567890 instead.\n"
             b"--part\nContent-Type: text/plain; name=code.txt\n"
             b"Content-Disposition: attachment; filename=code.txt\n\n123456789\n--part--\n"
+        )
+
+        self.assertIsNone(parse_login_code(_encoded(raw), RECEIVED_MS, SENT_AFTER))
+
+    def test_parser_rejects_unicode_login_code_digits(self):
+        raw = (
+            b"From: NexaCardVCC <jushihui@mail.jushipay.com>\n"
+            b"Subject: NexaCard Verification Code\n"
+            b"Content-Type: text/plain; charset=utf-8\n\n"
+            + "１２３４５６７８９".encode("utf-8")
         )
 
         self.assertIsNone(parse_login_code(_encoded(raw), RECEIVED_MS, SENT_AFTER))
@@ -277,6 +362,9 @@ class NexaCardGmailTests(unittest.TestCase):
         valid_profile = Mock()
         valid_profile.users().getProfile().execute.return_value = {"emailAddress": "Owner@Example.com"}
         with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "token.json"
+            token_path.write_text("{}", encoding="utf-8")
+            credentials._nexacard_token_digest = sha256(b"{}").hexdigest()
             meta_path = Path(directory) / "token.meta.json"
             meta_path.write_text(
                 json.dumps(
@@ -289,8 +377,8 @@ class NexaCardGmailTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
-                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", Path(directory) / "token.json"
+            with patch("nexacard_otp.gmail_auth._load_valid_credentials_unlocked", return_value=credentials), patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", token_path
             ), patch("nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", meta_path), patch(
                 "nexacard_otp.gmail_auth.build", side_effect=[failed_profile, valid_profile]
             ):
@@ -309,13 +397,13 @@ class NexaCardGmailTests(unittest.TestCase):
         profile = Mock()
         profile.users().getProfile().execute.return_value = {"emailAddress": "other@example.com"}
         with tempfile.TemporaryDirectory() as directory:
-            with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
+            with patch("nexacard_otp.gmail_auth._load_valid_credentials_unlocked", return_value=credentials), patch(
                 "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", Path(directory) / "token.meta.json"
             ), patch("nexacard_otp.gmail_auth.build", return_value=profile):
                 self.assertEqual(get_auth_status("owner@example.com").state, "mismatch")
 
         profile.users().getProfile().execute.side_effect = OSError("offline")
-        with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
+        with patch("nexacard_otp.gmail_auth._load_valid_credentials_unlocked", return_value=credentials), patch(
             "nexacard_otp.gmail_auth.build", return_value=profile
         ):
             self.assertEqual(get_auth_status("owner@example.com").state, "unknown")
@@ -336,7 +424,7 @@ class NexaCardGmailTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
+            with patch("nexacard_otp.gmail_auth._load_valid_credentials_unlocked", return_value=credentials), patch(
                 "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", meta_path
             ), patch("nexacard_otp.gmail_auth.build", return_value=profile):
                 status = get_auth_status("owner@example.com")
@@ -345,23 +433,46 @@ class NexaCardGmailTests(unittest.TestCase):
             self.assertEqual(status.state, "unknown")
             self.assertEqual(metadata, {"authorized_email": "owner@example.com"})
 
-    def test_second_profile_http_failure_remains_unknown_after_one_refresh(self):
-        for retry_status in (401, 503):
-            with self.subTest(retry_status=retry_status), tempfile.TemporaryDirectory() as directory:
+    def test_repeated_profile_401_requires_reauthorization_after_one_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
                 credentials = Mock(to_json=Mock(return_value="{}"))
+                token_path = Path(directory) / "token.json"
+                token_path.write_text("{}", encoding="utf-8")
+                credentials._nexacard_token_digest = sha256(b"{}").hexdigest()
                 first_profile = Mock()
                 first_profile.users().getProfile().execute.side_effect = HttpError(Mock(status=401), b"unauthorized")
                 retry_profile = Mock()
-                retry_profile.users().getProfile().execute.side_effect = HttpError(
-                    Mock(status=retry_status), b"unavailable"
-                )
-                with patch("nexacard_otp.gmail_auth.load_valid_credentials", return_value=credentials), patch(
-                    "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", Path(directory) / "token.json"
+                retry_profile.users().getProfile().execute.side_effect = HttpError(Mock(status=401), b"unauthorized")
+                with patch("nexacard_otp.gmail_auth._load_valid_credentials_unlocked", return_value=credentials), patch(
+                    "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", token_path
                 ), patch("nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", Path(directory) / "token.meta.json"), patch(
                     "nexacard_otp.gmail_auth.build", side_effect=[first_profile, retry_profile]
                 ):
-                    self.assertEqual(get_auth_status("owner@example.com").state, "unknown")
+                    self.assertEqual(get_auth_status("owner@example.com").state, "reauthorize")
                 credentials.refresh.assert_called_once()
+
+    def test_profile_quota_403_is_temporary_but_auth_403_requires_reauthorization(self):
+        for reason, expected_state in (
+            ("rateLimitExceeded", "unknown"),
+            ("insufficientPermissions", "reauthorize"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                credentials = Mock()
+                profile = Mock()
+                profile.users().getProfile().execute.side_effect = _gmail_http_error(
+                    403, reason
+                )
+                with patch(
+                    "nexacard_otp.gmail_auth._load_valid_credentials_unlocked",
+                    return_value=credentials,
+                ), patch(
+                    "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH",
+                    Path(directory) / "token.meta.json",
+                ), patch("nexacard_otp.gmail_auth.build", return_value=profile):
+                    self.assertEqual(
+                        get_auth_status("owner@example.com").state,
+                        expected_state,
+                    )
 
     def test_temporary_gmail_failure_is_retried_inside_bounded_mail_poll(self):
         reader = GmailCodeReader()

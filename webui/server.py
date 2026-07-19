@@ -63,6 +63,7 @@ def _ensure_proxy_env():
 
 app = FastAPI(title="reg-factory WebUI")
 NEXACARD_OAUTH = OAuthCoordinator()
+SECRET_SENTINEL = "********"
 
 # 运行中的任务：run_id -> {proc, lines:[], done:bool, script, cmd, started}
 RUNS = {}
@@ -838,8 +839,8 @@ def api_env_get():
             }.get(it["key"])
             if not value and legacy_key:
                 value = cur.get(legacy_key, "")
-            if it["key"] == "OCTO_API_TOKEN" and value:
-                value = "********"
+            if it.get("secret") and value:
+                value = SECRET_SENTINEL
             items.append({
                 "key": it["key"],
                 "value": value,
@@ -862,8 +863,17 @@ async def api_env_set(request: Request):
     # 只接受 schema 里声明的 key，避免写入垃圾
     allowed = set(schema.env_keys())
     updates = {k: ("" if v is None else str(v)) for k, v in updates.items() if k in allowed}
-    if updates.get("OCTO_API_TOKEN") == "********":
-        updates.pop("OCTO_API_TOKEN")
+    secret_keys = {
+        item["key"]
+        for group in schema.ENV_SCHEMA
+        for item in group["items"]
+        if item.get("secret")
+    }
+    updates = {
+        key: value
+        for key, value in updates.items()
+        if not (key in secret_keys and value == SECRET_SENTINEL)
+    }
     if not os.path.isfile(ENV_PATH) and os.path.isfile(ENV_EXAMPLE):
         # 首次保存：以模板为底
         import shutil

@@ -39,6 +39,15 @@ class NexaCardMatchingTests(unittest.TestCase):
                 with self.assertRaises(InvalidLookupInput):
                     parse_lookup_input(card_number, card_type, order_created_at, self.zone)
 
+    def test_unicode_digits_are_not_accepted_as_card_numbers(self):
+        with self.assertRaises(InvalidLookupInput):
+            parse_lookup_input(
+                "６５０００００００００００００７",
+                "NexaCardB",
+                "2026-07-19 03:00:00",
+                self.zone,
+            )
+
     def test_equal_time_is_rejected_and_nearest_strictly_later_row_wins(self):
         lookup = parse_lookup_input("6500000000000037", "NexaCardB", "2026-07-19 03:00:00", self.zone)
         rows = [

@@ -1,4 +1,6 @@
 import unittest
+import asyncio
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +12,75 @@ from webui import scripts, server
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class _JsonRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
+
+
 class NexaCardWebUITests(unittest.TestCase):
+    def test_env_get_masks_every_schema_secret_including_nexacard_password(self):
+        secret_keys = {
+            item["key"]
+            for group in scripts.ENV_SCHEMA
+            for item in group["items"]
+            if item.get("secret")
+        }
+        values = {key: f"private-{index}" for index, key in enumerate(secret_keys)}
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "".join(f"{key}={value}\n" for key, value in values.items()),
+                encoding="utf-8",
+            )
+            with patch.object(server, "ENV_PATH", str(env_path)), patch.object(
+                server, "ENV_EXAMPLE", str(Path(directory) / "missing.example")
+            ):
+                payload = server.api_env_get()
+
+        items = {
+            item["key"]: item
+            for group in payload["groups"]
+            for item in group["items"]
+        }
+        self.assertIn("NEXACARD_PASSWORD", secret_keys)
+        for key in secret_keys:
+            with self.subTest(key=key):
+                self.assertEqual(items[key]["value"], "********")
+                self.assertNotIn(values[key], repr(payload))
+
+    def test_env_post_sentinel_preserves_every_stored_schema_secret(self):
+        secret_keys = {
+            item["key"]
+            for group in scripts.ENV_SCHEMA
+            for item in group["items"]
+            if item.get("secret")
+        }
+        values = {key: f"private-{index}" for index, key in enumerate(secret_keys)}
+        values["NEXACARD_ACCOUNT"] = "old-account"
+        request_values = {key: "********" for key in secret_keys}
+        request_values["NEXACARD_ACCOUNT"] = "new-account"
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "".join(f"{key}={value}\n" for key, value in values.items()),
+                encoding="utf-8",
+            )
+            with patch.object(server, "ENV_PATH", str(env_path)), patch.object(
+                server, "ENV_EXAMPLE", str(Path(directory) / "missing.example")
+            ), patch.object(server, "_apply_saved_env"):
+                asyncio.run(
+                    server.api_env_set(_JsonRequest({"env": request_values}))
+                )
+            saved = server._parse_env_file(str(env_path))
+
+        for key in secret_keys:
+            with self.subTest(key=key):
+                self.assertEqual(saved[key], values[key])
+        self.assertEqual(saved["NEXACARD_ACCOUNT"], "new-account")
+
     def test_schema_exposes_secret_credentials_and_polling_defaults(self):
         group = next(group for group in scripts.ENV_SCHEMA if group["group"] == "NexaCard OTP")
         items = {item["key"]: item for item in group["items"]}

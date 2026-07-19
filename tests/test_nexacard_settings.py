@@ -8,12 +8,30 @@ from nexacard_otp.models import CardType
 from nexacard_otp.settings import (
     PRIVATE_CREDENTIALS_PATH,
     PRIVATE_TOKEN_PATH,
+    discover_chrome,
     ensure_private_oauth_files,
     load_settings,
 )
 
 
 class NexaCardSettingsTests(unittest.TestCase):
+    def test_explicit_chrome_path_requires_a_chrome_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chrome = Path(directory) / "Chrome.EXE"
+            chrome.write_bytes(b"")
+            self.assertEqual(discover_chrome(str(chrome)), chrome)
+
+            edge = Path(directory) / "msedge.exe"
+            edge.write_bytes(b"")
+            with self.assertRaisesRegex(FileNotFoundError, "chrome.exe"):
+                discover_chrome(str(edge))
+
+    def test_missing_explicit_chrome_path_does_not_fall_back_to_auto_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "chrome.exe"
+            with self.assertRaises(FileNotFoundError):
+                discover_chrome(str(missing))
+
     def test_private_directory_is_created_without_legacy_oauth_files(self):
         with tempfile.TemporaryDirectory() as directory:
             private_dir = Path(directory) / "private"

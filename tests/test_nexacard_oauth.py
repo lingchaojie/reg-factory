@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -8,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from nexacard_otp import gmail_auth
 from nexacard_otp.gmail_auth import OAuthCoordinator
 from nexacard_otp.models import AuthStatus
 from webui import server
@@ -24,6 +27,131 @@ def _flow(authorization_url="https://accounts.google.com/authorize", returned_st
 
 
 class NexaCardOAuthCoordinatorTests(unittest.TestCase):
+    def test_start_runs_private_oauth_file_migration_inside_transaction(self):
+        events = []
+        flow = _flow()
+
+        class RecordingTransaction:
+            def __enter__(self):
+                events.append("transaction-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("transaction-exit")
+
+        with patch(
+            "nexacard_otp.gmail_auth.oauth_file_transaction",
+            return_value=RecordingTransaction(),
+        ), patch(
+            "nexacard_otp.gmail_auth.ensure_private_oauth_files",
+            side_effect=lambda: events.append("migrate"),
+        ), patch(
+            "nexacard_otp.gmail_auth.Flow.from_client_secrets_file",
+            return_value=flow,
+        ):
+            OAuthCoordinator().start("owner@example.com", CALLBACK)
+
+        self.assertEqual(
+            events,
+            ["transaction-enter", "migrate", "transaction-exit"],
+        )
+
+    def test_api_401_refresh_cannot_overwrite_a_newer_oauth_completion(self):
+        old_credentials = Mock(valid=True)
+        current_credentials = Mock(valid=True)
+        flow = _flow()
+        flow.credentials.to_json.return_value = '{"token":"new-reauth"}'
+        coordinator = OAuthCoordinator()
+        coordinator.pending["state1"] = ("owner@example.com", flow)
+        profile = Mock()
+        profile.users().getProfile().execute.return_value = {
+            "emailAddress": "owner@example.com"
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "token.json"
+            meta_path = Path(directory) / "token.meta.json"
+            token_path.write_text('{"token":"old"}', encoding="utf-8")
+            with patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", token_path
+            ), patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", meta_path
+            ), patch(
+                "nexacard_otp.gmail_auth.ensure_private_oauth_files"
+            ), patch(
+                "nexacard_otp.gmail_auth.Credentials.from_authorized_user_file",
+                side_effect=[old_credentials, current_credentials],
+            ), patch("nexacard_otp.gmail_auth.build", return_value=profile):
+                loaded = gmail_auth.load_valid_credentials()
+                coordinator.complete(
+                    "state1", CALLBACK + "?state=state1&code=abc"
+                )
+                result = gmail_auth.refresh_credentials_after_unauthorized(loaded)
+
+            self.assertIs(result, current_credentials)
+            old_credentials.refresh.assert_not_called()
+            self.assertEqual(
+                json.loads(token_path.read_text(encoding="utf-8"))["token"],
+                "new-reauth",
+            )
+
+    def test_oauth_token_and_metadata_pair_are_hidden_from_concurrent_status_readers(self):
+        flow = _flow()
+        flow.credentials.to_json.return_value = '{"token":"new-reauth"}'
+        coordinator = OAuthCoordinator()
+        coordinator.pending["state1"] = ("owner@example.com", flow)
+        profile = Mock()
+        profile.users().getProfile().execute.return_value = {
+            "emailAddress": "owner@example.com"
+        }
+        credentials = Mock(valid=True)
+        token_written = threading.Event()
+        allow_metadata_write = threading.Event()
+        real_atomic_write = gmail_auth.atomic_write_text
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_path = Path(directory) / "token.json"
+            meta_path = Path(directory) / "token.meta.json"
+
+            def slow_pair_write(path, text):
+                real_atomic_write(path, text)
+                if path == token_path and not token_written.is_set():
+                    token_written.set()
+                    allow_metadata_write.wait(timeout=1)
+
+            with patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_PATH", token_path
+            ), patch(
+                "nexacard_otp.gmail_auth.PRIVATE_TOKEN_META_PATH", meta_path
+            ), patch(
+                "nexacard_otp.gmail_auth.atomic_write_text",
+                side_effect=slow_pair_write,
+            ), patch(
+                "nexacard_otp.gmail_auth.ensure_private_oauth_files"
+            ), patch(
+                "nexacard_otp.gmail_auth.Credentials.from_authorized_user_file",
+                return_value=credentials,
+            ), patch("nexacard_otp.gmail_auth.build", return_value=profile), ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+                completion = executor.submit(
+                    coordinator.complete,
+                    "state1",
+                    CALLBACK + "?state=state1&code=abc",
+                )
+                self.assertTrue(token_written.wait(timeout=1))
+                status_read = executor.submit(
+                    gmail_auth.get_auth_status, "owner@example.com"
+                )
+                time.sleep(0.05)
+                self.assertFalse(status_read.done())
+                allow_metadata_write.set()
+                completion.result(timeout=1)
+                status = status_read.result(timeout=1)
+
+            self.assertEqual(status.state, "valid")
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["authorized_email"], "owner@example.com")
+
     def test_start_uses_offline_consent_login_hint_and_strong_random_state(self):
         first, second = _flow(), _flow()
         with patch("nexacard_otp.gmail_auth.ensure_private_oauth_files"), patch(

@@ -11,7 +11,7 @@ from nexacard_otp.errors import (
     GmailTemporarilyUnavailable,
     NexaCardLoginFailed,
 )
-from nexacard_otp.login import BASE_URL, NexaCardLogin
+from nexacard_otp.login import BASE_URL, PROTECTED_CARD_SEARCH, NexaCardLogin
 
 
 LOGIN_URL = "https://www.nexacardvcc.com/login"
@@ -25,6 +25,8 @@ PASSWORD = 'input[placeholder="请输入密码"]'
 EMAIL = 'input[placeholder="请输入邮箱"]'
 EMAIL_CODE = 'input[placeholder="请输入邮箱验证码"]'
 
+CARD_SEARCH = "input[placeholder='请输入卡号']"
+
 
 def make_settings():
     return Mock(account="account-123", password="password-456", verification_email="owner@example.com")
@@ -34,6 +36,7 @@ def logged_out_page():
     page = Mock()
     page.url = LOGIN_URL
     page.goto = AsyncMock()
+    page.wait_for_function = AsyncMock()
     page.wait_for_url = AsyncMock()
     locators = {}
     for selector in (USERNAME, PASSWORD, EMAIL, EMAIL_CODE, ".el-radio", "button.get-code-btn", "button.submit-btn"):
@@ -48,6 +51,80 @@ def logged_out_page():
 
 
 class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_protected_probe_uses_the_real_card_search_selector(self):
+        self.assertEqual(PROTECTED_CARD_SEARCH, CARD_SEARCH)
+
+    async def test_confirmed_api_failure_on_protected_url_forces_guard_recheck_and_login(self):
+        page, _ = logged_out_page()
+        page.url = PROTECTED_PROBE_URL
+        page.wait_for_function = AsyncMock()
+        reader = AsyncMock(
+            snapshot_login_message_ids=AsyncMock(return_value=frozenset()),
+            wait_for_login_code=AsyncMock(return_value="123456789"),
+        )
+
+        recovered = await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(
+            page, make_settings(), confirmed_failure=True
+        )
+
+        self.assertTrue(recovered)
+        page.goto.assert_any_await(
+            PROTECTED_PROBE_URL, wait_until="domcontentloaded", timeout=30_000
+        )
+        page.wait_for_function.assert_awaited_once()
+
+    async def test_confirmed_api_failure_recheck_accepts_protected_dom_not_url_alone(self):
+        page = Mock(url=PROTECTED_PROBE_URL, goto=AsyncMock(), wait_for_function=AsyncMock())
+        login_form = Mock(count=AsyncMock(return_value=0))
+        card_search = Mock(count=AsyncMock(return_value=1))
+        page.locator.side_effect = lambda selector: {
+            USERNAME: login_form,
+            CARD_SEARCH: card_search,
+        }[selector]
+        login = NexaCardLogin(asyncio.Lock(), AsyncMock())
+        login._perform_login = AsyncMock()
+
+        recovered = await login.ensure_authenticated(
+            page, make_settings(), confirmed_failure=True
+        )
+
+        self.assertFalse(recovered)
+        page.wait_for_function.assert_awaited_once()
+        login._perform_login.assert_not_awaited()
+
+    async def test_concurrent_confirmed_failures_still_perform_exactly_one_recovery(self):
+        login = NexaCardLogin(asyncio.Lock(), AsyncMock())
+        first_probe_started = asyncio.Event()
+        release_first_probe = asyncio.Event()
+        probe_count = 0
+
+        async def probe(_page):
+            nonlocal probe_count
+            probe_count += 1
+            if probe_count == 1:
+                first_probe_started.set()
+                await release_first_probe.wait()
+                return True
+            return False
+
+        login._navigate_for_recheck = AsyncMock()
+        login._probe_is_logged_out = AsyncMock(side_effect=probe)
+        login._perform_login = AsyncMock()
+        first = asyncio.create_task(
+            login.ensure_authenticated(AsyncMock(), Mock(), confirmed_failure=True)
+        )
+        await first_probe_started.wait()
+        second = asyncio.create_task(
+            login.ensure_authenticated(AsyncMock(), Mock(), confirmed_failure=True)
+        )
+        release_first_probe.set()
+
+        results = await asyncio.gather(first, second)
+
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 1)
+        login._perform_login.assert_awaited_once()
+
     async def test_hash_login_url_is_logged_out_without_querying_login_fields(self):
         page = Mock()
         page.url = HASH_LOGIN_URL
@@ -112,14 +189,25 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         locators[".el-radio"].click.assert_awaited_once_with(timeout=30_000)
         locators[EMAIL].fill.assert_awaited_once_with("owner@example.com", timeout=30_000)
         reader.wait_for_login_code.assert_awaited_once_with(
-            sent_at, excluded_message_ids=frozenset()
+            sent_at,
+            excluded_message_ids=frozenset(),
+            expected_email="owner@example.com",
         )
         locators[EMAIL_CODE].fill.assert_awaited_once_with("123456789", timeout=30_000)
         page.wait_for_url.assert_awaited_once()
         selectors = [call.args[0] for call in page.locator.call_args_list]
         self.assertEqual(
             selectors,
-            [USERNAME, PASSWORD, ".el-radio", EMAIL, "button.get-code-btn", EMAIL_CODE, "button.submit-btn"],
+            [
+                USERNAME,
+                USERNAME,
+                PASSWORD,
+                ".el-radio",
+                EMAIL,
+                "button.get-code-btn",
+                EMAIL_CODE,
+                "button.submit-btn",
+            ],
         )
 
     async def test_hash_login_requires_protected_route_after_submit(self):
@@ -165,16 +253,18 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         reader = AsyncMock()
         events = []
 
-        async def snapshot():
+        async def snapshot(*, expected_email):
+            self.assertEqual(expected_email, "owner@example.com")
             events.append("snapshot")
             return frozenset({"old-message"})
 
         async def request_code(**_kwargs):
             events.append("click")
 
-        async def wait_for_code(_sent_after, *, excluded_message_ids):
+        async def wait_for_code(_sent_after, *, excluded_message_ids, expected_email):
             events.append("wait")
             self.assertEqual(excluded_message_ids, frozenset({"old-message"}))
+            self.assertEqual(expected_email, "owner@example.com")
             return "123456789"
 
         reader.snapshot_login_message_ids.side_effect = snapshot
@@ -188,24 +278,29 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
     async def test_baseline_gmail_authorization_failure_never_requests_code_or_leaks_secret(self):
         page, locators = logged_out_page()
         reader = AsyncMock()
-        reader.snapshot_login_message_ids.side_effect = GmailAuthorizationRequired("owner@example.com")
+        failure = GmailAuthorizationRequired("owner@example.com")
+        reader.snapshot_login_message_ids.side_effect = failure
 
-        with self.assertRaisesRegex(NexaCardLoginFailed, "Gmail authorization is required") as captured:
+        with self.assertRaises(GmailAuthorizationRequired) as captured:
             await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(page, make_settings())
 
-        self.assertNotIn("owner@example.com", str(captured.exception))
+        self.assertIs(captured.exception, failure)
+        reader.snapshot_login_message_ids.assert_awaited_once_with(
+            expected_email="owner@example.com"
+        )
         locators["button.get-code-btn"].click.assert_not_awaited()
         reader.wait_for_login_code.assert_not_called()
 
     async def test_baseline_gmail_temporary_failure_never_requests_code_or_leaks_secret(self):
         page, locators = logged_out_page()
         reader = AsyncMock()
-        reader.snapshot_login_message_ids.side_effect = GmailTemporarilyUnavailable("access-token")
+        failure = GmailTemporarilyUnavailable("access-token")
+        reader.snapshot_login_message_ids.side_effect = failure
 
-        with self.assertRaisesRegex(NexaCardLoginFailed, "Gmail is temporarily unavailable") as captured:
+        with self.assertRaises(GmailTemporarilyUnavailable) as captured:
             await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(page, make_settings())
 
-        self.assertNotIn("access-token", str(captured.exception))
+        self.assertIs(captured.exception, failure)
         locators["button.get-code-btn"].click.assert_not_awaited()
 
     async def test_missing_login_configuration_fails_without_visiting_page_or_gmail(self):
@@ -235,24 +330,24 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
     async def test_gmail_authorization_failure_maps_to_safe_login_failure(self):
         page, _ = logged_out_page()
         reader = AsyncMock()
-        reader.wait_for_login_code.side_effect = GmailAuthorizationRequired("owner@example.com")
+        failure = GmailAuthorizationRequired("owner@example.com")
+        reader.wait_for_login_code.side_effect = failure
 
-        with self.assertRaisesRegex(NexaCardLoginFailed, "Gmail authorization is required") as captured:
+        with self.assertRaises(GmailAuthorizationRequired) as captured:
             await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(page, make_settings())
 
-        self.assertIsInstance(captured.exception.__cause__, GmailAuthorizationRequired)
-        self.assertNotIn("owner@example.com", str(captured.exception))
+        self.assertIs(captured.exception, failure)
 
     async def test_gmail_temporary_failure_maps_to_safe_login_failure(self):
         page, _ = logged_out_page()
         reader = AsyncMock()
-        reader.wait_for_login_code.side_effect = GmailTemporarilyUnavailable("access token")
+        failure = GmailTemporarilyUnavailable("access token")
+        reader.wait_for_login_code.side_effect = failure
 
-        with self.assertRaisesRegex(NexaCardLoginFailed, "Gmail is temporarily unavailable") as captured:
+        with self.assertRaises(GmailTemporarilyUnavailable) as captured:
             await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(page, make_settings())
 
-        self.assertIsInstance(captured.exception.__cause__, GmailTemporarilyUnavailable)
-        self.assertNotIn("access token", str(captured.exception))
+        self.assertIs(captured.exception, failure)
 
     async def test_playwright_failure_maps_to_safe_login_failure(self):
         page, _ = logged_out_page()
@@ -297,6 +392,9 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
 
         login._is_logged_out = AsyncMock(side_effect=is_logged_out)
         login._navigate_for_recheck = AsyncMock()
+        login._probe_is_logged_out = AsyncMock(
+            side_effect=lambda _page: state["logged_out"]
+        )
         login._perform_login = AsyncMock(side_effect=perform_login)
 
         results = await asyncio.gather(
@@ -318,6 +416,20 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
         def make_page(name):
             page, locators = logged_out_page()
             page.url = HASH_LOGIN_URL
+            login_form = locators[USERNAME]
+            login_form.count.side_effect = lambda: 0 if state["authenticated"] else 1
+            card_search = Mock(
+                count=AsyncMock(side_effect=lambda: 1 if state["authenticated"] else 0)
+            )
+
+            def locator(selector):
+                if selector == USERNAME:
+                    return login_form
+                if selector == CARD_SEARCH:
+                    return card_search
+                return locators[selector]
+
+            page.locator.side_effect = locator
 
             async def goto(url, **_kwargs):
                 navigations.append((name, url))
@@ -383,10 +495,10 @@ class NexaCardLoginTests(unittest.IsolatedAsyncioTestCase):
     async def test_gmail_refresh_error_maps_to_safe_login_failure(self):
         page, _ = logged_out_page()
         reader = AsyncMock()
-        reader.wait_for_login_code.side_effect = RefreshError("token=secret-token")
+        failure = RefreshError("token=secret-token")
+        reader.wait_for_login_code.side_effect = failure
 
-        with self.assertRaisesRegex(NexaCardLoginFailed, "Gmail authorization is required") as captured:
+        with self.assertRaises(RefreshError) as captured:
             await NexaCardLogin(asyncio.Lock(), reader).ensure_authenticated(page, make_settings())
 
-        self.assertIsInstance(captured.exception.__cause__, RefreshError)
-        self.assertNotIn("secret-token", str(captured.exception))
+        self.assertIs(captured.exception, failure)

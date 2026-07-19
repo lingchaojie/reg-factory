@@ -50,6 +50,7 @@ class NativeChromeManager:
     async def _context_for(self, settings: Settings) -> BrowserContext:
         fingerprint = settings.browser_fingerprint
         previous_context: BrowserContext | None = None
+        detached_context = False
 
         async with self._condition:
             while self._transitioning:
@@ -59,13 +60,16 @@ class NativeChromeManager:
                 return self._context
 
             self._transitioning = True
-            while self._active_pages:
-                await self._condition.wait()
-            previous_context = self._context
-            self._context = None
-            self._fingerprint = None
 
         try:
+            async with self._condition:
+                while self._active_pages:
+                    await self._condition.wait()
+                previous_context = self._context
+                self._context = None
+                self._fingerprint = None
+                detached_context = True
+
             if previous_context is not None:
                 await previous_context.close()
             if self._playwright is None:
@@ -79,19 +83,22 @@ class NativeChromeManager:
                 env=direct_browser_env(),
             )
         except BaseException:
-            await self._stop_playwright_after_failed_launch()
+            if detached_context:
+                await self._stop_playwright_after_failed_launch()
+            raise
+        else:
             async with self._condition:
+                self._context = context
+                self._fingerprint = fingerprint
+                self._active_pages += 1
                 self._transitioning = False
                 self._condition.notify_all()
-            raise
-
-        async with self._condition:
-            self._context = context
-            self._fingerprint = fingerprint
-            self._active_pages += 1
-            self._transitioning = False
-            self._condition.notify_all()
-        return context
+            return context
+        finally:
+            async with self._condition:
+                if self._transitioning:
+                    self._transitioning = False
+                    self._condition.notify_all()
 
     async def _stop_playwright_after_failed_launch(self) -> None:
         playwright = self._playwright
@@ -125,24 +132,30 @@ class NativeChromeManager:
                 await self._release_page()
 
     async def close(self) -> None:
+        context: BrowserContext | None = None
+        playwright: Any | None = None
+        detached_context = False
         async with self._condition:
             while self._transitioning:
                 await self._condition.wait()
             self._transitioning = True
-            while self._active_pages:
-                await self._condition.wait()
-            context = self._context
-            playwright = self._playwright
-            self._context = None
-            self._playwright = None
-            self._fingerprint = None
 
         try:
+            async with self._condition:
+                while self._active_pages:
+                    await self._condition.wait()
+                context = self._context
+                playwright = self._playwright
+                self._context = None
+                self._playwright = None
+                self._fingerprint = None
+                detached_context = True
+
             if context is not None:
                 await context.close()
         finally:
             try:
-                if playwright is not None:
+                if detached_context and playwright is not None:
                     await playwright.stop()
             finally:
                 async with self._condition:

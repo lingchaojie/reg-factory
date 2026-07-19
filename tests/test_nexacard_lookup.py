@@ -167,18 +167,38 @@ class VerificationPageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("6500000000000037", str(caught.exception))
                 self.assertNotIn("123456", str(caught.exception))
 
+    async def test_current_rows_rejects_unicode_otp_digits(self):
+        cells = [
+            "9",
+            "",
+            "１２３４５６",
+            "6500000000000037",
+            "",
+            "",
+            "2026-07-19 03:00:01",
+            "",
+        ]
+
+        with self.assertRaises(NexaCardPageError):
+            await VerificationPage()._current_rows(
+                _TablePage([_CellRow(cells)]), self.settings
+            )
+
     async def test_current_rows_rejects_short_rows_instead_of_silently_ignoring_them(self):
         with self.assertRaises(NexaCardPageError):
             await VerificationPage()._current_rows(_TablePage([_CellRow(["1"]) ]), self.settings)
 
-    async def test_search_uses_each_confirmed_route(self):
+    async def test_search_uses_each_confirmed_spa_url(self):
         reader = VerificationPage()
-        for lookup, route in ((self.lookup_b, "/nova-v-card-b/verify-code"), (self.lookup_3d, "/3d-1-card/verify-code")):
-            with self.subTest(route=route):
+        for lookup, url in (
+            (self.lookup_b, "https://www.nexacardvcc.com/#/nova-v-card-b/verify-code"),
+            (self.lookup_3d, "https://www.nexacardvcc.com/#/3d-1-card/verify-code"),
+        ):
+            with self.subTest(url=url):
                 page = _RoutePage()
                 reader._settle_rows = AsyncMock(return_value=[])
                 await reader.search_rows(page, lookup, self.settings)
-                self.assertTrue(page.goto.await_args.args[0].endswith(route))
+                page.goto.assert_awaited_once_with(url, wait_until="networkidle")
                 page.card_input.fill.assert_awaited_once_with(lookup.card_number)
                 page.search_button.click.assert_awaited_once()
                 page.response.finished.assert_awaited_once()
@@ -437,7 +457,9 @@ class OtpLookupServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch("nexacard_otp.lookup.asyncio.sleep", new=AsyncMock()):
             with self.assertRaises(OtpLookupTimedOut):
                 await OtpLookupService(manager, login, reader).lookup(self.lookup, self.settings)
-        login.ensure_authenticated.assert_awaited_once()
+        login.ensure_authenticated.assert_awaited_once_with(
+            manager.pages[0], self.settings, confirmed_failure=True
+        )
         self.assertEqual(reader.search_rows.await_count, 4)
 
         reader.search_rows = AsyncMock(side_effect=[PermissionError(), PermissionError()])

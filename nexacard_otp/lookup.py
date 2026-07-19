@@ -30,7 +30,7 @@ DOM_SETTLE_CHECKS = 4
 DOM_SETTLE_INTERVAL_SECONDS = 0.05
 DOM_SETTLE_TIMEOUT_MS = 1_000
 RESPONSE_FINISHED_TIMEOUT_SECONDS = 5.0
-_OTP_PATTERN = re.compile(r"\d{6}\Z")
+_OTP_PATTERN = re.compile(r"[0-9]{6}\Z")
 
 _QUERY_MARKER_KEY = "__nexacardOtpQueryMarker"
 QUERY_MARKER_INSTALL_SCRIPT = f"""
@@ -291,7 +291,9 @@ class VerificationPage:
 
     async def search_rows(self, page: Page, lookup: LookupInput, settings: Settings) -> list[OtpRow]:
         try:
-            await page.goto(BASE_URL + route_for(lookup.card_type), wait_until="networkidle")
+            await page.goto(
+                BASE_URL + "/#" + route_for(lookup.card_type), wait_until="networkidle"
+            )
         except PlaywrightTimeoutError as exc:
             raise NexaCardTransientError("NexaCard verification page timed out") from exc
         except PlaywrightError as exc:
@@ -381,7 +383,9 @@ class OtpLookupService:
                         raise NexaCardPageError(
                             "NexaCard session could not be recovered"
                         ) from exc
-                    did_recover = await self._login.ensure_authenticated(page, settings)
+                    did_recover = await self._login.ensure_authenticated(
+                        page, settings, confirmed_failure=True
+                    )
                     if did_recover:
                         recovered = True
                     continue

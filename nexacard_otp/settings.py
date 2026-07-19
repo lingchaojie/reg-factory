@@ -74,14 +74,21 @@ def _bool(value: str) -> bool:
 
 
 def discover_chrome(explicit: str = "") -> Path:
+    if explicit:
+        configured = Path(explicit)
+        if configured.name.casefold() != "chrome.exe" or not configured.is_file():
+            raise FileNotFoundError(
+                "NEXACARD_CHROME_PATH must name an existing chrome.exe file"
+            )
+        return configured
+
     candidates = [
-        Path(explicit) if explicit else None,
         Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
         Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
     ]
     for candidate in candidates:
-        if candidate and candidate.is_file():
+        if candidate.is_file():
             return candidate
     raise FileNotFoundError("Google Chrome executable was not found")
 

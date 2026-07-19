@@ -13,7 +13,12 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from .errors import GmailAuthorizationRequired, GmailTemporarilyUnavailable
-from .gmail_auth import load_valid_credentials
+from .gmail_auth import (
+    load_authorized_credentials,
+    load_valid_credentials,
+    raise_for_gmail_http_error,
+    refresh_credentials_after_unauthorized,
+)
 
 
 EXPECTED_SENDER = "jushihui@mail.jushipay.com"
@@ -22,7 +27,7 @@ LOGIN_MESSAGE_QUERY = f'from:({EXPECTED_SENDER}) subject:"{EXPECTED_SUBJECT}" ne
 FETCH_PAGE_SIZE = 10
 SNAPSHOT_PAGE_SIZE = 500
 MAX_SNAPSHOT_PAGES = 100
-CODE_PATTERN = re.compile(r"(?<!\d)(\d{9})(?!\d)")
+CODE_PATTERN = re.compile(r"(?<![0-9])([0-9]{9})(?![0-9])")
 
 
 def _decode(raw: str) -> bytes:
@@ -72,6 +77,30 @@ def parse_login_code(raw_message: str, internal_date_ms: int, sent_after: dateti
 
 class GmailCodeReader:
     @staticmethod
+    def _credentials_for(expected_email: str):
+        normalized = expected_email.strip().lower()
+        if normalized:
+            return load_authorized_credentials(normalized)
+        return load_valid_credentials()
+
+    @classmethod
+    def _run_with_auth_retry(cls, operation, expected_email: str):
+        credentials = cls._credentials_for(expected_email)
+        try:
+            return operation(credentials)
+        except HttpError as exc:
+            if getattr(exc.resp, "status", None) != 401:
+                raise_for_gmail_http_error(
+                    exc, "Gmail API is temporarily unavailable"
+                )
+
+        credentials = refresh_credentials_after_unauthorized(credentials)
+        try:
+            return operation(credentials)
+        except HttpError as exc:
+            raise_for_gmail_http_error(exc, "Gmail API is temporarily unavailable")
+
+    @staticmethod
     def _matching_message_page(
         service, *, max_results: int, page_token: str | None = None
     ) -> dict:
@@ -93,18 +122,14 @@ class GmailCodeReader:
     def _matching_message_items(cls, service) -> list[dict]:
         return cls._matching_message_page(service, max_results=FETCH_PAGE_SIZE).get("messages", [])
 
-    @staticmethod
-    def _raise_gmail_api_error(exc: Exception) -> None:
-        if isinstance(exc, HttpError) and getattr(exc.resp, "status", None) in {401, 403}:
-            raise GmailAuthorizationRequired("Gmail authorization is required") from exc
-        raise GmailTemporarilyUnavailable("Gmail API is temporarily unavailable") from exc
-
-    def _snapshot_login_message_ids_once(self) -> frozenset[str]:
-        try:
+    def _snapshot_login_message_ids_once(
+        self, *, expected_email: str = ""
+    ) -> frozenset[str]:
+        def snapshot(credentials) -> frozenset[str]:
             service = build(
                 "gmail",
                 "v1",
-                credentials=load_valid_credentials(),
+                credentials=credentials,
                 cache_discovery=False,
             )
             message_ids: set[str] = set()
@@ -130,23 +155,32 @@ class GmailCodeReader:
                 seen_page_tokens.add(next_page_token)
                 page_token = next_page_token
             raise ValueError("Gmail message snapshot exceeded page limit")
-        except HttpError as exc:
-            self._raise_gmail_api_error(exc)
+
+        try:
+            return self._run_with_auth_retry(snapshot, expected_email)
         except (OSError, TransportError, KeyError, TypeError, ValueError) as exc:
             raise GmailTemporarilyUnavailable("Gmail API is temporarily unavailable") from exc
 
-    async def snapshot_login_message_ids(self) -> frozenset[str]:
+    async def snapshot_login_message_ids(
+        self, *, expected_email: str = ""
+    ) -> frozenset[str]:
         """Return the bounded matching-message ID baseline before requesting a new code."""
-        return await asyncio.to_thread(self._snapshot_login_message_ids_once)
+        return await asyncio.to_thread(
+            self._snapshot_login_message_ids_once, expected_email=expected_email
+        )
 
     def _fetch_once(
-        self, sent_after: datetime, *, excluded_message_ids: frozenset[str] = frozenset()
+        self,
+        sent_after: datetime,
+        *,
+        excluded_message_ids: frozenset[str] = frozenset(),
+        expected_email: str = "",
     ) -> str | None:
-        try:
+        def fetch(credentials) -> str | None:
             service = build(
                 "gmail",
                 "v1",
-                credentials=load_valid_credentials(),
+                credentials=credentials,
                 cache_discovery=False,
             )
             for item in self._matching_message_items(service):
@@ -163,8 +197,9 @@ class GmailCodeReader:
                 if code:
                     return code
             return None
-        except HttpError as exc:
-            self._raise_gmail_api_error(exc)
+
+        try:
+            return self._run_with_auth_retry(fetch, expected_email)
         except (OSError, TransportError, KeyError, TypeError, ValueError) as exc:
             raise GmailTemporarilyUnavailable("Gmail API is temporarily unavailable") from exc
 
@@ -175,6 +210,7 @@ class GmailCodeReader:
         max_attempts: int = 60,
         *,
         excluded_message_ids: frozenset[str] = frozenset(),
+        expected_email: str = "",
     ) -> str:
         """Wait for a fresh code, excluding IDs present before the send request.
 
@@ -186,7 +222,10 @@ class GmailCodeReader:
         for attempt in range(max_attempts):
             try:
                 code = await asyncio.to_thread(
-                    self._fetch_once, sent_after, excluded_message_ids=excluded_message_ids
+                    self._fetch_once,
+                    sent_after,
+                    excluded_message_ids=excluded_message_ids,
+                    expected_email=expected_email,
                 )
                 last_temporary_error = None
             except GmailTemporarilyUnavailable as exc:

@@ -28,7 +28,7 @@ def normalize_card_type(value: str) -> CardType:
 
 def normalize_card_number(value: str) -> str:
     normalized = re.sub(r"[\s-]", "", value)
-    if not re.fullmatch(r"\d{12,19}", normalized):
+    if not re.fullmatch(r"[0-9]{12,19}", normalized):
         raise InvalidLookupInput("card_number must contain 12 to 19 digits")
     return normalized
 

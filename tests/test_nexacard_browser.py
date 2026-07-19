@@ -17,6 +17,70 @@ def make_settings(fingerprint=("chrome.exe", True, "account", "mail@example.com"
 
 
 class NexaCardBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def _wait_for_transition(self, manager):
+        for _ in range(20):
+            if manager._transitioning:
+                return
+            await asyncio.sleep(0)
+        self.fail("browser manager did not enter transition state")
+
+    async def test_cancelled_context_transition_releases_waiters_and_preserves_old_context(self):
+        old_settings = make_settings()
+        new_settings = make_settings(
+            ("chrome.exe", False, "account", "mail@example.com")
+        )
+        old_context = AsyncMock()
+        old_context.new_page.side_effect = [AsyncMock(), AsyncMock()]
+        playwright = AsyncMock()
+        playwright.chromium.launch_persistent_context.return_value = old_context
+        manager = NativeChromeManager(
+            playwright_factory=AsyncMock(return_value=playwright)
+        )
+        active = manager.page(old_settings)
+        await active.__aenter__()
+
+        transition = asyncio.create_task(manager.page(new_settings).__aenter__())
+        await self._wait_for_transition(manager)
+        transition.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await transition
+
+        self.assertIs(manager._context, old_context)
+        old_context.close.assert_not_awaited()
+        await active.__aexit__(None, None, None)
+        async with asyncio.timeout(0.2):
+            async with manager.page(old_settings):
+                pass
+            await manager.close()
+
+    async def test_cancelled_close_releases_waiters_and_allows_later_close(self):
+        settings = make_settings()
+        context = AsyncMock()
+        context.new_page.side_effect = [AsyncMock(), AsyncMock()]
+        playwright = AsyncMock()
+        playwright.chromium.launch_persistent_context.return_value = context
+        manager = NativeChromeManager(
+            playwright_factory=AsyncMock(return_value=playwright)
+        )
+        active = manager.page(settings)
+        await active.__aenter__()
+
+        closing = asyncio.create_task(manager.close())
+        await self._wait_for_transition(manager)
+        closing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+
+        self.assertIs(manager._context, context)
+        await active.__aexit__(None, None, None)
+        async with asyncio.timeout(0.2):
+            async with manager.page(settings):
+                pass
+            await manager.close()
+
+        context.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+
     def test_direct_env_removes_only_standard_proxy_keys_case_insensitively(self):
         source = {
             "HTTP_PROXY": "http://proxy",
