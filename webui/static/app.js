@@ -255,6 +255,94 @@ $('#btn-stop').onclick = async ()=>{
 };
 
 // ---------------------------------------------------------------- 配置页
+async function loadNexaCardOAuthStatus(email, target){
+  if(!email){
+    target.textContent='请先填写验证邮箱';
+    target.classList.remove('bad');
+    return;
+  }
+  try{
+    const response = await fetch('/api/nexacard/oauth/status?email='+encodeURIComponent(email));
+    if(!response.ok) throw new Error('status request failed');
+    const result = await response.json();
+    const parts = [result.message || result.state || '授权状态未知'];
+    if(result.authorized_email) parts.push(result.authorized_email);
+    if(result.estimated_expires_at){
+      parts.push(`${result.estimated ? '预计' : ''}到期 ${result.estimated_expires_at}`);
+    }
+    target.textContent = parts.join(' · ');
+    const bad = result.state==='reauthorize' || result.state==='mismatch';
+    target.classList.toggle('bad', bad);
+    if(result.state !== 'unknown') target.classList.toggle('unknown', false);
+    else target.classList.add('unknown');
+  }catch(error){
+    target.textContent='暂时无法验证授权状态';
+    target.classList.remove('bad');
+    target.classList.add('unknown');
+  }
+}
+
+function addNexaCardOAuthActions(row, initialEmail){
+  if(row.querySelector('.oauth-actions')) return;
+  const field = row.querySelector('input[data-env]');
+  if(!field) return;
+  const actions = document.createElement('div');
+  actions.className='oauth-actions';
+  const status = document.createElement('span');
+  status.className='oauth-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.textContent='尚未检测';
+  const makeButton = (action, label)=>{
+    const button=document.createElement('button');
+    button.type='button';
+    button.dataset.oauthAction=action;
+    button.textContent=label;
+    return button;
+  };
+  const authorize=makeButton('authorize', 'Google 鉴权');
+  const reauthorize=makeButton('reauthorize', '重新鉴权');
+  const check=makeButton('status', '检测状态');
+  actions.append(authorize, reauthorize, check, status);
+  row.querySelector('.v').appendChild(actions);
+
+  const startAuthorization = async ()=>{
+    const email=field.value.trim();
+    if(!email){
+      status.textContent='请先填写验证邮箱';
+      status.classList.remove('bad');
+      return;
+    }
+    // This must happen synchronously in the click handler to retain the user gesture.
+    const popup=window.open('about:blank', '_blank');
+    if(!popup){
+      status.textContent='浏览器阻止了授权窗口，请允许弹窗后重试';
+      status.classList.add('bad');
+      return;
+    }
+    status.textContent='正在启动 Google 授权…';
+    status.classList.remove('bad', 'unknown');
+    try{
+      const response=await fetch('/api/nexacard/oauth/start', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})
+      });
+      const result=await response.json();
+      if(!response.ok || !result.ok || !result.authorization_url) throw new Error('authorization start failed');
+      popup.opener=null;
+      popup.location.replace(result.authorization_url);
+      status.textContent='请在 Google 页面完成授权，然后点击“检测状态”';
+    }catch(error){
+      popup.close();
+      status.textContent='无法启动 Google 授权，请检查本地 OAuth 配置后重试';
+      status.classList.add('bad');
+    }
+  };
+  authorize.addEventListener('click', startAuthorization);
+  reauthorize.addEventListener('click', startAuthorization);
+  check.addEventListener('click', ()=>loadNexaCardOAuthStatus(field.value.trim(), status));
+  loadNexaCardOAuthStatus(initialEmail, status);
+}
+
 async function loadEnv(){
   const data = await (await fetch('/api/env')).json();
   const wrap = $('#env-groups'); wrap.innerHTML='';
@@ -281,6 +369,7 @@ async function loadEnv(){
           ${it.help?`<div class="ehelp">${it.help}</div>`:''}
         </div>`;
       box.appendChild(row);
+      if(it.gmail_oauth) addNexaCardOAuthActions(row, value);
     });
     // 绑定该组的测试按钮
     box.querySelectorAll('.btn-test').forEach(btn=>{

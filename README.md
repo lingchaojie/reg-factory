@@ -53,6 +53,27 @@
 
 ---
 
+### NexaCard OTP 服务
+
+此服务只查询已有 NexaCardB 或 3D-1 卡记录的付款 OTP；不会创建付款、修改卡片、订单或余额。
+
+1. 打开 WebUI 的 `NexaCard OTP` 配置组，保存账号、密码、验证邮箱、时区和轮询参数。密码使用既有密码框语义，不会作为普通文本展示。
+2. 在验证邮箱旁点击 `Google 鉴权`（需要更新授权时点击 `重新鉴权`），完成 Google 同意页后点击 `检测状态`。状态会显示已授权邮箱和到期信息。
+3. 从脚本列表启动 `NexaCard OTP 服务`，或运行 `python nexacard_otp_service.py`。服务默认仅监听 `127.0.0.1:8811`；WebUI 的“检测 OTP 服务”会访问本地 `/health`。
+4. 调用本地 API：
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8811/v1/otp -ContentType application/json -Body '{"card_number":"6500000000000037","card_type":"NexaCardB","order_created_at":"2026-07-19T05:30:20+08:00"}'
+```
+
+成功响应只包含 OTP：`{"otp":"123456"}`。默认第一次立即查询，随后每 `3` 秒刷新一次（`NEXACARD_OTP_POLL_INTERVAL_SECONDS=3`），最多 `100` 次（`NEXACARD_OTP_MAX_ATTEMPTS=100`）。这些值在每个 API 请求开始时读取；保存后对下一次请求生效，无需重启服务。
+
+服务使用本机原生 Google Chrome，默认无头运行，并明确强制直连：不继承项目代理，也不使用 BitBrowser、AdsPower、Octo 或其他指纹浏览器。OAuth 凭据、刷新 token、OAuth 元数据和 Chrome profile 仅保存在已忽略的 `nexacard_otp/private/`，不得提交、复制到日志或共享给他人。
+
+Google Access Token 通常约一小时过期，但会用 refresh token 按需自动刷新；这不等同于 Google 授权失效。只有刷新被 Google 以 `invalid_grant` 拒绝、授权被撤销，或凭据损坏时才需要重新鉴权。Google 未提供 refresh-token 有效期时，界面显示的七天“预计到期”只是 Testing-mode 的估算，不是保证的失效时间；临时网络错误会显示为暂时未知，不会误报授权已失效。
+
+---
+
 ## 1. 前置条件
 
 ### ① 指纹浏览器（三选一）

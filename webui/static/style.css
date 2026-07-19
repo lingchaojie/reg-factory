@@ -100,6 +100,12 @@ body{margin:0;background:var(--bg);color:var(--text);
 .env-item input,.env-item select{width:100%;padding:7px 10px;background:var(--panel2);border:1px solid var(--line);
   border-radius:6px;color:var(--text);font-size:13px}
 .env-item .ehelp{color:var(--dim);font-size:11.5px;margin-top:3px}
+.oauth-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+.oauth-actions button{padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);cursor:pointer}
+.oauth-actions button:hover{border-color:var(--accent)}
+.oauth-status{font-size:12px;color:var(--green);overflow-wrap:anywhere}
+.oauth-status.bad{color:var(--red)}
+.oauth-status.unknown{color:var(--dim)}
 
 /* ---- 内嵌功能页 + 接码助手 ---- */
 #view-embed{height:100%}

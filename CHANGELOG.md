@@ -1,5 +1,17 @@
 ﻿# 更新日志
 
+## 2026-07-19 — NexaCard OTP 服务 WebUI 与本地 API
+
+**新增**
+- WebUI 新增 `NexaCard OTP` 配置组、密码遮挡、Google 鉴权/重新鉴权/状态控件、本地健康检查和常驻服务启动入口。
+- 新增仅监听本地地址的 `POST /v1/otp` 调用说明；成功响应只返回 `otp`。轮询间隔（x）和最大次数（y）默认分别为 3 秒与 100 次，保存后在下一次请求读取。
+- 服务使用原生 Chrome 强制直连，不使用代理或指纹浏览器；Google OAuth 凭据、token 和 Chrome profile 统一放在 Git 忽略的私有目录。
+
+**授权说明**
+- Access Token 约一小时后会自动刷新；真正的撤销或 `invalid_grant` 才要求重新鉴权。未由 Google 明确给出的七天 refresh-token 到期时间仅显示为估算值。
+
+---
+
 ## 2026-07-19 — Octo Browser provider 与 Clash/直连预检
 
 **新增**

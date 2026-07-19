@@ -108,6 +108,29 @@ def _http_alive(url, timeout=3):
         return False
 
 
+def _nexacard_health_url():
+    """Build the service health URL only for loopback listeners."""
+    host = _read_config_val("NEXACARD_SERVICE_HOST", "127.0.0.1").strip().lower()
+    port_text = _read_config_val("NEXACARD_SERVICE_PORT", "8811").strip()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    rendered_host = f"[{host}]" if host == "::1" else host
+    return f"http://{rendered_host}:{port}/health"
+
+
+def _test_nexacard():
+    url = _nexacard_health_url()
+    if not url:
+        return False, "NexaCard OTP 服务仅支持本地回环监听地址和有效端口"
+    return _http_alive(url), f"NexaCard OTP 服务 {url}"
+
+
 def _k12_url():
     raw = _read_config_val("K12_CONSOLE_URL", "http://127.0.0.1:8806").strip().rstrip("/")
     try:
@@ -467,6 +490,7 @@ _TESTERS = {
     "smsman": _test_smsman,
     "firefox": _test_firefox,
     "yyds": _test_yyds,
+    "nexacard": _test_nexacard,
 }
 
 
