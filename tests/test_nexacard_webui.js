@@ -33,6 +33,57 @@ assert.deepEqual(
   {type: 'password'},
 );
 
+function control(key, value, valid){
+  return {
+    dataset: {env: key},
+    value,
+    checkValidity: () => valid,
+    reportValidityCalls: 0,
+    reportValidity(){ this.reportValidityCalls += 1; },
+  };
+}
+
+async function testInvalidConfigurationNeverPosts(){
+  const message = target();
+  const interval = control('NEXACARD_OTP_POLL_INTERVAL_SECONDS', '0', false);
+  const attempts = control('NEXACARD_OTP_MAX_ATTEMPTS', '1.5', false);
+  let fetchCalls = 0;
+  const result = await NexaCardWebUi.saveEnvControls(
+    [interval, attempts], message, async () => { fetchCalls += 1; },
+  );
+
+  assert.equal(result, null);
+  assert.equal(fetchCalls, 0);
+  assert.equal(interval.reportValidityCalls, 1);
+  assert.equal(attempts.reportValidityCalls, 0);
+  assert.equal(message.textContent, '请修正无效配置');
+}
+
+async function testValidDecimalIntervalAndIntegerAttemptsPost(){
+  const message = target();
+  let request;
+  const result = await NexaCardWebUi.saveEnvControls(
+    [
+      control('NEXACARD_OTP_POLL_INTERVAL_SECONDS', '4.5', true),
+      control('NEXACARD_OTP_MAX_ATTEMPTS', '100', true),
+    ],
+    message,
+    async (url, options) => {
+      request = {url, options};
+      return {json: async () => ({ok: true, saved: 2})};
+    },
+  );
+
+  assert.deepEqual(result, {ok: true, saved: 2});
+  assert.equal(request.url, '/api/env');
+  assert.deepEqual(JSON.parse(request.options.body), {
+    env: {
+      NEXACARD_OTP_POLL_INTERVAL_SECONDS: '4.5',
+      NEXACARD_OTP_MAX_ATTEMPTS: '100',
+    },
+  });
+}
+
 async function testLatestStatusResponseWins(){
   let email = 'old@example.com';
   const status = target();
@@ -64,6 +115,11 @@ async function testCurrentEmailMustStillMatch(){
   assert.equal(status.classList.contains('bad'), false);
 }
 
-Promise.all([testLatestStatusResponseWins(), testCurrentEmailMustStillMatch()])
+Promise.all([
+  testLatestStatusResponseWins(),
+  testCurrentEmailMustStillMatch(),
+  testInvalidConfigurationNeverPosts(),
+  testValidDecimalIntervalAndIntegerAttemptsPost(),
+])
   .then(() => console.log('NexaCard WebUI behavior tests passed'))
   .catch(error => { console.error(error); process.exitCode = 1; });

@@ -13,6 +13,31 @@
     return {type: item?.secret ? 'password' : 'text'};
   }
 
+  function collectValidEnvControls(controls, messageTarget){
+    const env = {};
+    for(const control of Array.from(controls)){
+      if(typeof control.checkValidity === 'function' && !control.checkValidity()){
+        if(typeof control.reportValidity === 'function') control.reportValidity();
+        messageTarget.textContent = '请修正无效配置';
+        return null;
+      }
+      env[control.dataset.env] = control.value;
+    }
+    return env;
+  }
+
+  async function saveEnvControls(controls, messageTarget, fetchImpl){
+    const env = collectValidEnvControls(controls, messageTarget);
+    if(!env) return null;
+    const fetcher = fetchImpl || root.fetch.bind(root);
+    const response = await fetcher('/api/env', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({env}),
+    });
+    return response.json();
+  }
+
   function isCurrent(target, generation, requestedEmail, currentEmail){
     return statusGenerations.get(target) === generation
       && String(currentEmail()).trim() === requestedEmail;
@@ -49,7 +74,7 @@
     }
   }
 
-  const api = {shouldRenderGoogleOauthActions, envInputMetadata, loadOauthStatus};
+  const api = {shouldRenderGoogleOauthActions, envInputMetadata, loadOauthStatus, saveEnvControls};
   if(typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.NexaCardWebUi = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

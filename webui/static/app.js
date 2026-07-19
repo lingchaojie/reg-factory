@@ -373,11 +373,12 @@ async function runTest(target, btn){
 }
 
 $('#btn-save-env').onclick = async ()=>{
-  const env = {};
-  $$('input[data-env],select[data-env]').forEach(i=>{ env[i.dataset.env] = i.value; });
-  const r = await (await fetch('/api/env',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({env})})).json();
   const msg = $('#env-msg');
+  msg.textContent = '';
+  const r = await NexaCardWebUi.saveEnvControls(
+    $$('input[data-env],select[data-env]'), msg, fetch
+  );
+  if(!r) return;
   msg.textContent = r.ok
     ? ('✓ 已保存 '+r.saved+' 项，新任务立即生效，无需重启')
     : ('保存失败: '+(r.error||''));
