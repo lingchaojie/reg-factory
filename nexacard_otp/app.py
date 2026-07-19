@@ -39,28 +39,55 @@ def _error(status_code: int, code: str, message: str) -> JSONResponse:
     )
 
 
+_MISSING = object()
+
+
+def _state_value(app: FastAPI, name: str):
+    return getattr(app.state, name, _MISSING)
+
+
+def _restore_state_if_unchanged(app: FastAPI, name: str, written, previous) -> None:
+    """Restore one lifecycle-owned assignment without erasing a newer owner."""
+    if written is _MISSING or _state_value(app, name) is not written:
+        return
+    if previous is _MISSING:
+        delattr(app.state, name)
+    else:
+        setattr(app.state, name, previous)
+
+
 @asynccontextmanager
 async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Wire request services without starting Chrome until the first lookup."""
-    browser = NativeChromeManager()
-    lookup_service = None
+    """Wire services while respecting state owned by an enclosing lifespan."""
+    previous_browser = _state_value(app, "browser")
+    previous_lookup_service = _state_value(app, "lookup_service")
+    owned_browser = _MISSING
+    written_browser = _MISSING
+    written_lookup_service = _MISSING
     try:
-        reader = GmailCodeReader()
-        login = NexaCardLogin(browser.login_lock, reader)
-        lookup_service = OtpLookupService(browser, login)
-        app.state.browser = browser
-        app.state.lookup_service = lookup_service
+        if previous_lookup_service is _MISSING:
+            browser = previous_browser
+            if browser is _MISSING:
+                browser = NativeChromeManager()
+                owned_browser = browser
+            reader = GmailCodeReader()
+            login = NexaCardLogin(browser.login_lock, reader)
+            lookup_service = OtpLookupService(browser, login)
+            if previous_browser is _MISSING:
+                app.state.browser = browser
+                written_browser = browser
+            app.state.lookup_service = lookup_service
+            written_lookup_service = lookup_service
         yield
     finally:
         try:
-            await browser.close()
+            if owned_browser is not _MISSING:
+                await owned_browser.close()
         finally:
-            # A process can run multiple test/server lifespans. Do not leave a
-            # closed service reachable, and never clear a later lifecycle's state.
-            if lookup_service is not None and getattr(app.state, "lookup_service", None) is lookup_service:
-                delattr(app.state, "lookup_service")
-            if getattr(app.state, "browser", None) is browser:
-                delattr(app.state, "browser")
+            _restore_state_if_unchanged(
+                app, "lookup_service", written_lookup_service, previous_lookup_service
+            )
+            _restore_state_if_unchanged(app, "browser", written_browser, previous_browser)
 
 
 def create_app() -> FastAPI:

@@ -187,6 +187,111 @@ class NexaCardApiTests(unittest.TestCase):
         browser.close.assert_awaited_once_with()
         self.assertFalse(hasattr(app.state, "lookup_service"))
 
+    def test_lifespan_preserves_preinjected_lookup_service_for_requests_and_shutdown(self):
+        app = create_app()
+        supplied_service = Mock()
+        supplied_service.lookup = AsyncMock(return_value="654321")
+        app.state.lookup_service = supplied_service
+        supplied_browser = Mock(login_lock=object())
+        supplied_browser.close = AsyncMock()
+        app.state.browser = supplied_browser
+
+        with patch("nexacard_otp.app.NativeChromeManager") as browser_type, patch(
+            "nexacard_otp.app.GmailCodeReader"
+        ) as reader_type, patch("nexacard_otp.app.NexaCardLogin") as login_type, patch(
+            "nexacard_otp.app.OtpLookupService"
+        ) as service_type, patch("nexacard_otp.app.load_settings", return_value=_settings()), patch(
+            "nexacard_otp.app.parse_lookup_input", return_value=Mock()
+        ):
+            with TestClient(app) as client:
+                response = client.post("/v1/otp", json=self._valid_payload())
+                self.assertEqual(response.json(), {"otp": "654321"})
+                self.assertIs(app.state.lookup_service, supplied_service)
+
+        self.assertIs(app.state.lookup_service, supplied_service)
+        self.assertIs(app.state.browser, supplied_browser)
+        supplied_service.lookup.assert_awaited_once()
+        browser_type.assert_not_called()
+        reader_type.assert_not_called()
+        login_type.assert_not_called()
+        service_type.assert_not_called()
+        supplied_browser.close.assert_not_called()
+
+    def test_nested_lifespans_keep_outer_service_until_outer_shutdown(self):
+        app = create_app()
+        outer_browser = Mock(login_lock=object())
+        outer_browser.close = AsyncMock()
+        outer_service = Mock()
+        outer_service.lookup = AsyncMock(return_value="123456")
+
+        with patch("nexacard_otp.app.NativeChromeManager", return_value=outer_browser) as browser_type, patch(
+            "nexacard_otp.app.GmailCodeReader"
+        ), patch("nexacard_otp.app.NexaCardLogin") as login_type, patch(
+            "nexacard_otp.app.OtpLookupService", return_value=outer_service
+        ) as service_type, patch("nexacard_otp.app.load_settings", return_value=_settings()), patch(
+            "nexacard_otp.app.parse_lookup_input", return_value=Mock()
+        ):
+            with TestClient(app) as outer:
+                self.assertEqual(outer.post("/v1/otp", json=self._valid_payload()).status_code, 200)
+                with TestClient(app) as inner:
+                    self.assertEqual(inner.post("/v1/otp", json=self._valid_payload()).status_code, 200)
+                self.assertEqual(outer.post("/v1/otp", json=self._valid_payload()).status_code, 200)
+                self.assertIs(app.state.lookup_service, outer_service)
+                outer_browser.close.assert_not_called()
+
+        browser_type.assert_called_once_with()
+        login_type.assert_called_once()
+        service_type.assert_called_once()
+        outer_browser.close.assert_awaited_once_with()
+        self.assertFalse(hasattr(app.state, "browser"))
+        self.assertFalse(hasattr(app.state, "lookup_service"))
+
+    def test_lifespan_uses_external_browser_for_temporary_lookup_without_closing_it(self):
+        app = create_app()
+        external_browser = Mock(login_lock=object())
+        external_browser.close = AsyncMock()
+        app.state.browser = external_browser
+        created_service = Mock()
+        created_service.lookup = AsyncMock(return_value="123456")
+
+        with patch("nexacard_otp.app.NativeChromeManager") as browser_type, patch(
+            "nexacard_otp.app.GmailCodeReader"
+        ) as reader_type, patch("nexacard_otp.app.NexaCardLogin") as login_type, patch(
+            "nexacard_otp.app.OtpLookupService", return_value=created_service
+        ) as service_type, patch("nexacard_otp.app.load_settings", return_value=_settings()), patch(
+            "nexacard_otp.app.parse_lookup_input", return_value=Mock()
+        ):
+            with TestClient(app) as client:
+                self.assertEqual(client.post("/v1/otp", json=self._valid_payload()).status_code, 200)
+                self.assertIs(app.state.browser, external_browser)
+                self.assertIs(app.state.lookup_service, created_service)
+
+        browser_type.assert_not_called()
+        reader_type.assert_called_once_with()
+        login_type.assert_called_once_with(external_browser.login_lock, reader_type.return_value)
+        service_type.assert_called_once_with(external_browser, login_type.return_value)
+        external_browser.close.assert_not_called()
+        self.assertIs(app.state.browser, external_browser)
+        self.assertFalse(hasattr(app.state, "lookup_service"))
+
+    def test_lifespan_initialization_failure_restores_external_state(self):
+        app = create_app()
+        external_browser = Mock(login_lock=object())
+        external_browser.close = AsyncMock()
+        app.state.browser = external_browser
+
+        with patch("nexacard_otp.app.NativeChromeManager") as browser_type, patch(
+            "nexacard_otp.app.GmailCodeReader", side_effect=RuntimeError("private token")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "private token"):
+                with TestClient(app):
+                    pass
+
+        browser_type.assert_not_called()
+        external_browser.close.assert_not_called()
+        self.assertIs(app.state.browser, external_browser)
+        self.assertFalse(hasattr(app.state, "lookup_service"))
+
     def test_concurrent_requests_share_no_api_lock(self):
         both_entered = threading.Event()
         release = threading.Event()
