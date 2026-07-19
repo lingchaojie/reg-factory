@@ -741,6 +741,8 @@ async def run_claude_platform_flow(
             raise ClaudeApiRegistrationError("verification_artifact_not_found")
     except ClaudeApiRegistrationError:
         raise
+    except NineMallMailboxError:
+        raise
     except Exception:
         raise ClaudeApiRegistrationError("mail_timeout") from None
 

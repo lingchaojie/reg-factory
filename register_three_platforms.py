@@ -45,6 +45,7 @@ from common.log_redaction import (
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(ROOT, "tri_register_logs")
 CLAUDE_FAMILY = {"claude", "claude_api"}
+LEGACY_SUCCESS_MARKER_PLATFORMS = {"claude", "chatgpt", "grok"}
 
 
 class PlatformLaunchError(RuntimeError):
@@ -231,6 +232,7 @@ async def run_platform(
             process_owner.track_process(proc)
 
         final_nonempty_line = ""
+        saw_standalone_success = False
         with open(log_path, "w", encoding="utf-8", errors="replace") as log:
             assert proc.stdout is not None
             while True:
@@ -240,6 +242,8 @@ async def run_platform(
                 text = line.decode("utf-8", errors="replace")
                 if text.strip():
                     final_nonempty_line = text.strip()
+                    if final_nonempty_line.casefold() == "success: 1/1":
+                        saw_standalone_success = True
                 display_text = _mask_email_text(text)
                 log.write(display_text)
                 log.flush()
@@ -259,7 +263,13 @@ async def run_platform(
             if process_owner is not None:
                 process_owner.confirm_process_stopped(proc, confirmed)
         raise
-    saw_success = final_nonempty_line.casefold() == "success: 1/1"
+    if platform == "claude_api":
+        saw_success = final_nonempty_line.casefold() == "success: 1/1"
+    else:
+        saw_success = (
+            platform in LEGACY_SUCCESS_MARKER_PLATFORMS
+            and saw_standalone_success
+        )
     ok = rc == 0 and saw_success
     status = "OK" if ok else f"FAIL(exit={rc}, success_marker={saw_success})"
     print(f"[{platform}] done: {status}")

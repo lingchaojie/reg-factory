@@ -676,6 +676,23 @@ class ClaudeApiRegistrationLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.bb.close_browser.assert_called_once_with("profile-a")
         self.bb.delete_browser.assert_called_once_with("profile-a")
 
+    async def test_ninemail_failure_marks_its_sanitized_code(self):
+        failure = register_claude_api.NineMallMailboxError("invalid_json")
+        with self.playwright_patch(), patch.object(
+            register_claude_api,
+            "run_claude_platform_flow",
+            new=AsyncMock(side_effect=failure),
+        ):
+            result = await register_claude_api.register_one(
+                self.bb, self.account, self.store, timeout=90
+            )
+
+        self.assertIsNone(result)
+        self.store.mark_error.assert_called_once_with(
+            self.account, "invalid_json"
+        )
+        self.store.release.assert_not_called()
+
     async def test_profile_launch_failure_releases_reservation(self):
         self.bb.create_browser.side_effect = RuntimeError(
             "secret profile creation failure"
@@ -1687,8 +1704,10 @@ class ClaudeApiDeadlineAndCleanupTests(ClaudeApiRegistrationLifecycleTests):
             0.05,
             create=True,
         ):
+            # The fake clock drives the deadline transition. Keep the real
+            # owner wait independent of scheduler load from spawned tests.
             result = await register_claude_api.register_one(
-                self.bb, self.account, self.store, timeout=0.02
+                self.bb, self.account, self.store, timeout=1.0
             )
 
         self.assertIsNone(result)

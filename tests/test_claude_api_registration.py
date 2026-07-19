@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from common.claude_email_accounts import ClaudeEmailAccount
 from common.claude_platform_mailbox import ClaudePlatformVerification
+from common.ninemail_mailbox import NineMallMailboxError
 import register_claude_api
 
 
@@ -721,6 +722,24 @@ class ClaudeApiRegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.assert_safe_terminal_error(error, "mail_timeout")
         else:
             self.fail("expected a stable mail timeout")
+
+    async def test_ninemail_mailbox_errors_preserve_sanitized_codes(self):
+        for code in ("http_401", "invalid_json", "network_error"):
+            async def fetch_verification(*_args, error_code=code):
+                raise NineMallMailboxError(error_code)
+
+            with self.subTest(code=code), self.assertRaises(
+                NineMallMailboxError
+            ) as raised:
+                await register_claude_api.run_claude_platform_flow(
+                    FakePlatformPage(),
+                    FakeBrowserContext([]),
+                    self.account,
+                    fetch_verification,
+                    1,
+                )
+
+            self.assertEqual(raised.exception.code, code)
 
     async def test_verification_navigation_failure_is_safe_rejection(self):
         page = FakePlatformPage(fail_navigation="verification")

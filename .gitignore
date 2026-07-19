@@ -36,6 +36,15 @@ emails_used_claude_api.txt
 emails_error_claude_api.txt
 .claude_email_pool.lock
 .claude_email_pool.journal
+/.emails_used.txt.*.tmp
+/.emails_error.txt.*.tmp
+/.emails_used_claude_api.txt.*.tmp
+/.emails_error_claude_api.txt.*.tmp
+/.mail_used_claude.txt.*.tmp
+/.mail_error_claude.txt.*.tmp
+/.mail_used_claude_api.txt.*.tmp
+/.mail_error_claude_api.txt.*.tmp
+/..claude_email_pool.journal.*.tmp
 outlook_no_graph.txt
 proxies.txt
 outlook_accounts/

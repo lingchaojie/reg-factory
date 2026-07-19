@@ -1945,7 +1945,7 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("@例子.公司", masked)
             self.assertIn("@xn--fsqu00a.xn--55qx5d", masked)
 
-    async def test_process_success_marker_must_be_exact_and_final(self):
+    async def test_claude_api_success_marker_must_be_exact_and_final(self):
         cases = (
             ("print('prefix success: 1/1 suffix')", False),
             ("print('success: 1/1'); print('later output')", False),
@@ -1963,6 +1963,98 @@ class SharedClaudeReservationTests(unittest.IsolatedAsyncioTestCase):
                     f"marker-{index}",
                 )
                 self.assertEqual(result[1], expected)
+
+    async def test_legacy_success_marker_accepts_real_post_marker_output(self):
+        separator = "=" * 50
+        representative_outputs = {
+            "claude": "\n".join((
+                separator,
+                "  RESULTS: 1 total",
+                separator,
+                "  #1 [OK] claude_profile",
+                "",
+                "  success: 1/1",
+                separator,
+                "  AUTO VALIDATE: running validate_keys.py on cookies/accounts.txt",
+                separator,
+                "  [OK] 1/1 keys valid",
+                "",
+            )),
+            "chatgpt": "\n".join((
+                separator,
+                "  success: 1/1",
+                separator,
+                "",
+            )),
+            "grok": "\n".join((
+                separator,
+                "  success: 1/1",
+                separator,
+                "",
+            )),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            register_three_platforms, "LOG_DIR", temp_dir
+        ), patch.object(
+            register_three_platforms, "ROOT", str(self.root)
+        ):
+            for platform, output in representative_outputs.items():
+                with self.subTest(platform=platform):
+                    result = await register_three_platforms.run_platform(
+                        platform,
+                        [
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            f"import sys; sys.stdout.write({output!r})",
+                        ],
+                        f"legacy-marker-{platform}",
+                    )
+                    self.assertTrue(result[1])
+
+    async def test_legacy_success_marker_never_accepts_a_substring(self):
+        output = "progress\nprefix success: 1/1 suffix\n"
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            register_three_platforms, "LOG_DIR", temp_dir
+        ), patch.object(
+            register_three_platforms, "ROOT", str(self.root)
+        ):
+            for platform in ("claude", "chatgpt", "grok"):
+                with self.subTest(platform=platform):
+                    result = await register_three_platforms.run_platform(
+                        platform,
+                        [
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            f"import sys; sys.stdout.write({output!r})",
+                        ],
+                        f"substring-marker-{platform}",
+                    )
+                    self.assertFalse(result[1])
+
+    async def test_mixed_legacy_and_api_keep_platform_specific_marker_rules(self):
+        output = "success: 1/1\n==================================================\n"
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            register_three_platforms, "LOG_DIR", temp_dir
+        ), patch.object(
+            register_three_platforms, "ROOT", str(self.root)
+        ):
+            command = [
+                sys.executable,
+                "-u",
+                "-c",
+                f"import sys; sys.stdout.write({output!r})",
+            ]
+            legacy = await register_three_platforms.run_platform(
+                "claude", command, "mixed-marker-claude"
+            )
+            api = await register_three_platforms.run_platform(
+                "claude_api", command, "mixed-marker-claude-api"
+            )
+
+        self.assertTrue(legacy[1])
+        self.assertFalse(api[1])
 
 
 if __name__ == "__main__":
